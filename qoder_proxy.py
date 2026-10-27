@@ -39,6 +39,7 @@ import ssl
 import sys
 import threading
 import fnmatch
+import itertools
 import time
 import urllib.error
 import urllib.parse
@@ -62,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5929,6 +5930,19 @@ def _is_request_fault(code, detail):
                               for m in _REQUEST_FAULT_MARKERS)
 
 
+def _is_billing_limit(code, detail):
+    """日计数超限（110 Billing daily count exceeded）：账号级「当日额度用完」。
+
+    与排队(10605)/频控(429)不同：重试、等待、换号都改变不了结果——计数只在
+    UTC+8 日界重置。body 里有 JSON 转义（\"code\"），先去反斜杠再匹配。
+    """
+    if code != 403:
+        return False
+    low = (detail or "").lower().replace("\\", "")
+    return ("billing daily count exceeded" in low
+            or '"code":"110"' in low)
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -6125,6 +6139,22 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         log("account %s queued via envelope (HTTP %s) - not penalising the "
             "account (issue #71)" % (account.uid[:8], status_int),
             level="WARN", tag="chat")
+        return
+    if _is_billing_limit(status_int, detail):
+        # 110 日计数超限：停放账号到 UTC+8 日界重置。刻意不走 note_error 冷却
+        # （60s 会被反复空烧），也躲开 note_success/clear_error/refresh 的清理——
+        # 计数以「日」为单位，一次成功请求证明不了当日额度已恢复。
+        if session_key and POOL:
+            try:
+                POOL.affinity.unbind(session_key)
+            except Exception:
+                pass
+        deadline = account.note_billing_limit(
+            "billing daily count exceeded (HTTP %s)" % status_int)
+        log("account %s billing daily limit exceeded via envelope (HTTP %s) - "
+            "parked until daily reset %d (UTC+8 00:00)"
+            % (account.uid[:8], status_int, int(deadline)),
+            level="ERROR", tag="chat")
         return
     if session_key and POOL:
         try:
@@ -6356,6 +6386,10 @@ def _exc_http_status(exc, default=502):
         v = getattr(exc, attr, None)
         if isinstance(v, int):
             return v
+        if isinstance(v, str) and v.isdigit():
+            # 信封 statusCodeValue 可能是 str（如 "403"）——返回 str 会让调用方
+            # 拿到 default（429），把凭证错报成限流。能转 int 就转。
+            return int(v)
     return default
 
 
@@ -6418,6 +6452,9 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
+    # 110 日计数超限：重开上游必然再吃 110，别烧重试预算（应直接报给客户端）
+    if _is_billing_limit(status_int, detail):
+        return False
     # 401/403 (含 10605 排队被拒) 与 429 在未吐出字节前均允许通过 reopen 换号重试
     if status_int in (401, 403, 429):
         return True
@@ -7089,6 +7126,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         % (exc.code, account.uid[:8], model,
                            int(time.time() - queue_start)),
                         level="WARN", tag="chat")
+                    last_error = exc
+                    continue
+                if _is_billing_limit(exc.code, detail):
+                    # 110 日计数超限：停放账号到日界（见 note_billing_limit），
+                    # 不进 note_error 冷却链——当日重置前轮换注定再吃 110。
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    deadline = account.note_billing_limit(
+                        "billing daily count exceeded (HTTP %s)" % exc.code)
+                    log("account %s billing daily limit exceeded (HTTP %s) - "
+                        "parked until daily reset %d (UTC+8 00:00)"
+                        % (account.uid[:8], exc.code, int(deadline)),
+                        level="ERROR", tag="chat")
                     last_error = exc
                     continue
                 log("account %s rejected (HTTP %s), rotating"
@@ -8616,10 +8666,9 @@ class Handler(BaseHTTPRequestHandler):
         if not data:
             return
         if not getattr(self, "_chunked", False):
-            # 理论上不会发生；保守回退成裸写
-            self.wfile.write(data)
-            self.wfile.flush()
-            return
+            # 惰性建流：首个字节到达才发响应头——错误在首帧前暴露时，
+            # 调用方还有机会改发真实 HTTP 状态码（而不是 200 + 流内错误帧）。
+            self._sse_begin()
         self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
         self.wfile.write(data)
         self.wfile.write(b"\r\n")
@@ -10342,7 +10391,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "upstream unreachable: %s" % exc)
         with upstream:
             if want_stream:
-                self._sse_begin()
+                # 惰性建流（同 responses 泵）：首帧前报错要能回真实 HTTP 状态。
                 first_ms = None
                 try:
                     # 守卫链与 chat 主链路**逐字一致**（顺序与参数都不能改）：
@@ -10355,6 +10404,11 @@ class Handler(BaseHTTPRequestHandler):
                             iter_inner_sse(upstream, holder=holder),
                             allowed_names=_tool_names_from_payload(chat_req)),
                         self._sse_write)
+                    # 先探一针：stream_anthropic_events 首帧 message_start 不读
+                    # 内层数据，不先推进一格，错误信封会落在 200 已建流之后。
+                    _first = next(iter(inner), None)
+                    if _first is not None:
+                        inner = itertools.chain([_first], inner)
                     for frame in qoder_anthropic.stream_anthropic_events(
                             inner, model, holder):
                         if first_ms is None:
@@ -10387,6 +10441,9 @@ class Handler(BaseHTTPRequestHandler):
                                                      exc.detail)
                     log("anthropic upstream status %s: %s"
                         % (exc.status, msg[:200]), level="ERROR", tag="chat")
+                    if not getattr(self, "_chunked", False):
+                        # 首帧前就失败：回真实 HTTP 状态而不是 200 + 流内错误帧。
+                        return self._error(_to_int_status(exc.status), msg)
                     self._sse_write(qoder_anthropic.anthropic_error_frame(msg))
                     self._sse_end()
                     return
@@ -10629,7 +10686,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "upstream unreachable: %s" % exc)
         with upstream:
             if want_stream:
-                self._sse_begin()
+                # 不在此处 eager 建流：_sse_write 现在惰性发头。上游如果在
+                # 首帧前就报信封错，下面能改发真实 HTTP 状态码（而不是 200
+                # + 流内错误帧，客户端/聚合网关无法归类）。
                 first_ms = None
                 # 流内信封重试：上游可能 HTTP200 建流后在信封里投 418
                 # （access log 记 200 + 业务错 418 即此形态）。只要还没向
@@ -10654,12 +10713,21 @@ class Handler(BaseHTTPRequestHandler):
                             # issue #87：Responses 与 chat 走**同一条**回读链
                             # （此前只有 chat/Anthropic 有，Codex 侧泄漏型工具
                             # 调用只能等流末才被解析出来）。
-                            inner = _count_src(
-                                sse_with_heartbeat(
-                                    recover_leaked_tool_calls(
-                                        iter_inner_sse(cur, holder=holder),
-                                        allowed_names=_tool_names_from_payload(chat_req)),
-                                    self._sse_write))
+                            _raw = sse_with_heartbeat(
+                                recover_leaked_tool_calls(
+                                    iter_inner_sse(cur, holder=holder),
+                                    allowed_names=_tool_names_from_payload(chat_req)),
+                                self._sse_write)
+                            # 先探一针（在 _count_src 之前取，**不计入消费数**）：
+                            # stream_responses_events 首帧 response.created 不读内层数据，
+                            # 不先推进一格，错误信封会落在 200 已建流之后。探针取首行时
+                            # 抛 UpstreamStatus 还没写过任何字节 → consumed 仍为 0，
+                            # 首帧 418 信封重试（#64）语义保持；错误在后续行才抛时，
+                            # 计数从那行开始累，重开判定与旧实现一致。
+                            _first = next(iter(_raw), None)
+                            inner = _count_src(_raw)
+                            if _first is not None:
+                                inner = itertools.chain([_first], inner)
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
@@ -10761,6 +10829,12 @@ class Handler(BaseHTTPRequestHandler):
                     log("responses upstream status %s: %s"
                         % (_pst, msg[:200]), level="ERROR", tag="chat")
                     # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
+                    if not getattr(self, "_chunked", False):
+                        # 首帧前就失败（含探针阶段）：回真实 HTTP 状态；
+                        # 排队耗尽的 RateLimited 保住 Retry-After 口径。
+                        if isinstance(pump_exc, RateLimited):
+                            return self._rate_limited(pump_exc)
+                        return self._error(_to_int_status(_pst), msg)
                     try:
                         self._sse_write(_responses_failed_frame(
                             holder, _to_int_status(_pst), msg))
@@ -11101,7 +11175,7 @@ class Handler(BaseHTTPRequestHandler):
         with upstream:
             holder = {"usage": None}
             if want_stream:
-                self._sse_begin()
+                # 惰性建流（同上）：不在这里 eager 发 200 头，首帧前报错才能改发真实 HTTP 状态。
                 emitted = False
                 first_ms = None
                 # 流内信封重试（同上：200 建流后信封投 418 的形态），仅在
@@ -11212,6 +11286,13 @@ class Handler(BaseHTTPRequestHandler):
                                  key_id=self._key_id_for_usage())
                     msg, etype = friendly_upstream_error(
                         _to_int_status(_cst), exc.detail)
+                    if not getattr(self, "_chunked", False):
+                        # 首帧前就失败：还没向客户端发过任何字节（含头），
+                        # 直接给真实 HTTP 状态，客户端/聚合器才能正确归类轮换。
+                        # 排队耗尽（RateLimited）走 _rate_limited 保住 Retry-After。
+                        if isinstance(exc, RateLimited):
+                            return self._rate_limited(exc)
+                        return self._error(_to_int_status(_cst), msg, etype)
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
                         "code": _cst}}, ensure_ascii=False)
@@ -11223,6 +11304,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse_end()
                     return
                 if not emitted:
+                    if not getattr(self, "_chunked", False):
+                        # 上游一个数据行都没产出：回真实 502（客户端/聚合器
+                        # 能归类重试），而不是 200 + 流内 error 帧——后者正是
+                        # 「Stream ended before producing a non-ping event」的成因。
+                        return self._error(502, "empty upstream stream",
+                                           "server_error")
                     err = json.dumps({"error": {
                         "message": "empty upstream stream",
                         "type": "server_error"}})

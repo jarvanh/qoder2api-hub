@@ -1061,6 +1061,19 @@ def next_checkin_window(now=None):
     return int(boundary.timestamp()), boundary.strftime("%m-%d %H:%M") + "（UTC+8）"
 
 
+def next_daily_reset(now=None):
+    """下一个「每日 00:00（UTC+8）」日界 → epoch 秒（int）。
+
+    用于日计数类限流（如 Billing daily count exceeded）的停放截止：
+    到点即认为上游计数已重置，账号应重新可用。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    boundary = now8.replace(hour=0, minute=0, second=0, microsecond=0)
+    boundary += datetime.timedelta(days=1)
+    return int(boundary.timestamp())
+
+
 # ---------------------------------------------------------------------------
 # 账号级预算护栏（task-61）：常量 + 当日用量折叠
 # ---------------------------------------------------------------------------
@@ -1425,6 +1438,9 @@ class Account(object):
         self.enabled = data.get("enabled", True)
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
+        # 日计数超限停放（110 Billing daily count exceeded）：独立于 cooldown，
+        # note_success/clear_error/token 刷新都清不掉，只有到点或手工恢复才解除。
+        self.billing_until = float(data.get("billingUntil") or 0)
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
@@ -1519,6 +1535,7 @@ class Account(object):
             "enabled": self.enabled,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
+            "billingUntil": self.billing_until or None,
             "credits": self.credits,
             "lastQuotaAnomaly": self.last_quota_anomaly,
             "creditsDegraded": self.credits_degraded,
@@ -1629,6 +1646,8 @@ class Account(object):
             "inExpiringWindow": self.in_expiring_window(),
             "balanceParked": self.balance_until > time.time(),
             "balanceUntil": self.balance_until or None,
+            "billingParked": self.billing_until > time.time(),
+            "billingUntil": self.billing_until or None,
             "softStreak": int(self.soft_streak),
             "breakerFor": round(max(0.0, self.breaker_until - time.time())) or None,
             "degradeFor": round(max(0.0, self.degrade_until - time.time())) or None,
@@ -1682,6 +1701,8 @@ class Account(object):
         if not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
+            return False
+        if self.billing_until > time.time():   # 110 日计数停放（日界解封）
             return False
         if model and self.model_cooldowns.get(model, 0.0) > time.time():
             return False
@@ -1933,6 +1954,31 @@ class Account(object):
         actual_cooldown = 3 if single_account else cooldown
         self.cooldown_until = time.time() + actual_cooldown
         return actual_cooldown
+
+    def note_billing_limit(self, message, realm="", model=""):
+        """日计数超限（110 Billing daily count exceeded）→ 停放到下次日重置。
+
+        与 cooldown 的关键区别：note_success / clear_error / token 刷新都
+        **不会**清掉 billing_until——上游计数是「按日」的，一次成功请求
+        （比如刷新额度）并不能证明当日计数已恢复；唯一解除途径是自然到点
+        （UTC+8 00:00 日界，观察当天请求在 00:00–00:02 就恢复）或手工
+        clear_billing_limit。返回停放截止的 epoch 秒，供日志打真值（#29）。
+        """
+        deadline = float(next_daily_reset())
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.billing_until = deadline
+        # 立即落盘：停放必须活过容器重启（2026-10-27 现场教训——只写内存的
+        # 惩罚在容器重建后蒸发，整池复活空烧）。与 _post_token 尾部同模式。
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return deadline
+
+    def clear_billing_limit(self):
+        """手工解除 110 停放（面板/维护用）；自然到点无需调用。"""
+        self.billing_until = 0.0
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
