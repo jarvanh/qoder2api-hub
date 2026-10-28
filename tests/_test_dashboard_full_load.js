@@ -176,6 +176,19 @@ const blocks = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(x =>
 check('主 script 块可抽取且非空', blocks.length >= 1 && blocks[blocks.length - 1].length > 100000);
 const mainJs = blocks[blocks.length - 1];
 
+// 块顺序本身是契约：末块被抽出来整页 eval，blocks[0] 是 <head> 里的主题预点亮。
+// i18n 引导插在两者中间。再有人插一个 <script> 就会静默换掉这两处抽到的内容，
+// 而抽错块的表现是「主题/语言不生效」，不是报错 —— 所以这里显式钉住。
+check('script 块顺序 = 主题 / i18n / 主块（blocks[0] 与末块的身份是契约）',
+  blocks.length === 3 && /qd-theme/.test(blocks[0]) &&
+  /initLangSystem/.test(blocks[1]) && /BEGIN-PURE-I18N-CORE/.test(blocks[1]) &&
+  blocks[blocks.length - 1].length > 100000);
+
+// 走查的根是 document.body，<title> 不在那棵子里 —— 标题只能显式写一次。
+// 少了这一行不会报错，只是浏览器标签页一直留着中文，所以钉在源码上。
+check('i18n 块显式翻 document.title（走查碰不到 head）',
+  /document\.title\s*=\s*t\(document\.title\)/.test(blocks[1]));
+
 let sandboxErr = null;
 let api = null;
 global.document = doc; global.window = win; global.localStorage = win.localStorage;

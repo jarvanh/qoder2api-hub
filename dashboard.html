@@ -972,6 +972,438 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   });
 })();
 </script>
+<script>
+/* i18n 层。拆成三块放在同一个 <script> 里，是为了让「纯查找核」能被
+ * tests/_test_i18n_core.js 按锚点切出来在 node 里直接 eval —— 它不碰 DOM，
+ * 所以四级兜底语义（尤其是「查不到就原样返回中文」）可以脱离浏览器断言。
+ *
+ * 块顺序是有约束的：本块必须夹在 head/主题块与主脚本块之间。
+ * tests/_test_dashboard_full_load.js 取 blocks[length-1] 当主脚本、
+ * 断言 blocks[0] 是主题块；把本块挪到主脚本之后就等于让它测错对象。
+ *
+ * 为什么在 DOM 边界翻译、而不是把 650 处字面量改成 t('key')：
+ * 全仓 75% 的中文在主脚本里，其中近半是和运行期变量拼起来的片段
+ * （'最近一次对话（' + at + '）走了 ' + nameOf(r)），另有 ~315 条中文来自
+ * Python 后端经 fetch 渲染成 toast/错误框。观察器看到的是**最终落盘的字符串**，
+ * 所以静态 HTML、JS 动态文本、后端消息一套机制全覆盖，且不改任何源字面量
+ * ——17 处按中文文本 grep dashboard 源码的断言因此继续为绿。详见 docs/i18n.md。 */
+(function(){
+'use strict';
+
+/* ================= L2 · 纯查找核（无 DOM） ================= */
+/* BEGIN-PURE-I18N-CORE —— tests/_test_i18n_core.js 按这两个锚点切片 */
+var CJK = /[㐀-䶿一-鿿豈-﫿]/;
+
+var MSG = {}, PAT = {}, FRG = {}, MEM = new Map(), PTC = new Map(), READY = false;
+
+/* '{0}'/'{1}' 槽位编译成捕获组。先转义正则元字符，但故意放过 { } ——
+ * 它们是槽位语法，不是量词。 */
+function compile(tpl){
+  var slots = [];
+  var re = tpl.replace(/[.*+?^$()|[\]\\]/g, '\\$&')
+              .replace(/\{(\d+)\}/g, function(_, i){ slots.push(+i); return '([\\s\\S]+?)'; });
+  return { re: new RegExp('^' + re + '$'), slots: slots };
+}
+
+/* 槽位里常常本身就是可译片段（'走了 国内版'、'颜色主题: 跟随系统 (当前浅色)'）。
+ * 整句翻了、槽位留着中文，界面就成了半中半英 —— 所以填槽时再走一遍查表。
+ * 深度必须封死：源串只写 {0} 的模式会 ^(.+)$ 吃掉整句再自我递归，
+ * 不能指望包作者永远不写那种模式。 */
+var MAX_SLOT_DEPTH = 2;
+
+function fill(tpl, args, depth){
+  return tpl.replace(/\{(\d+)\}/g, function(_, i){
+    var v = args[+i];
+    if(v === undefined) return '';
+    return depth < MAX_SLOT_DEPTH ? lookup(v, depth + 1) : v;
+  });
+}
+
+/* 求值顺序按「便宜且可靠」排：整串精确 → 片段精确 → 折叠空白 → 模板正则。
+ * 前三级是哈希查表，最后一级是 O(P) 扫描且可能误捕获，所以放最后。
+ *
+ * 为什么要「折叠空白」这一遍：HTML 里跨行写的长文案，文本节点的 nodeValue
+ * 带着换行和缩进（浏览器只是**渲染时**折叠它，取值时不折叠）。抄成单空格的
+ * 键于是永远命不中，而且静默 —— 兜底返回原文，看起来只是「这条还没翻」。
+ * tests/_test_i18n_packs.py 就是为抓它而写的，也确实抓到了 5 条。
+ *
+ * 顺序不能反：先试未 trim 的原串，片段键的前导空格才有机会命中
+ * （' 个 Key 生效' → ' keys active'，空格是拼接的一部分）。i18n/README.md
+ * 承诺「空格属于键」，靠这个顺序兑现。 */
+function squash(s){ return s.replace(/\s+/g, ' ').trim(); }
+
+function lookup(src, depth){
+  var d = depth || 0;
+  if(MSG.hasOwnProperty(src)) return MSG[src];
+  if(FRG.hasOwnProperty(src)) return FRG[src];
+  var t = src.trim();
+  if(!t) return src;
+  if(t !== src){
+    if(MSG.hasOwnProperty(t)) return MSG[t];
+    if(FRG.hasOwnProperty(t)) return FRG[t];
+  }
+  var q = squash(src);
+  if(q !== t){
+    if(MSG.hasOwnProperty(q)) return MSG[q];
+    if(FRG.hasOwnProperty(q)) return FRG[q];
+  }
+  if(CJK.test(t)){
+    for(var k in PAT){
+      /* 编译缓存必须放在 PAT 之外：PAT[k] 是译文字符串本身，给字符串挂属性在
+       * 'use strict' 里直接抛 TypeError —— 浏览器实测会把整次 walk 打断在表头
+       * 之后（属性翻好了、正文没翻），node 的 sloppy eval 则静默失败，所以
+       * 这条只有严格模式的套件才抓得到。 */
+      var c = PTC.get(k);
+      if(c === undefined){ c = compile(k); PTC.set(k, c); }
+      var m = c.re.exec(t) || (q !== t && c.re.exec(q));
+      if(m && m !== false){
+        var a = {};
+        for(var i = 0; i < c.slots.length; i++) a[c.slots[i]] = m[i + 1];
+        return fill(PAT[k], a, d);
+      }
+    }
+  }
+  /* 第四级兜底：原样返回输入。这就是「缺翻译不留白、不漏 key」的实现点，
+   * 也是观察器写入后不会自触发死循环的原因 —— 英文不是任何 key，
+   * 再走一遍 t() 得到同一个字符串，比较相等就不再写。 */
+  return src;
+}
+
+function t(src){
+  if(typeof src !== 'string' || !READY) return src;
+  if(MEM.has(src)) return MEM.get(src);
+  var out = lookup(src);
+  MEM.set(src, out);
+  return out;
+}
+
+function tier(obj, label){
+  if(obj === undefined || obj === null) return {};
+  if(typeof obj !== 'object' || Array.isArray(obj)) throw new Error(label + ' must be an object');
+  var out = {};
+  for(var k in obj){
+    if(!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    if(typeof obj[k] !== 'string') throw new Error(label + ' entries must map to strings');
+    out[k] = obj[k];
+  }
+  return out;
+}
+
+/* 一个坏条目就让整包失效：半套翻译比没有更难排查（见 docs/i18n.md §12.3）。 */
+function load(pack){
+  var nextMsg = tier(pack && pack.messages, 'messages');
+  var nextPat = tier(pack && pack.patterns, 'patterns');
+  var nextFrg = tier(pack && pack.fragments, 'fragments');
+  MSG = nextMsg; PAT = nextPat; FRG = nextFrg;
+  MEM = new Map(); PTC = new Map();
+  READY = !!(Object.keys(MSG).length || Object.keys(PAT).length || Object.keys(FRG).length);
+  return READY;
+}
+/* END-PURE-I18N-CORE */
+
+var API = { t: t, load: load, isReady: function(){ return READY; } };
+if(typeof window !== 'undefined') window.QD_I18N = API;
+
+/* ================= L3 · DOM 应用引擎 ================= */
+var WATCH_ATTRS = ['title', 'placeholder', 'aria-label'];
+/* 日志流是后端自由格式的开发文本（~145 条），既最没翻译价值、又是每 5 秒
+ * 一轮的最大变更源；<code>/<pre> 是命令与配置示例，翻了就不可用。
+ * .no-i18n 给语言下拉自己用（母语名不能被翻成别的语言）。 */
+var SKIP_SEL = '.log-line, code, pre, .no-i18n';
+var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+
+function skippable(el){
+  return !!(el && el.closest && el.closest(SKIP_SEL));
+}
+
+function applyText(n){
+  if(seen){ if(seen.has(n)) return; seen.add(n); }
+  var out = t(n.nodeValue);
+  if(out !== n.nodeValue) n.nodeValue = out;
+}
+
+function applyAttrs(el){
+  if(!el || !el.hasAttribute) return;
+  for(var i = 0; i < WATCH_ATTRS.length; i++){
+    var a = WATCH_ATTRS[i];
+    if(!el.hasAttribute(a)) continue;
+    var cur = el.getAttribute(a);
+    var out = t(cur);
+    if(out !== cur) el.setAttribute(a, out);
+  }
+}
+
+function walk(root){
+  /* 节点桩没有 createTreeWalker 也要能跑完（见 tests 桩），静默降级。 */
+  if(!root || typeof document === 'undefined' || !document.createTreeWalker) return;
+  if(root.nodeType === 1){
+    if(skippable(root)) return;
+    applyAttrs(root);
+    /* SHOW_ELEMENT 的 walker 只会 yield root 的**后代**，永远不给 root 本身，
+     * 所以叶子元素（只有文本子节点的 button/span/h2）必须在这里直接处理自己的
+     * 孩子 —— 观察器报上来的恰恰多数是这种节点：文本被 JS 改掉时 target 就是它。
+     * 少这一段的表现是「属性翻了、正文没翻」，而且只在运行期改写的节点上出现。 */
+    var rk = root.childNodes;
+    for(var ri = 0; ri < rk.length; ri++){
+      if(rk[ri].nodeType === 3) applyText(rk[ri]);
+    }
+  }
+  var w = document.createTreeWalker(root, 1 /* SHOW_ELEMENT */, null);
+  var el = w.nextNode();
+  while(el){
+    if(!skippable(el)){
+      applyAttrs(el);
+      var kids = el.childNodes;
+      for(var i = 0; i < kids.length; i++){
+        if(kids[i].nodeType === 3) applyText(kids[i]);
+      }
+    }
+    el = w.nextNode();
+  }
+}
+
+var pending = null;
+function schedule(root){
+  if(!READY) return;
+  var target = root || document.body;
+  if(!target) return;
+  if(pending){ if(pending.indexOf(target) < 0) pending.push(target); }
+  else pending = [target];
+  var flush = function(){
+    var list = pending; pending = null;
+    if(!list) return;
+    for(var i = 0; i < list.length; i++) walk(list[i]);
+  };
+  /* rAF 在后台页签 / 被遮挡窗口里**根本不触发**（实测 visibilityState=hidden 时
+   * 一帧都不来）。语言切换走的是 reload，用户切走页签后整页会一直停在中文。
+   * 所以 rAF 只当「同帧合并」用，另挂一个定时器兜底；谁先到谁排空 pending，
+   * 另一个读到 null 直接返回 —— 重复调用无害，不需要额外状态。 */
+  if(typeof requestAnimationFrame === 'function') requestAnimationFrame(flush);
+  setTimeout(flush, 120);
+}
+
+function startObserver(){
+  if(typeof MutationObserver !== 'function' || !document.body) return;
+  new MutationObserver(function(recs){
+    var roots = [];
+    for(var i = 0; i < recs.length; i++){
+      var n = recs[i].target;
+      /* 文本节点自己不是可遍历根，取它的父元素。 */
+      var el = (n && n.nodeType === 3) ? n.parentElement : n;
+      if(el && el.nodeType === 1 && roots.indexOf(el) < 0) roots.push(el);
+    }
+    for(var j = 0; j < roots.length; j++) schedule(roots[j]);
+  }).observe(document.body, {
+    subtree: true, childList: true, characterData: true,
+    attributes: true, attributeFilter: WATCH_ATTRS
+  });
+}
+
+/* ================= L4 · 语言偏好与启动 ================= */
+var LANG_KEY = 'qd-lang';
+var PACK_CACHE = 'qd-i18n-pack';
+var SOURCE_LANG = 'zh';
+
+function readLS(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function writeLS(k, v){ try{ localStorage.setItem(k, v); }catch(e){} }
+
+function getPref(){
+  /* ?lang= 给截图和套件用；它不写进 localStorage，一次性覆盖。 */
+  try{
+    var q = new URLSearchParams(location.search).get('lang');
+    if(q) return q;
+  }catch(e){}
+  return readLS(LANG_KEY) || '';
+}
+
+/* 浏览器主语言子标签：'en-US' → 'en'；拿不到就空串。 */
+function navLang(){
+  var nav = (typeof navigator !== 'undefined' && navigator.language) ? navigator.language.toLowerCase() : '';
+  return nav ? nav.split('-')[0] : '';
+}
+
+function detectPref(packs){
+  var want = getPref();
+  if(want === SOURCE_LANG) return SOURCE_LANG;
+  var codes = {};
+  for(var i = 0; i < packs.length; i++) codes[packs[i].code] = 1;
+  if(want && codes[want]) return want;
+  var exact = navLang();
+  if(exact && codes[exact]) return exact;
+  return SOURCE_LANG;
+}
+
+/* 返回 {ok, version}：version 要和清单里的比一遍，否则缓存会变成永久旧包 ——
+ * 「往 i18n/ 丢个文件就生效」这条承诺只对第一次访问的人成立。 */
+function hydrateFromCache(code){
+  var out = {ok: false, version: 0};
+  if(!code || code === SOURCE_LANG) return out;
+  var raw = readLS(PACK_CACHE);
+  if(!raw) return out;
+  try{
+    var hit = JSON.parse(raw);
+    if(hit && hit.code === code && hit.pack && load(hit.pack)){
+      out.ok = true; out.version = hit.version || 0;
+    }
+  }catch(e){}
+  return out;
+}
+
+function fetchJSON(url){
+  return fetch(url, {cache: 'no-store'}).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  });
+}
+
+function loadPack(code, version){
+  if(code === SOURCE_LANG) return Promise.resolve(false);
+  return fetchJSON('/i18n/' + code + '.json').then(function(pack){
+    var ok = load(pack);
+    if(ok) writeLS(PACK_CACHE, JSON.stringify({code: code, version: version || 0, pack: pack}));
+    return ok;
+  });
+}
+
+/* 标签页标题不在 body 子树里，走查碰不到，只能显式翻一次。t() 是恒等兜底，
+ * 所以重复调用安全，缺键时保持中文。 */
+function applyTitle(){ document.title = t(document.title); }
+
+/* 只在启动时应用一次：灌包、走一遍已有 DOM、挂观察器。 */
+function applyActive(code, version){
+  document.documentElement.setAttribute('lang', code === SOURCE_LANG ? 'zh-CN' : code);
+  if(code === SOURCE_LANG) return Promise.resolve(false);
+  return loadPack(code, version).then(function(ok){
+    if(ok){ schedule(document.body); startObserver(); applyTitle(); }
+    return ok;
+  });
+}
+
+window.selectLang = function(code, evt){
+  if(evt){ evt.preventDefault(); evt.stopPropagation(); }
+  var next = code || SOURCE_LANG;
+  writeLS(LANG_KEY, next);
+  /* 换语言一律整页重载，包括「源语言 → 另一种语言」。
+   * 已改写的文本节点，它的中文原文只存在于改写前那一瞬间：原地切换在
+   * en → zh 这一步还原不出来，en → id 更会把英文留在页面上。给每个节点
+   * 存一份原值能绕过去，但那是一整类「切两次就残留」bug 的源头。
+   * 包体已缓存在 localStorage，重载后首帧即目标语言（docs/i18n.md §8）。 */
+  location.reload();
+};
+
+function closeLangMenu(){
+  var menu = document.getElementById('langDropdown');
+  var btn = document.getElementById('langToggleBtn');
+  if(menu) menu.classList.remove('open');
+  if(btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+window.toggleLangMenu = function(evt){
+  if(evt){ evt.preventDefault(); evt.stopPropagation(); }
+  var menu = document.getElementById('langDropdown');
+  var btn = document.getElementById('langToggleBtn');
+  if(!menu) return;
+  var wasOpen = menu.classList.contains('open');
+  var theme = document.getElementById('themeDropdown');
+  if(theme) theme.classList.remove('open');   // 两个下拉不同时开
+  var open = !wasOpen;
+  menu.classList.toggle('open', open);
+  if(btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+};
+
+var svgGlobe = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.2"></circle><path d="M3.2 9.2h17.6M3.2 14.8h17.6"></path><path d="M12 2.9c2.6 2.6 2.6 15.6 0 18.2M12 2.9c-2.6 2.6-2.6 15.6 0 18.2"></path></svg>';
+var svgCheck = '<svg class="theme-opt-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+function escHTML(s){
+  return String(s).replace(/[<>&"]/g, function(c){
+    return ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[c];
+  });
+}
+
+function renderMenu(packs, active){
+  var menu = document.getElementById('langDropdown');
+  var icon = document.getElementById('langToggleIcon');
+  if(icon && !icon.innerHTML) icon.innerHTML = svgGlobe;
+  if(!menu) return;
+  /* 下拉里一律用「母语自称」（English / Bahasa Indonesia / 简体中文）：
+   * 界面已经翻成一种你读不懂的语言时，只有母语名还找得回来。 */
+  var items = [{ code: SOURCE_LANG, name: '简体中文' }].concat(packs);
+  var html = '';
+  for(var i = 0; i < items.length; i++){
+    var code = String(items[i].code).replace(/[^A-Za-z0-9._-]/g, '');
+    var on = items[i].code === active;
+    html += '<button type="button" role="menuitem" class="theme-option no-i18n' + (on ? ' active' : '') +
+            '" onclick="selectLang(\'' + code + '\', event)">' +
+            '<span class="theme-opt-text">' + escHTML(items[i].name || code) + '</span>' +
+            svgCheck + '</button>';
+  }
+  menu.innerHTML = html;
+}
+
+window.initLangSystem = function(){
+  var pref = getPref();
+  /* 首屏之前先灌 localStorage 里的缓存包：第 2 次及以后访问不再闪中文。
+   * 首访没有缓存只能等 fetch —— 这是不做构建步骤、不做服务端内联的实际
+   * 下限（docs/i18n.md §8）。
+   * 自动跟随浏览器语言的人不会有 qd-lang，所以缓存要用同一个猜测去取；
+   * 用 pref 取的话这部分人每次都落回「重新拉 13 KB 包 + 先看到中文」。 */
+  var hydrateCode = pref || navLang();
+  var cached = hydrateFromCache(hydrateCode);
+  var boot = function(){
+    if(cached.ok){
+      document.documentElement.setAttribute('lang', hydrateCode);
+      schedule(document.body);
+      applyTitle();
+    }
+    startObserver();
+    fetchJSON('/i18n/manifest').then(function(m){
+      var packs = (m && m.packs) || [];
+      var code = detectPref(packs);
+      renderMenu(packs, code);
+      if(code === SOURCE_LANG){
+        /* 包被删掉或改名：缓存还在的话，界面会停在一门服务器上已经不存在的
+         * 语言。清掉缓存并重载一次 —— 重载后 cached.ok 为假，不会再进这条。 */
+        if(cached.ok){ writeLS(PACK_CACHE, ''); location.replace(location.href); }
+        return null;
+      }
+      var want = 0;
+      for(var i = 0; i < packs.length; i++){
+        if(packs[i].code === code) want = packs[i].version || 0;
+      }
+      if(cached.ok && cached.version === want) return null;   // 缓存就是当前版
+      /* 缓存没了、版本变了，或 ?lang= 指了一个没缓存的语言 —— 才真的去取包。 */
+      return applyActive(code, want).then(function(ok){
+        /* 版本变了而页面已经用旧包涂过一遍：文本节点进了 seen 就不再翻，
+         * 就地换包只能得到新旧混排 —— 跟就地换语言是同一个毛病。缓存已经
+         * 写成新包了，所以重载一次即可；重载后版本已对齐，不会再进这个分支。 */
+        if(ok && cached.ok) location.replace(location.href);
+        return ok;
+      });
+    }).catch(function(){
+      renderMenu([], SOURCE_LANG);   // 拿不到清单也要有按钮，只是没有可选项
+    });
+  };
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+
+  document.addEventListener('click', function(e){
+    var wrap = document.getElementById('langDropdownWrap');
+    var themeWrap = document.getElementById('themeDropdownWrap');
+    /* 点主题按钮也要收起语言菜单 —— 反过来已在 toggleLangMenu 里做了。
+     * 用「点到了另一个下拉的容器」而不是改主题块，保持主题脚本零改动。 */
+    var hitOther = themeWrap && themeWrap.contains(e.target);
+    if(hitOther || (wrap && !wrap.contains(e.target))){
+      var menu = document.getElementById('langDropdown');
+      if(menu && menu.classList.contains('open')) closeLangMenu();
+    }
+  });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape') closeLangMenu();
+  });
+};
+window.initLangSystem();
+})();
+</script>
 </head>
 <body>
 <header>
@@ -1005,6 +1437,17 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
     </nav>
   </div>
   <div class="header-right">
+    <!-- 复用主题下拉的 .theme-btn / .theme-dropdown / .theme-option：
+         零新增 CSS，[data-theme="dark"] 那批覆盖与 themePop 动画自动生效。
+         选项由 /i18n/manifest 在运行时渲染，这里不写死语言列表 —— 这才是
+         「丢一个 json 进 i18n/ 就多一门语言」的落点。 -->
+    <div class="theme-dropdown-wrap" id="langDropdownWrap">
+      <button type="button" class="theme-btn" id="langToggleBtn" onclick="toggleLangMenu(event)"
+              title="界面语言" aria-label="切换界面语言" aria-haspopup="true" aria-expanded="false">
+        <span id="langToggleIcon" class="theme-btn-icon"></span>
+      </button>
+      <div class="theme-dropdown" id="langDropdown" role="menu" aria-label="选择界面语言"></div>
+    </div>
     <div class="theme-dropdown-wrap" id="themeDropdownWrap">
       <button type="button" class="theme-btn" id="themeToggleBtn" onclick="toggleThemeMenu(event)" title="颜色主题" aria-label="切换颜色主题" aria-haspopup="true" aria-expanded="false">
         <span id="themeToggleIcon" class="theme-btn-icon"></span>
@@ -1147,6 +1590,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
             <th style="text-align:center;width:160px">模型能力</th>
             <th style="text-align:center;width:130px">上下文窗口</th>
             <th style="text-align:left">思考档位</th>
+            <th style="text-align:center;width:130px">上下文设置</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -2241,7 +2685,7 @@ function renderAvailableModels(){
     countEm.textContent = '(共 ' + MODELS_DATA.length + ' 个 · 开放 ' + openN + ' 个)';
   }
   if(!MODELS_DATA.length){
-    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无可用模型</td></tr>';
+    tb.innerHTML = '<tr><td colspan="6" class="empty">暂无可用模型</td></tr>';
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
@@ -2391,12 +2835,30 @@ function renderAvailableModels(){
       idLines.push('<div style="margin-top:2px;font-size:11px;color:var(--dim);line-height:1.45" title="'
         + esc(m.description) + '">' + esc(m.description) + '</div>');
     }
+    // 6. 上下文设置（issue #106）：官方 context_config 档位下拉；选中值发往网关
+    //    settings.model_context，build_qoder_body 按它抬 max_input_tokens。
+    const ctxKey = (m.upstream_key && m.upstream_key !== m.id)
+      ? m.upstream_key : m.id;
+    const ctxLabels = (m.context_window_labels && m.context_window_labels.length)
+      ? m.context_window_labels : (m.context_windows || []);
+    const ctxCur = String((window.SETTINGS_MODEL_CONTEXT || {})[ctxKey]
+      || (window.SETTINGS_MODEL_CONTEXT || {})[m.id] || '');
+    const ctxSel = ctxLabels.length
+      ? '<select class="ctx-select" data-model="' + esc(ctxKey) + '"'
+        + ' onchange="saveModelContext(this.dataset.model, this.value)">'
+        + '<option value="">默认' + (m.context_window_default
+            ? (' (' + esc(m.context_window_default) + ')') : '') + '</option>'
+        + ctxLabels.map(l => '<option value="' + esc(l) + '"' + (ctxCur === String(l) ? ' selected' : '') + '>'
+            + esc(l) + '</option>').join('')
+        + '</select>'
+      : '<span style="color:var(--dim)">—</span>';
     return '<tr>'
       + '<td style="text-align:left">' + idLines.join('') + '</td>'
       + '<td style="text-align:center">' + credBadge + '</td>'
       + '<td style="text-align:center">' + capHtml + '</td>'
       + '<td style="text-align:center">' + ctx + '</td>'
       + '<td style="text-align:left">' + effort + '</td>'
+      + '<td style="text-align:center">' + ctxSel + '</td>'
       + '</tr>';
   }).join('');
 }
@@ -4274,7 +4736,11 @@ async function refreshInner(){
     '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
-        + '<td class="mono">' + esc(r.model) + '</td>'
+        + '<td class="mono">' + esc(r.model)
+      + (r.billed_model && r.billed_model !== r.model
+        ? ' <span class="badge bad" title="上游实际按 ' + esc(r.billed_model) + ' 计费（该模型对网关身份未开放或被回退，计费与限额按它算）">' + '计费→' +
+            esc(r.billed_model) + '</span>'
+        : '') + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
@@ -4476,9 +4942,21 @@ async function startDashboard(){
   ];
 }
 
+async function saveModelContext(model, label){
+  try{
+    const r = await postJSON('/settings/model-context', {model: model, label: label});
+    window.SETTINGS_MODEL_CONTEXT = r.model_context || {};
+    renderAvailableModels();
+    toast(label ? ('上下文已设为 ' + label + '（立即生效，新请求起）')
+               : '已恢复官方默认上下文', 'ok');
+  }catch(e){ toast('保存失败: ' + e.message, 'bad'); }
+}
+
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    // issue #106：模型上下文档缓存给模型库表用（保存后也走这份）
+    window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
     const wtBox = document.getElementById('setWebTools');
     if(wtBox) wtBox.checked = data.web_tools === true;
     const wtState = document.getElementById('setWebToolsState');

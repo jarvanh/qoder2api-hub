@@ -33,7 +33,10 @@ jobs:
         include:
           # README 宣称 Python 3.9+，最低版本在 Linux 上锻炼；
           # 主力平台（Windows）跑当前版本。
-          - os: ubuntu-latest
+          # 注意：ubuntu-latest 已切到 Ubuntu 26.04，其 tool cache 不再提供
+          # Python 3.9（setup-python 直接报错，v1.7.8 CI 即栽在这）。3.9 钉在
+          # ubuntu-24.04 上继续测——代码本身仍保持 3.9 兼容；镜像到期前再评估。
+          - os: ubuntu-24.04
             python: "3.9"
           - os: ubuntu-latest
             python: "3.12"

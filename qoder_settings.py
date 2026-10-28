@@ -152,6 +152,54 @@ def ensure_launcher_key(accounts_dir):
 REALMS = ("", "intl", "cn")
 
 
+# ---------------------------------------------------------------------------
+# 模型上下文窗口覆盖（issue #106）
+# ---------------------------------------------------------------------------
+def model_context(accounts_dir):
+    """{model_key: "1M"|"400K"|"200K"|int}：用户为各模型选的上下文档。"""
+    raw = load(accounts_dir).get("model_context")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        key = str(k or "").strip()
+        if not key:
+            continue
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) and v > 0:
+            out[key] = v
+            continue
+        label = str(v or "").strip()
+        if label:
+            out[key] = label
+    return out
+
+
+def set_model_context(accounts_dir, model, label):
+    """设置/清除单个模型的上下文档（label 空串 = 回到官方默认）。"""
+    data = load(accounts_dir)
+    cur = data.get("model_context")
+    cur = dict(cur) if isinstance(cur, dict) else {}
+    key = str(model or "").strip()
+    if not key:
+        raise ValueError("model required")
+    if label in (None, "", 0):
+        cur.pop(key, None)
+    elif isinstance(label, int) and not isinstance(label, bool):
+        if label <= 0:
+            raise ValueError("tokens must be positive")
+        cur[key] = int(label)
+    else:
+        label = str(label).strip()
+        if label.isdigit() and int(label) > 0:
+            cur[key] = int(label)
+        else:
+            cur[key] = label[:12]
+    data["model_context"] = cur
+    save(accounts_dir, data)
+    return cur
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):

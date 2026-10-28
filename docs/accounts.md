@@ -158,6 +158,32 @@
 
 更完整的风控分析见[风控与排队](risk-control-and-queueing.md)和[风控处置手册](risk-control-playbook.md)。
 
+## 上下文窗口（#106）
+
+官方清单里多数模型的 `max_input_tokens` 默认落在 200K 档，而模型本身支持 1M/400K。网关现在允许两处设置：
+
+| 方式 | 生效范围 | 用法 |
+|---|---|---|
+| 面板「模型库 → 上下文设置」下拉 | 该模型的全局默认 | 写入 `accounts/settings.json` 的 `model_context`，立即生效（新请求起） |
+| 请求头 `X-QD-Context: 1M`（或 token 数） | 单次请求，优先级高于面板 | chat / responses / anthropic 三个端点都支持；无法抬到官方档位之外（如 `2M` 会被忽略并 WARN） |
+
+- 档位名对照官方 `context_config`（`1M` / `400K` / `200K`，大小写不敏感），也可以直接填 token 数；
+- 生效位置是出站请求体的 `model_config.max_input_tokens`，与官方桌面端选择档位是同一通道；
+- 客户端**不能**通过 body 里的 `_qd_context` 字段伪造（入口会先清除，只有 HTTP 头有效）；
+- 面板清除选择 = 回到官方默认档。
+
+## Kimi 等新模型被上游回退成 auto（#105）
+
+2026-10 实测：CN 区把 `kmodel_latest`（Kimi-K3 / K3.1-Pro）发给上游，上游**不报错**，但按 `auto` 路由与计费（官方清单同时给这些模型标了 `minimal_version.vsc = 999.999.999`，即该形态未放量）。这不是网关能修的——客户端版本身份是 COSY 签名的一部分，伪造更高版本只会把账号推进风控画像。
+
+网关能做的是**让这件事可见**：
+
+- usage 行新增 `billed_model`：仅当上游 usage 里的 model 与请求模型不一致时写入（一致时行格式零变化）；
+- 日志出现 `upstream billed a different model: requested=Kimi-K3 billed=auto`（WARN）；
+- 面板「最近请求」在模型列显示 `计费→auto` 红标——一眼看出「你以为在用 Kimi，其实在用 auto」。
+
+排查方法：想看某模型是否真被上游接受，直接看面板最近请求列有没有 `计费→` 徽标，或 grep 日志 `billed a different model`。
+
 ## 禁用与签到（#102）
 
 「禁用」只表示**不接推理流量**，不该顺带停掉每日签到——账号级奖励照领、会话也保持活性（效果近似 keepalive）。
