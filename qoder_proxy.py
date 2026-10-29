@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.10"
+VERSION = "1.7.11"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5749,9 +5749,49 @@ QUEUE_MODE = (os.environ.get("QD_QUEUE_WAIT_MODE") or "visible").strip().lower()
 if QUEUE_MODE not in ("visible", "fast", "wait"):
     QUEUE_MODE = "visible"
 
+# fork：按模型排队策略。QD_QUEUE_FAST_MODELS 列出「不等队列」的模型（逗号/分号
+# 分隔，匹配公开模型名或上游 modelKey，大小写不敏感，支持 * 通配）；命中即
+# fast——遇到 10605 排队立即 503 + Retry-After 交给网关退避，不占流式等待预算。
+# 典型用途：限免/赠品模型放 combo 首位抢到账窗口，坏时秒切下一腿；付费模型
+# 不列入，照常走全局档（visible）在流内排队等待。
+QUEUE_FAST_MODELS_RAW = (os.environ.get("QD_QUEUE_FAST_MODELS") or "")
+QUEUE_FAST_MODELS = frozenset(
+    s.strip().lower()
+    for s in QUEUE_FAST_MODELS_RAW.replace(";", ",").split(",")
+    if s.strip() and not any(c in s for c in "*?"))
+QUEUE_FAST_MODEL_GLOBS = tuple(
+    s.strip().lower()
+    for s in QUEUE_FAST_MODELS_RAW.replace(";", ",").split(",")
+    if s.strip() and any(c in s for c in "*?"))
 
-def queue_mode():
-    """当前排队策略（visible / fast / wait）。"""
+
+def _is_fast_queue_model(model="", model_key=""):
+    """该模型（公开名或 modelKey，大小写不敏感）是否命中 QD_QUEUE_FAST_MODELS。"""
+    if not QUEUE_FAST_MODELS and not QUEUE_FAST_MODEL_GLOBS:
+        return False
+    for cand in (model, model_key):
+        if not cand:
+            continue
+        c = str(cand).strip().lower()
+        if not c:
+            continue
+        if c in QUEUE_FAST_MODELS:
+            return True
+        for pat in QUEUE_FAST_MODEL_GLOBS:
+            if fnmatch.fnmatch(c, pat):
+                return True
+    return False
+
+
+def queue_mode(model="", model_key=""):
+    """当前排队策略（visible / fast / wait）。
+
+    不传模型 = 全局档（/health 与既有调用方兼容）；传入 model/model_key 时，
+    QD_QUEUE_FAST_MODELS 命中的模型强制 fast（优先于全局 wait——该模型
+    「不等队列」是名单语义，不应被全局档覆盖）。
+    """
+    if _is_fast_queue_model(model, model_key):
+        return "fast"
     return QUEUE_MODE
 
 
@@ -7137,7 +7177,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                              <= QUEUE_WAIT_BUDGET_SECS)
                 # issue #87：visible 模式由调用方（流式 handler）提供 on_queue，
                 # 它在**流内**发心跳+排队提示；fast 模式直接抛给 handler 返回 503。
-                if _can_wait and on_queue is not None:
+                if (_can_wait and on_queue is not None
+                        and queue_mode(model, model_key) == "visible"):
                     queue_tries += 1
                     log("upstream queued on '%s' model '%s' - waiting %ds "
                         "(round %d/%d, visible)"
@@ -7149,7 +7190,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         pass
                     time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
-                if qwait > 0 and queue_mode() != "wait":
+                if qwait > 0 and queue_mode(model, model_key) != "wait":
+                    if _is_fast_queue_model(model, model_key):
+                        log("upstream queued on '%s' model '%s' (qwait=%ds) "
+                            "- fast reject per QD_QUEUE_FAST_MODELS"
+                            % (account.uid[:8], model, qwait),
+                            level="WARN", tag="chat")
                     raise UpstreamQueued(qwait, detail,
                                          int(time.time() - queue_start))
                 if _can_wait:
@@ -10590,7 +10636,7 @@ class Handler(BaseHTTPRequestHandler):
             # （_sse_begin 尚未调用），所以流内等待不存在「重复 message_start」
             # 的顾虑——docstring 里那条能力差异只适用于 aggregate_stream 之后。
             _msg, _et = friendly_upstream_error(503, exc.detail)
-            if not want_stream or queue_mode() != "visible":
+            if not want_stream or queue_mode(model, model_key) != "visible":
                 return self._error(503, _msg, _et, retry_after=exc.retry_after)
             self._sse_begin()
             _q0 = time.time()
@@ -10879,7 +10925,7 @@ class Handler(BaseHTTPRequestHandler):
             # issue #87：排队——visible 在流内等待并持续报告进度；
             # fast / 非流式直接 503 + Retry-After + 中文原因。
             _msg, _et = friendly_upstream_error(503, exc.detail)
-            if not want_stream or queue_mode() != "visible":
+            if not want_stream or queue_mode(model) != "visible":
                 return self._error(503, _msg, _et, retry_after=exc.retry_after)
             self._sse_begin()
             _q0 = time.time()
@@ -11391,7 +11437,7 @@ class Handler(BaseHTTPRequestHandler):
             # issue #87：排队——visible 在流内等待并持续报告进度；
             # fast / 非流式给 503 + Retry-After + 中文原因。
             _msg, _et = friendly_upstream_error(503, exc.detail)
-            if not want_stream or queue_mode() != "visible":
+            if not want_stream or queue_mode(model) != "visible":
                 return self._error(503, _msg, _et, retry_after=exc.retry_after)
             self._sse_begin()
             _q0 = time.time()

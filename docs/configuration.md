@@ -156,6 +156,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_QUEUE_WAIT_MAX_SECS` | `180` | 单轮最多等待的秒数 |
 | `QD_QUEUE_WAIT_BUDGET_SECS` | `600` | 排队总共最多等待的秒数 |
 | `QD_QUEUE_WAIT_JITTER` | `2` | 每次排队等待额外加上 0 到 N 秒的随机抖动，避免多个客户端同时唤醒 |
+| `QD_QUEUE_FAST_MODELS` | （空） | 按模型强制 fast 排队：逗号/分号分隔的公开模型名或 modelKey（大小写不敏感，支持 `*` 通配）。命中的模型遇 10605 排队立即 503 + Retry-After 交给客户端退避，不占流式等待预算；未列出的模型照常走 `QD_QUEUE_WAIT_MODE` 全局档。典型用途：限免/赠品模型交给网关层退避，付费模型维持流内排队 |
 | `QD_SSE_HEARTBEAT` | `5` | 等待首字期间发送 SSE 心跳的间隔（秒），`0` 表示关闭 |
 
 ### 流量守卫

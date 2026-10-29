@@ -9,6 +9,10 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.11
+
+fork 维护版：**按模型排队策略 `QD_QUEUE_FAST_MODELS`**。新增逗号/分号分隔的模型名单（匹配公开名或 modelKey，大小写不敏感，支持 `*` 通配），命中的模型遇 10605 / RESOURCE_LIMIT 排队立即 503 + Retry-After（fast），不占流式等待预算；未列出的模型照常走 `QD_QUEUE_WAIT_MODE` 全局档（visible 在流内排队等待不受影响）。名单语义优先于全局档（全局 wait 下命中名单仍 fast）。三个入口（chat / responses / anthropic）的流式消费点与 open_upstream 重试循环全部带模型上下文；fast 拒绝打 WARN 日志；/health 的 queue_mode 展示保持全局档不变。典型用途：赠品/限免模型放 combo 首位抢到账窗口，排队时秒拒秒切下一腿；付费模型不列入名单、排队照等。新增 tests/_test_fork_fast_queue_models.py（18 checks），既有 #87/#99/#71/queue403 排队套件全绿。
+
 ## v1.7.10
 
 fork 维护版：合并上游 v1.7.8（#105/#106/#107/#108/#109 + i18n + CI），保留 fork 110 日界停放语义（f1ba521）优先于上游 #108 的 110 本地 0 点冷却分支；_test_quota_envelope.py 的 110 断言改写为 fork 停放语义（billing_until/ready() 拦截）。全量 86 套件 2415 checks 通过。（v1.7.9 tag 因 VERSION 常量未随合并递增而跳过，部署镜像直接落 1.7.10。）
