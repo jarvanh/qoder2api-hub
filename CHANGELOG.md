@@ -9,6 +9,29 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.14
+
+fork 维护版：**积分到期语义显式化 + NEVER 占位还原**（下游误报「7 天内真损失 1,737」
+的根因修复）。
+
+- **`credits.expires_at` 语义标注**：上游 `/api/v2/quota/usage` 的**顶层** `expiresAt`
+  是「本周期配额**刷新/重置**」时刻，不是积分作废时刻（实测 131 号该值与面板原文
+  「将于 2026年10月30日 23:59:38 **刷新配额**」逐秒一致）。旧实现只写一个裸时刻，
+  下游必然读成「到期作废」——实测把「月额剩余 237 + 资源包 1,500（11/16–11/29 才
+  到期）」合并报成「2 小时后损失 1,737」。本次**新增** `expires_kind`
+  （`"refresh"` / `"never"` / `""`）、`refresh_at`（与 `expires_at` 同源）、
+  `package_expiry_known`（包级到期是否真的可得，上游当前恒 False）三个语义字段；
+  `expires_at` 名字与含义边界保持不变（`qoder_tasks.ledger_is_unknown` 依赖它）。
+- **NEVER 占位被毫秒启发式抹掉的既有 bug**：「永不过期」占位是**秒级**
+  253402214400（≈ 公元 9999 年），而 `normalize_epoch` 对 >1e11 一律当毫秒除以 1000
+  → 抹成 253402214（≈1978 年），导致 `ledger_is_unknown()` 的
+  `>= LEDGER_NEVER_EPOCH` 判据**永不成立**：退化 body（全 0 + `isQuotaExceeded`）
+  会被当成「真实余额 0」而非「账本未知」，可能误触发限额护栏误拦账号。现占位值
+  先按原值短路，其余才走归一。
+- **测试**：`tests/_test_credit_expiry.py` 从 6 checks 扩到 14（新增 E4a–f 语义字段、
+  E5/E5b NEVER 占位还原与 `ledger_is_unknown` 联动）。全量 **91 套件 / 2527 checks
+  全绿**。
+
 ## v1.7.13
 
 fork 维护版：**信封层也按 QD_QUEUE_FAST_MODELS 快速拒绝**。线上验证发现 10605 排队常以 HTTP 200 + 流内 SSE 信封投递，v1.7.11 盖住的 HTTP 层 fast 不触发（线上 `fast reject` 0 次实锤），流内信封重试循环仍睡 retryAfterSeconds×N（约 99s）。本次：`should_retry_envelope` 增加 model 参数，排队类信封命中名单立即放弃重试（由调用方转 429 + Retry-After，与 HTTP 层语义一致）；modelKey 藏在多层转义的 detail JSON，去反斜杠平铺后正则提取兼底；三个流内调用点（aggregate/responses/chat）全部传 model 上下文；emitted>0 绝不重试的计费安全语义不变；未设名单行为与 1.7.10 一致。测试套件扩到 27 checks（信封层 9 条），#87/#99/#71/queue403 排队回归全绿。

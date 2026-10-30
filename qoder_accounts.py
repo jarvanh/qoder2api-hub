@@ -1832,11 +1832,12 @@ class Account(object):
         未知数据永不构成偏好（R7：expiring_window_days 默认 0 = 关闭）。
 
         S1 实测（2026-10）：上游 /quota/usage 的 userQuota / addOnQuota 内部
-        **没有**任何到期字段——真正的到期只有响应**顶层** expiresAt（已原样存
-        在 credits["expires_at"]；其归属未经证实，故不映射到包级：误贴会把
-        「按月重置」的额度算成临期、反向消耗）。因此在真实数据上本函数恒返回
-        None = 偏好不触发（安全侧）；fetch_credits 已对未来的包级到期字段做
-        透传，上游一补就自动生效（回归守卫见 tests/_test_credit_expiry.py）。
+        **没有**任何到期字段——响应**顶层** expiresAt 是「本周期配额刷新」时刻
+        （v1.7.14 起由 credits["expires_kind"]="refresh" + credits["refresh_at"]
+        显式标注，包级可得性见 credits["package_expiry_known"]），不映射到
+        包级：误贴会把「按月重置」的额度算成临期、反向消耗。因此在真实数据上
+        本函数恒返回 None = 偏好不触发（安全侧）；fetch_credits 已对未来的包级
+        到期字段做透传，上游一补就自动生效（回归守卫见 tests/_test_credit_expiry.py）。
         """
         cred = self.credits
         if not isinstance(cred, dict):
@@ -3133,6 +3134,24 @@ class Account(object):
             _prev_eff = (self.credits or {}).get("remain_effective")
         except Exception:
             _prev_eff = None
+        # 「永不过期」占位是**秒级** 253402214400（≈ 公元 9999 年），而
+        # normalize_epoch 的毫秒启发式（>1e11 即除以 1000）会把它抹成
+        # 253402214（≈1978 年）—— 于是 qoder_tasks.ledger_is_unknown()
+        # 的 `>= LEDGER_NEVER_EPOCH` 判据永远不成立，退化 body（全 0 +
+        # isQuotaExceeded）会被当成「真实余额 0」而非「账本未知」，可能
+        # 误触发限额护栏误拦账号。占位值先按原值短路，其余才走归一。
+        try:
+            _raw_top = float(q.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            _raw_top = 0.0
+        _top_exp = (int(_raw_top) if _raw_top >= _EXPIRY_NEVER_EPOCH
+                    else normalize_epoch(q.get("expiresAt")))
+        # 包级到期是否真的可得（packages 里带 expires_at / days_left 才算）：
+        # 上游当前只给汇总桶，下游不得拿 credits.expires_at 去推「资源包要作废」。
+        _pkg_exp_known = any(
+            ("expires_at" in p or "expire_at" in p or "days_left" in p)
+            for p in _pkgs
+        )
         self.credits = {
             "remain": remain,
             "remain_effective": remain_effective,
@@ -3140,7 +3159,19 @@ class Account(object):
             "size": size,
             "exceeded": bool(q.get("isQuotaExceeded")),
             "usage_pct": q.get("totalUsagePercentage"),
-            "expires_at": normalize_epoch(q.get("expiresAt")),
+            # expires_at 语义（2026-10-30 修）：上游 /quota/usage 的**顶层**
+            # expiresAt 是「本周期配额刷新/重置」时刻，**不是**积分作废时刻
+            # —— 实测 131 号与该号面板原文「将于 … 23:59:38 刷新配额」逐秒一致。
+            # 此前只写 expires_at 一个裸时刻，下游必然读成「到期作废」，把
+            # 「月额 237 + 资源包 1500（11/16–11/29 才到期）」报成「2 小时后
+            # 损失 1,737」。字段名保持不变（qoder_tasks.ledger_is_unknown 依赖
+            # 它做 NEVER 占位判定），另补 expires_kind / refresh_at 让下游按
+            # 语义读，不必再猜；package_expiry_known=False 明确告知包级不可得。
+            "expires_at": _top_exp,
+            "expires_kind": ("never" if _top_exp >= _EXPIRY_NEVER_EPOCH
+                             else ("refresh" if _top_exp else "")),
+            "refresh_at": _top_exp,
+            "package_expiry_known": _pkg_exp_known,
             "shared": shared,
             "packages": _pkgs,
             "updated_at": time.time(),

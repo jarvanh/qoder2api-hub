@@ -33,7 +33,7 @@ def check(label, cond, extra=None):
         print("  [FAIL] %s  %r" % (label, extra))
 
 
-def _quota_shape(addon_extra=None):
+def _quota_shape(addon_extra=None, top_expires=None):
     """探针抓到的真实响应形状（脱敏：数值为无关样例）。
 
     顶层 expiresAt 用「永不过期」占位（253402214400，实测 CN 号会返回该值），
@@ -46,7 +46,7 @@ def _quota_shape(addon_extra=None):
     return {
         "userId": "u", "userType": "personal_standard", "usageType": "credits",
         "totalUsagePercentage": 0.14, "isQuotaExceeded": False,
-        "expiresAt": 253402214400,
+        "expiresAt": 253402214400 if top_expires is None else top_expires,
         "userQuota": {"total": 300.0, "used": 147.0, "remaining": 153.0,
                       "percentage": 0.5, "unit": "credits"},
         "addOnQuota": aq,
@@ -96,6 +96,47 @@ check("E3 顶层 expiresAt（永不过期占位）不被映射到包级（防反
       all("expires_at" not in p for p in a1.credits["packages"])
       and all("expires_at" not in p for p in a2.credits["packages"]
               if p["name"] == "基础额度"))
+
+# ---- E4：顶层 expiresAt 的**语义**必须显式标注（v1.7.14 起）---------------
+# 背景：旧实现只写 credits["expires_at"] 一个裸时刻，下游必然读成「积分作废」。
+# 实测 131 号该值与该号面板原文「将于 2026年10月30日 23:59:38 刷新配额」
+# 逐秒一致 —— 是**配额刷新**时刻，不是到期作废；而 credits["remain"] 混合了
+# 月额剩余与 11/16–11/29 才到期的资源包。下游据此报出「2 小时后损失 1,737」。
+# ⚠️ E4 的顶层 expiresAt 必须显式给非占位值：真实 131 号形状是顶层 2 小时后
+# 刷新 + 包级无任何到期字段。此前只改 addOnQuota 不够（顶层仍是 NEVER 占位），
+# 且旧 normalize_epoch 的毫秒启发式会把占位抹成 1978 年，让本断言**假通过**。
+a3 = _fetch(_quota_shape(top_expires=time.time() + 2 * 3600))
+check("E4 非占位顶层 expiresAt → expires_kind='refresh'（刷新，不是作废）",
+      a3.credits.get("expires_kind") == "refresh", a3.credits.get("expires_kind"))
+check("E4b refresh_at 与 expires_at 同源同值（下游按语义读，不必猜）",
+      a3.credits.get("refresh_at") == a3.credits.get("expires_at")
+      and a3.credits.get("refresh_at", 0) > 0, a3.credits.get("refresh_at"))
+check("E4c 永不过期占位 → expires_kind='never'（保留 NEVER 判据语义）",
+      a1.credits.get("expires_kind") == "never", a1.credits.get("expires_kind"))
+check("E4d 无 packages 包级到期 → package_expiry_known=False（明确告知不可得）",
+      a1.credits.get("package_expiry_known") is False,
+      a1.credits.get("package_expiry_known"))
+a4 = _fetch(_quota_shape(addon_extra={"expiresAt": time.time() + 3 * 86400}))
+check("E4e 上游补上包级到期 → package_expiry_known=True（下游可放心算损失）",
+      a4.credits.get("package_expiry_known") is True,
+      a4.credits.get("package_expiry_known"))
+check("E4f 既有 expires_at 字段仍在（qoder_tasks.ledger_is_unknown 依赖）",
+      isinstance(a1.credits.get("expires_at"), int),
+      a1.credits.get("expires_at"))
+
+# ---- E5：NEVER 占位不得被毫秒启发式抹掉（v1.7.14 顺带修）-------------------
+# normalize_epoch 对 >1e11 的值一律当毫秒除以 1000，而「永不过期」占位
+# 253402214400 是**秒级** 9999-12-31 → 被抹成 253402214（1978 年），
+# 使 ledger_is_unknown 的 `>= LEDGER_NEVER_EPOCH` 判据永不成立。
+import qoder_tasks as _T
+_deg = _fetch(_quota_shape())          # 顶层是 NEVER 占位
+check("E5 NEVER 占位原样保留（不被 /1000 抹成 1978 年）",
+      _deg.credits.get("expires_at") == 253402214400,
+      _deg.credits.get("expires_at"))
+_deg_cred = dict(_deg.credits, remain=0, remain_effective=0, size=0,
+                 exceeded=True)
+check("E5b 退化 body → ledger_is_unknown 判为 True（未知账本，不当 0 用）",
+      _T.ledger_is_unknown(_deg_cred) is True, _deg_cred.get("expires_at"))
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))
