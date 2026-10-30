@@ -9,6 +9,38 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.16
+
+fork 维护版：**fast 拒绝改走 OmniRoute combo 回退协议**——不再把聚合网关逼成终端错误。
+
+- **现场**：`QD_QUEUE_FAST_MODELS=dfmodel,deepseek-flash` 命中排队时，HTTP 层报
+  503、信封层报 429（两条出口不统一）。OmniRoute 3.8.52 把上游 **429** 归类为
+  `rate_limit_exceeded` → **Model-only lockout**（该模型锁 30s、连接保持活跃），
+  于是同一 combo 内反复撞上「all credentials cooling down」，最终向客户端抛
+  `[429] upstream rate limit reached ... retry in 30s` 与
+  `[503] Model runner-qoder-free/DeepSeek-Flash is unavailable`——**排队本应秒切下一腿，
+  实际变成整条 combo 报错**。
+- **协议**：OmniRoute 内建一条显式回退通道（bundle 实证）：上游返回
+  **503 + 响应头 `x-omni-fallback-hint: connection_cooldown`** 时判定为
+  `{shouldFallback: true, reason: service_not_running, skipProviderBreaker: true}`——
+  立即切 combo 下一腿，且**不计入 provider 熔断**。这正是「暂时不可用，请换腿」
+  的正确语义；而裸 503 只被当 `server_error`（仍会计熔断）。
+- **改动**：`_error()` 新增 `fallback_hint` 参数（仅 code==503 才发头，int(code)
+  做类型兼底）；`UpstreamQueued` 自带 `fallback_hint=True`；三个入口（chat /
+  responses / anthropic）的 fast / 非流式排队拒绝均显式带上；`_rate_limited()`
+  见 `exc.fallback_hint` 改发 503 + 回退头（非名单模型维持 429 口径）；
+  `_as_rate_limited_for_queue()` 按公开名 + detail 里的 modelKey 判定命中则打
+  hint 并置 `http_error=503`（记账与对外状态一致）。
+- **同时修掉一个隐藏降级**：三处非流式 `aggregate_with_envelope_retry` 调用方
+  只接 `UpstreamStatus`，而 `RateLimited` **不是它的子类**，排队耗尽会掉进
+  `except Exception` → 变成 **502**（既无 Retry-After 也无回退头，且被 OmniRoute
+  计成服务端故障）。现各补一条 `except RateLimited`（hinted 记 503 / 其余记 429）。
+- **兼容性**：不认识该头的客户端（OpenClaw / new-api / 直连）行为不变——仍是
+  503 + Retry-After + 中文原因；未设名单的模型完全照旧（走 `QD_QUEUE_WAIT_MODE`）。
+- **测试**：`tests/_test_fork_fast_queue_models.py` 27 → **40 checks**（新增
+  hint 标记、503 专发、非名单不带 hint、三处 fast 点、非流式兼底、版本断言）。
+  全量 **91 套件 / 2543 checks 全绿**。
+
 ## v1.7.15
 
 fork 维护版：**修 v1.7.14 引入的占位判别误伤**（毫秒时间戳被当成「永不过期」）。

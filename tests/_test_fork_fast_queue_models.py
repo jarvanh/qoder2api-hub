@@ -13,6 +13,11 @@
 - v1.7.12 信封层：流内 10605 信封（多层转义 JSON）按公开名 / detail 里
   modelKey 命中名单 → 不再睡 retryAfterSeconds×N 轮，立即转 429；
   非名单模型照旧；未设名单行为与 1.7.10 一致；emitted 计费安全优先
+- v1.7.16 回退协议头：fast 拒绝（名单命中）统一 503 +
+  x-omni-fallback-hint: connection_cooldown —— OmniRoute combos 立即切
+  下一腿且 skipProviderBreaker，而不是按 429 锁死模型；非名单模型
+  维持 429 口径；UpstreamQueued 三个 handler 快速拒绝点与非流式
+  aggregate 调用方的 except RateLimited 兼底
 """
 import json
 import os
@@ -144,6 +149,45 @@ try:
           "should_retry_envelope(exc, False, attempt, model=model)" in _src)
     check("信封层 fast 拒绝打 WARN 日志（可观测）",
           "envelope queue on model" in _src and "fast reject per" in _src)
+
+    # ------------------------------------------------- v1.7.16 回退协议头
+    print("[fork16] 快速拒绝统一 503 + x-omni-fallback-hint（OmniRoute combo 回退）")
+    P.QUEUE_MODE = "visible"
+    P.QUEUE_FAST_MODELS = frozenset({"dfmodel", "deepseek-flash"})
+    P.QUEUE_FAST_MODEL_GLOBS = ()
+    _e_df16 = _envelope_with("dfmodel")
+    _rl_hit = P._as_rate_limited_for_queue(_e_df16, model="DeepSeek-Flash")
+    check("信封 fast 转换仍是 RateLimited",
+          isinstance(_rl_hit, P.RateLimited), type(_rl_hit).__name__)
+    check("名单命中带 fallback_hint（OmniRoute 回退协议）",
+          getattr(_rl_hit, "fallback_hint", False) is True)
+    check("名单命中 http_error=503（与出门状态一致）",
+          _rl_hit.http_error == 503, _rl_hit.http_error)
+    check("名单命中 wait=上游 retryAfterSeconds", _rl_hit.wait == 30, _rl_hit.wait)
+    _e_km16 = _envelope_with("kmodel")
+    _rl_miss = P._as_rate_limited_for_queue(_e_km16, model="GLM-5.3-Flash")
+    check("非名单模型维持普通 429 口径（不带 hint）",
+          isinstance(_rl_miss, P.RateLimited)
+          and not getattr(_rl_miss, "fallback_hint", False))
+    check("非名单模型 http_error 保持 None",
+          _rl_miss.http_error is None, _rl_miss.http_error)
+    _q16 = P.UpstreamQueued(30, '{"code":"10605"}', waited=0)
+    check("UpstreamQueued 自带 fallback_hint 标记",
+          getattr(_q16, "fallback_hint", False) is True)
+    _src16 = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+    check("_error 支持 fallback_hint 并发 x-omni-fallback-hint",
+          "x-omni-fallback-hint" in _src16
+          and '"x-omni-fallback-hint"] = "connection_cooldown"' in _src16)
+    check("仅 503 才带回退头（非 503 不误发）",
+          "int(code) == 503" in _src16)
+    check("三个 UpstreamQueued 快速拒绝点都显式带 fallback_hint=True",
+          _src16.count("fallback_hint=True") >= 3, _src16.count("fallback_hint=True"))
+    check("_rate_limited 见 hint 改发 503（不再 429 锁死模型）",
+          'if getattr(exc, "fallback_hint", False):' in _src16)
+    check("非流式 aggregate 调用方补齐 except RateLimited（防掉 502）",
+          _src16.count("except RateLimited as exc:") >= 8,
+          _src16.count("except RateLimited as exc:"))
+    check("版本号递增 1.7.16", 'VERSION = "1.7.16"' in _src16)
 finally:
     _restore()
 

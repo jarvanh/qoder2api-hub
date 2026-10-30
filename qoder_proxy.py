@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.15"
+VERSION = "1.7.16"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5901,6 +5901,11 @@ class UpstreamQueued(UpstreamStatus):
         self.retry_after = max(1, retry_after)
         self.detail = detail or ""
         self.waited = int(waited)
+        # fork v1.7.16：OmniRoute combo 回退协议标记 —— 上层 _error 见 503 +
+        # 该标记就补发 x-omni-fallback-hint: connection_cooldown，OmniRoute
+        # 立即切 combo 下一腿且 skipProviderBreaker；不识别该头的客户端
+        # 仍按 503 + Retry-After 处理，行为不变。
+        self.fallback_hint = True
 
 
 
@@ -6622,11 +6627,22 @@ def _as_rate_limited_for_queue(exc, model=""):
     """排队类信封错误 -> RateLimited（429 + Retry-After）；其它原样返回。
 
     issue #71：排队最终以 403 抛给客户端，很容易被当成凭证失效。
+    fork v1.7.16：QD_QUEUE_FAST_MODELS 命中（公开名或 detail 里的
+    modelKey）时带 fallback_hint —— 上层 _rate_limited 见之改发
+    503 + x-omni-fallback-hint，让 OmniRoute combo 秒切下一腿而非锁死模型；
+    非名单模型维持普通 429（排队等满预算后的语义不变）。
     """
     q = _envelope_queue_wait(exc) if exc is not None else 0
     if q <= 0:
         return exc
-    return RateLimited(None, getattr(exc, "detail", "") or "", wait=q)
+    rl = RateLimited(None, getattr(exc, "detail", "") or "", wait=q)
+    _mk = re.search(r'"modelKey"\s*:\s*"([\w.\-]+)"',
+                    (getattr(exc, "detail", "") or "").replace("\\", ""))
+    if _is_fast_queue_model(model, _mk.group(1) if _mk else ""):
+        rl.fallback_hint = True
+        # 记账口径与对外状态一致：fast 拒绝最终以 503 出门（见 _rate_limited）。
+        rl.http_error = 503
+    return rl
 
 
 def _queue_budget():
@@ -9008,10 +9024,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, code, message, err_type="server_error", retry_after=None):
-        extra = {"Retry-After": int(retry_after)} if retry_after else None
+    def _error(self, code, message, err_type="server_error", retry_after=None,
+               fallback_hint=False):
+        extra = {}
+        if retry_after:
+            extra["Retry-After"] = int(retry_after)
+        if fallback_hint:
+            try:
+                _hint_ok = int(code) == 503
+            except (TypeError, ValueError):
+                _hint_ok = False
+            if _hint_ok:
+                # OmniRoute combos 回退协议（3.8.52 bundle 实证）：上游 503 +
+                # x-omni-fallback-hint: connection_cooldown -> shouldFallback=true
+                # 且 skipProviderBreaker=true —— 立即切下一腿，不把排队计成上游
+                # 故障；不识别该头的客户端行为不变。
+                extra["x-omni-fallback-hint"] = "connection_cooldown"
         self._json(code, {"error": {"message": message, "type": err_type,
-                                    "code": code}}, extra_headers=extra)
+                                    "code": code}},
+                   extra_headers=extra or None)
 
     def _unknown_path_error(self, path):
         """404，并针对最常见的「接入地址填错」给出可执行提示。
@@ -9038,7 +9069,16 @@ class Handler(BaseHTTPRequestHandler):
                            "invalid_request_error")
 
     def _rate_limited(self, exc):
-        """429 with Retry-After, so clients back off instead of hammering."""
+        """429 with Retry-After, so clients back off instead of hammering.
+
+        fork：QD_QUEUE_FAST_MODELS 命中转来的排队（exc.fallback_hint，见
+        _as_rate_limited_for_queue）改发 503 + 回退提示头 —— OmniRoute
+        combo 立即切下一腿，而不是按 429 把该模型锁死 30s。
+        """
+        if getattr(exc, "fallback_hint", False):
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            return self._error(503, _msg, _et, retry_after=exc.wait,
+                               fallback_hint=True)
         wait = max(1, int(getattr(exc, "wait", 60) or 60))
         body = json.dumps({
             "error": {
@@ -10753,7 +10793,9 @@ class Handler(BaseHTTPRequestHandler):
             # 的顾虑——docstring 里那条能力差异只适用于 aggregate_stream 之后。
             _msg, _et = friendly_upstream_error(503, exc.detail)
             if not want_stream or queue_mode(model, model_key) != "visible":
-                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+                return self._error(503, _msg, _et,
+                                   retry_after=exc.retry_after,
+                                   fallback_hint=True)
             self._sse_begin()
             _q0 = time.time()
 
@@ -10903,6 +10945,18 @@ class Handler(BaseHTTPRequestHandler):
                                                      exc.detail)
                 return self._error(
                     exc.status if str(exc.status).isdigit() else 502, msg, etype)
+            except RateLimited as exc:
+                # fork v1.7.16：信封层排队耗尽转来的 RateLimited（fast 名单命中
+                # 带 fallback_hint）。_rate_limited 见 hint 发 503 + 回退头，
+                # OmniRoute combo 秒切下一腿；非名单模型维持 429 口径（issue
+                # #71）。掉进 except Exception 变 502 会让聚合网关既不回退也不重试。
+                record_error(model, 503 if getattr(exc, "fallback_hint", False)
+                             else 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -11042,7 +11096,9 @@ class Handler(BaseHTTPRequestHandler):
             # fast / 非流式直接 503 + Retry-After + 中文原因。
             _msg, _et = friendly_upstream_error(503, exc.detail)
             if not want_stream or queue_mode(model) != "visible":
-                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+                return self._error(503, _msg, _et,
+                                   retry_after=exc.retry_after,
+                                   fallback_hint=True)
             self._sse_begin()
             _q0 = time.time()
 
@@ -11299,6 +11355,15 @@ class Handler(BaseHTTPRequestHandler):
                                                      exc.detail)
                 return self._error(exc.status if str(exc.status).isdigit() else 502,
                                    msg, etype)
+            except RateLimited as exc:
+                # fork v1.7.16：同上——hinted RateLimited 必须 503 + 回退头出门。
+                record_error(model, 503 if getattr(exc, "fallback_hint", False)
+                             else 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -11562,7 +11627,9 @@ class Handler(BaseHTTPRequestHandler):
             # fast / 非流式给 503 + Retry-After + 中文原因。
             _msg, _et = friendly_upstream_error(503, exc.detail)
             if not want_stream or queue_mode(model) != "visible":
-                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+                return self._error(503, _msg, _et,
+                                   retry_after=exc.retry_after,
+                                   fallback_hint=True)
             self._sse_begin()
             _q0 = time.time()
 
@@ -11811,6 +11878,15 @@ class Handler(BaseHTTPRequestHandler):
                 msg, etype = friendly_upstream_error(
                     _to_int_status(exc.status), exc.detail)
                 return self._error(code, msg, etype)
+            except RateLimited as exc:
+                # fork v1.7.16：同上——hinted RateLimited 必须 503 + 回退头出门。
+                record_error(model, 503 if getattr(exc, "fallback_hint", False)
+                             else 429, exc.detail[:200],
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
+                return self._rate_limited(exc)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
