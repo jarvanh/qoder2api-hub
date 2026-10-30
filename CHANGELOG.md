@@ -9,6 +9,10 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.12
+
+fork 维护版：合并上游 v1.7.10（#112 usage 归一 OpenAI 标准位 / 计费模型自检 /diag/model-billing 与面板自检按钮 / #113 QD_COSY_CLIENTTYPE·QD_COSY_UA 客户端身份可覆盖 / PR #114 原生对话框 i18n 与 i18n 工具链 / #111 账号表七列排序+持久化），保留 fork QD_QUEUE_FAST_MODELS 按模型排队策略与 110 日界停放语义。
+
 ## v1.7.11
 
 fork 维护版：**按模型排队策略 `QD_QUEUE_FAST_MODELS`**。新增逗号/分号分隔的模型名单（匹配公开名或 modelKey，大小写不敏感，支持 `*` 通配），命中的模型遇 10605 / RESOURCE_LIMIT 排队立即 503 + Retry-After（fast），不占流式等待预算；未列出的模型照常走 `QD_QUEUE_WAIT_MODE` 全局档（visible 在流内排队等待不受影响）。名单语义优先于全局档（全局 wait 下命中名单仍 fast）。三个入口（chat / responses / anthropic）的流式消费点与 open_upstream 重试循环全部带模型上下文；fast 拒绝打 WARN 日志；/health 的 queue_mode 展示保持全局档不变。典型用途：赠品/限免模型放 combo 首位抢到账窗口，排队时秒拒秒切下一腿；付费模型不列入名单、排队照等。新增 tests/_test_fork_fast_queue_models.py（18 checks），既有 #87/#99/#71/queue403 排队套件全绿。
@@ -16,6 +20,43 @@ fork 维护版：**按模型排队策略 `QD_QUEUE_FAST_MODELS`**。新增逗号
 ## v1.7.10
 
 fork 维护版：合并上游 v1.7.8（#105/#106/#107/#108/#109 + i18n + CI），保留 fork 110 日界停放语义（f1ba521）优先于上游 #108 的 110 本地 0 点冷却分支；_test_quota_envelope.py 的 110 断言改写为 fork 停放语义（billing_until/ready() 拦截）。全量 86 套件 2415 checks 通过。（v1.7.9 tag 因 VERSION 常量未随合并递增而跳过，部署镜像直接落 1.7.10。）
+
+## 上游 v1.7.10（随 v1.7.12 合并吸收）
+
+**🐛 问题修复**
+
+- **流式/非流式 usage 未归一为 OpenAI 标准位**（#112）：上游按模型族换缓存字段（DeepSeek `prompt_cache_hit_tokens`、Qwen `completion_tokens_details.cached_tokens`），出口原样透传，按标准协议解析的客户端读到的 `cached_tokens` 恒为 0。
+  新增 `normalize_usage_for_client()`：复用 `_extract_usage` 的优先级把数字搬进 `usage.prompt_tokens_details.cached_tokens`，**原字段保留**（已适配上游形态的客户端不受影响）；接在流式 `clean_chunk`（usage 帧）与非流式 `aggregate_stream` 两处。上游完全没给缓存时不凭空造字段；普通内容帧仍逐字节原样透传。
+
+**✨ 新增：计费模型自检**
+
+- `POST /diag/model-billing {model, realm?}`（面板鉴权）：发一个最小请求（ping + `max_tokens=16`），返回 `{billed: [...], billed_mismatch, account, elapsed_ms}` —— 用来回答「上游到底按哪个模型记账」；
+- 面板「模型库」每行新增 **自检** 按钮，结果直接 toast；
+- `usage` 行的 `billed_model`（v1.7.8）保留，但**日志改为同 (请求, 回报) 组合每小时只提醒一次** —— 实测上游对网关身份常常统一回报 `auto`（连 `dfmodel` 也是），逐请求 WARN 会把日志刷满。
+
+**🔧 客户端身份可覆盖（#113 排查用）**
+
+- 新增 `QD_COSY_CLIENTTYPE`（默认 `5`，即 CLI 形态）与 `QD_COSY_UA`（默认 `undici`）环境变量，配合既有的 `QD_COSY_VERSION`：用户可以把**自己官方 CLI 的身份**原样搬过来做 A/B，验证上游是否按客户端身份决定模型授权/记账。
+- 未伪造任何东西：`minimal_version.vsc = 999.999.999` 这类哨兵值只出现在注释里解释现象，不进代码分支。
+
+**🌐 i18n（PR #114 合并）**
+
+- 原生 `alert` / `confirm` / `prompt` 翻译层 `installDialogI18n`（只翻第一个字符串参数、其余透传、幂等）；`i18n/en.json` 扩到 608 消息 / 226 模式 / 26 片段；新增 `scripts/extract_i18n_keys.py` 提取工具与 `docs/i18n.md` 重写。
+- ⚠️ PR 只定义了 `installDialogI18n` 却**从未调用、也没导出**（功能等于没做）。合并后补上接线：`initLangSystem` 启动时装一次（`installDialogI18n(window, t)`）+ 导出到 `window.QD_I18N.API`，并加 17 条回归断言（含「确实被装进语言系统」这条接线检查）。
+
+**验证**：新增 `_test_issue112_usage.py`(15)、`_test_issue113_model_billing.py`(18)、`_test_i18n_dialog.js`(17)；`/diag/model-billing` 走真实服务 e2e（200 + 401 两条路径，实测返回 `billed=["auto"]`）。全量 **89 suites / 2462 checks / 0 failed**。
+
+## v1.7.9
+
+**✨ 新增**
+
+- **账号管理表格支持按列排序**（#111）：版本 / 账号 / 状态 / 积分 / 请求 / 总 token / 缓存 七列可点表头，升序 → 降序 → 恢复默认（三态循环），当前列显示 ▲ / ▼，状态存 `localStorage` 刷新后保持。
+  - **账号列自然序**：`Z Z2` 排在 `Z Z10` 之前（`localeCompare({numeric:true})`，忽略大小写与首尾空白，昵称缺失退回 UID）；
+  - **积分列两种口径**：点击=剩余额度、`Shift+点击`=已用额度；
+  - **取不到值的一律沉底且不随方向翻转** —— 额度拉取失败（`envelopes HTTP 403 code 112` 这类）不会被当成 0 混进「额度用尽」中间，降序时也不会翻到最上面；
+  - 状态列按「可用 → 异常 → 冷却 → 停用 → 过期」排；护栏 / 操作列不参与排序；同值时按账号名自然序稳定排列。
+
+**验证**：新增 `tests/_test_issue111_account_sort.js`（27 条：自然序、两种额度口径、失败沉底与方向无关、请求/token/缓存数值序、状态优先级、三态循环与持久化、表头锚点与指示符）；真实浏览器里点表头复核排序结果与 ▲▼ 指示。全量 **86 suites / 2413 checks / 0 failed**。
 
 ## v1.7.8
 

@@ -531,6 +531,15 @@ a:hover{text-decoration:underline}
 .ck-when-off input{width:11px;height:11px;accent-color:var(--accent);cursor:pointer}
 .ck-when-off:hover{color:var(--fg)}
 
+.sortable{cursor:pointer;user-select:none}
+.sortable:hover{color:var(--accent)}
+.sortable .sort-lbl{user-select:none;display:inline-flex;
+  align-items:center;gap:2px;padding:1px 2px;border-radius:4px}
+.sortable .sort-lbl:hover{color:var(--accent)}
+.sortable .sort-lbl:hover .sort-ind{opacity:1}
+.sort-ind{font-size:9px;opacity:.55;letter-spacing:-1px}
+.sortable.sorted th,.sortable.sorted .sort-lbl{color:var(--accent)}
+.sortable.sorted .sort-ind{opacity:1;font-weight:700}
 /* ================= 账号页（独立板块） ================= */
 .acct-realms{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:16px}
 .acct-realms .realm-card{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
@@ -1099,9 +1108,35 @@ function load(pack){
   READY = !!(Object.keys(MSG).length || Object.keys(PAT).length || Object.keys(FRG).length);
   return READY;
 }
+
+/* 原生 alert/confirm/prompt 不经过 DOM，观察器永远看不到它们；这里给宿主对象
+ * 的三个方法包一层，只翻第一个字符串参数，其余参数与返回值原样透传。同一宿主
+ * 只包一次：重复调用返回 false，避免翻译被叠成两层（第二次会拿到英文再查表）。 */
+function installDialogI18n(win, translate){
+  if(!win || typeof translate !== 'function') return false;
+  if(win.__qdDialogI18n) return false;
+  var names = ['alert', 'confirm', 'prompt'];
+  var wrapped = 0;
+  for(var i = 0; i < names.length; i++){
+    var name = names[i];
+    if(typeof win[name] !== 'function') continue;
+    (function(fn){
+      win[name] = function(msg){
+        var args = Array.prototype.slice.call(arguments);
+        if(typeof args[0] === 'string') args[0] = translate(args[0]);
+        return fn.apply(win, args);
+      };
+    })(win[name]);
+    wrapped++;
+  }
+  if(!wrapped) return false;
+  try{ win.__qdDialogI18n = true; }catch(e){}
+  return true;
+}
 /* END-PURE-I18N-CORE */
 
-var API = { t: t, load: load, isReady: function(){ return READY; } };
+var API = { t: t, load: load, isReady: function(){ return READY; },
+            installDialogI18n: installDialogI18n };
 if(typeof window !== 'undefined') window.QD_I18N = API;
 
 /* ================= L3 · DOM 应用引擎 ================= */
@@ -1341,6 +1376,9 @@ function renderMenu(packs, active){
 }
 
 window.initLangSystem = function(){
+  /* PR #114：原生 alert/confirm/prompt 不走 DOM 观察器，必须显式包一层；
+   * 这里装上（幂等），之后换包/切语言都沿用同一个 t。 */
+  try{ installDialogI18n(window, t); }catch(e){}
   var pref = getPref();
   /* 首屏之前先灌 localStorage 里的缓存包：第 2 次及以后访问不再闪中文。
    * 首访没有缓存只能等 fetch —— 这是不做构建步骤、不做服务端内联的实际
@@ -2676,6 +2714,20 @@ async function loadModels(){
   }
 }
 
+// issue #113：模型「计费自检」
+async function checkModelBilling(model, btn){
+  if(btn){ btn.disabled = true; btn.textContent = "检测中"; }
+  try{
+    const r = await postJSON("/diag/model-billing", {model: model});
+    if(!r.ok){ toast(model + " 自检失败: " + (r.error || "未知错误"), "bad"); return; }
+    const billed = (r.billed || []).join(", ") || "(上游未回报模型名)";
+    toast(r.billed_mismatch
+      ? (model + " → 上游实际按 " + billed + " 计费（计费与限额都按它算）")
+      : (model + " → 上游按 " + billed + " 计费，一致"),
+      r.billed_mismatch ? "bad" : "ok");
+  }catch(e){ toast("自检请求失败: " + e.message, "bad"); }
+  finally{ if(btn){ btn.disabled = false; btn.textContent = "自检"; } }
+}
 function renderAvailableModels(){
   const tb = document.querySelector('#modelsTable tbody');
   if(!tb) return;
@@ -2814,7 +2866,10 @@ function renderAvailableModels(){
         + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
         + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
       : '';
-    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
+    const _billBtn = // issue #113：一键「计费自检」——上游是否按另一个模型计费，比日志更直观
+    ' <button class="bill-check" title="发一个最小请求，返回上游实际按哪个模型计费（kmodel_latest 这类被上游改路由时能立刻看出来）"'
+      + ' onclick="checkModelBilling(\'' + esc(m.id) + '\', this)" style="font-size:10px;padding:1px 6px;margin-left:4px">自检</button>';
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + _billBtn + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -4047,6 +4102,83 @@ async function setCheckinWhenDisabled(uid, value){
   }catch(e){ toast("设置失败: " + e.message, "bad"); }
 }
 
+// ---- 账号表排序（issue #111）：点表头升序 → 降序 → 默认（存 localStorage）----
+const ACCT_SORT_STORE = "qd-acct-sort";
+let ACCT_SORT = (function(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(ACCT_SORT_STORE) || "{}");
+    const key = typeof raw.key === "string" ? raw.key : "";
+    return { key: key, dir: raw.dir === -1 ? -1 : 1 };
+  }catch(e){ return { key: "", dir: 1 }; }
+})();
+
+function sortAccounts(key, ev){
+  const k = (key === "credits" && ev && ev.shiftKey) ? "used" : key;
+  if(ACCT_SORT.key !== k){ ACCT_SORT = { key: k, dir: 1 }; }      // 新列：升序
+  else if(ACCT_SORT.dir === 1){ ACCT_SORT = { key: k, dir: -1 }; } // 再点：降序
+  else { ACCT_SORT = { key: "", dir: 1 }; }                        // 三下：回默认顺序
+  try{ localStorage.setItem(ACCT_SORT_STORE, JSON.stringify(ACCT_SORT)); }catch(e){}
+  renderAccounts();
+}
+
+function acctSortValue(a, key){
+  const usage = USAGE_BY_ACCOUNT[a.uid] || {};
+  switch(key){
+    case "realm":    return a.realm === "cn" ? 0 : 1;
+    case "name":     return String(a.nickname || a.uid || "").trim();
+    // 状态排序口径：可用 → 异常 → 冷却 → 停用 → 过期（越靠前越"能打"）
+    case "state":    return !a.enabled ? 3
+                        : a.expiresIn === "expired" ? 4
+                        : a.inCooldown ? 2
+                        : a.lastError ? 1 : 0;
+    // 两种额度口径：点击=剩余，Shift+点击=已用（issue #111）
+    case "credits":  return a.credits ? Number(a.credits.remain) : null;
+    case "used":     return a.credits ? (Number(a.credits.size) - Number(a.credits.remain)) : null;
+    case "requests": return Number(usage.requests || 0);
+    case "tokens":   return Number(usage.total_tokens || 0);
+    case "cached":   return Number(usage.cached_tokens || 0);
+  }
+  return null;
+}
+
+function sortAccountList(list){
+  const st = ACCT_SORT;
+  if(!st.key) return list;                       // 默认：保持后端给的顺序
+  const missing = v => (v === null || v === undefined
+    || (typeof v === "number" && !isFinite(v)));
+  const nameOf = a => String(a.nickname || a.uid || "");
+  const cmpName = (x, y) => nameOf(x).localeCompare(
+    nameOf(y), "zh-Hans-CN", { numeric: true, sensitivity: "base" });
+  const out = list.slice();
+  out.sort(function(x, y){
+    const vx = acctSortValue(x, st.key), vy = acctSortValue(y, st.key);
+    const nx = missing(vx), ny = missing(vy);
+    // 取不到值的一律沉底（额度查询失败那种不能当 0 插在中间）
+    if(nx && ny) return cmpName(x, y);
+    if(nx) return 1;
+    if(ny) return -1;
+    let r;
+    if(typeof vx === "string" || typeof vy === "string"){
+      r = String(vx).localeCompare(String(vy), "zh-Hans-CN",
+        { numeric: true, sensitivity: "base" });     // 自然序：Z Z2 < Z Z10
+    } else {
+      r = vx - vy;
+    }
+    if(r === 0) r = cmpName(x, y);                    // 同值保持可预期顺序
+    return r * (st.dir === -1 ? -1 : 1);
+  });
+  return out;
+}
+
+function sortTh(key, label, style, title){
+  const cur = ACCT_SORT.key === key
+    || (key === "credits" && ACCT_SORT.key === "used");
+  const ind = cur ? (ACCT_SORT.dir === -1 ? " ▼" : " ▲") : "";
+  return '<th class="sortable' + (cur ? " sorted" : "") + '" style="' + style
+    + '" title="' + (title || "点击排序：升序 → 降序 → 恢复默认")
+    + '" onclick="sortAccounts(\'' + key + '\', event)">'
+    + label + '<span class="sort-ind">' + ind + "</span></th>";
+}
 function renderAccounts(){
   const box = document.getElementById('accounts');
   const currentView = (window.VIEW_REALM || "intl");
@@ -4059,6 +4191,7 @@ function renderAccounts(){
       String(a.organizationName || "").toLowerCase().includes(_q) ||
       String(a.note || "").toLowerCase().includes(_q)));
   }
+  list = sortAccountList(list);          // issue #111：表头排序（默认顺序 = 后端原序）
   const usable = list.filter(a => a.enabled).length;
   const viewName = currentView === 'cn' ? '国内版' : '国际版';
   document.getElementById('acctCount').textContent =
@@ -4082,17 +4215,21 @@ function renderAccounts(){
   }
   box.innerHTML = '<table><thead><tr>'
   box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
-    + '<th style="text-align:center;width:76px">版本</th>'
-    + '<th style="text-align:left">账号</th>'
-    + '<th style="text-align:center;width:84px">状态</th>'
+    + sortTh("realm", "版本", "text-align:center;width:76px")
+    + sortTh("name", "账号", "text-align:left",
+             "点击按账号名/UID 自然序排序（Z Z2 排在 Z Z10 前）：升序 → 降序 → 默认")
+    + sortTh("state", "状态", "text-align:center;width:84px",
+             "按可用程度排序：可用 → 异常 → 冷却 → 停用 → 过期")
     + '<th style="text-align:center;width:96px">护栏</th>'
-    + '<th style="text-align:left;width:120px">积分</th>'
-    + '<th style="text-align:right;width:70px">请求</th>'
-    + '<th style="text-align:right;width:88px">总 token</th>'
-    + '<th style="text-align:right;width:80px">缓存</th>'
+    + sortTh("credits", "积分", "text-align:left;width:120px",
+             "点击按剩余额度排序；Shift+点击按已用额度。取额度失败的账号始终沉底")
+    + sortTh("requests", "请求", "text-align:right;width:70px")
+    + sortTh("tokens", "总 token", "text-align:right;width:88px")
+    + sortTh("cached", "缓存", "text-align:right;width:80px")
     + '<th style="text-align:center;width:150px">操作</th>'
     + '</tr></thead><tbody>' + list.map(accountRow).join('') + '</tbody></table></div>'
-    + '<div class="legend"><span>多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个</span></div>';
+    + '<div class="legend"><span>多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个'
++ ' · 点击表头排序（再次点击反向，第三次恢复默认；Shift+点击「积分」按已用额度）</span></div>';
 }
 
 async function loadAccounts(){

@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.11"
+VERSION = "1.7.12"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -477,6 +477,9 @@ def _empty_stats():
 _usage = _empty_stats()
 
 
+_BILLED_WARN_AT = {}
+
+
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
     if not usage:
@@ -551,8 +554,16 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     _billed = str((usage or {}).get("model") or "")
     if _billed and _billed != str(model or ""):
         fields["billed_model"] = _billed
-        log("upstream billed a different model: requested=%s billed=%s"
-            % (model, _billed), level="WARN", tag="chat")
+        # 上游对网关身份常常统一回报 "auto"（issue #113 实测：dfmodel 也一样），
+        # 逐请求 WARN 会把日志刷满——同一 (请求, 回报) 组合每小时只提醒一次。
+        _bk = (str(model or ""), _billed)
+        _now = time.time()
+        if _now - _BILLED_WARN_AT.get(_bk, 0) > 3600:
+            _BILLED_WARN_AT[_bk] = _now
+            log("upstream reports a different model name: requested=%s billed=%s"
+                " (billing/quota attribution follows the upstream name;"
+                " check /diag/model-billing)" % (model, _billed),
+                level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -3133,6 +3144,41 @@ def strip_data_prefix(line):
     return line
 
 
+def normalize_usage_for_client(usage):
+    """把上游的多套缓存字段归一写进 OpenAI 标准位（issue #112）。
+
+    上游按模型族换字段：DeepSeek 用 `prompt_cache_hit_tokens`、Qwen 用
+    `completion_tokens_details.cached_tokens`，都不发标准位
+    `prompt_tokens_details.cached_tokens` —— 按标准协议解析的客户端恒读 0。
+    这里复用 _extract_usage 的优先级把数字搬过去，**原字段保留**（不删上游惯例，
+    避免已经适配了上游形态的客户端反而读不到）。
+    """
+    if not isinstance(usage, dict):
+        return usage
+    det = usage.get("completion_tokens_details") or {}
+    pdet = usage.get("prompt_tokens_details")
+    pdet = dict(pdet) if isinstance(pdet, dict) else {}
+    val = None
+    for cand in (usage.get("prompt_cache_hit_tokens"),
+                 det.get("cached_tokens") if isinstance(det, dict) else None,
+                 pdet.get("cached_tokens")):
+        try:
+            n = int(cand or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            val = n
+            break
+    if val is None:
+        if "prompt_tokens_details" in usage and pdet:
+            return usage          # 上游已经给了标准位，别动它
+        return usage
+    if pdet.get("cached_tokens") == val and usage.get("prompt_tokens_details"):
+        return usage
+    pdet["cached_tokens"] = val
+    usage["prompt_tokens_details"] = pdet
+    return usage
+
 def clean_chunk(raw):
     """Drop the empty noise fields the gateway pads deltas with."""
     try:
@@ -3142,6 +3188,12 @@ def clean_chunk(raw):
     if not isinstance(obj, dict):
         return raw
     changed = False
+    # issue #112：流尾 usage 帧也要按 OpenAI 标准位给 cached_tokens
+    if isinstance(obj.get("usage"), dict):
+        before = json.dumps(obj["usage"], sort_keys=True)
+        obj["usage"] = normalize_usage_for_client(obj["usage"])
+        if json.dumps(obj["usage"], sort_keys=True) != before:
+            changed = True
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
@@ -7808,7 +7860,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
-        out["usage"] = usage
+        out["usage"] = normalize_usage_for_client(usage)   # issue #112
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
@@ -10141,6 +10193,60 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "token": token})
         return self._unknown_path_error(path)
 
+    def _handle_diag_billing(self, payload):
+        """issue #113：发最小请求，回报上游实际按哪个模型计费。"""
+        # issue #113：上游可能「静默按另一个模型计费」（kmodel_latest -> auto）。
+        # 这里发一个最小请求，把**上游实际回报的模型名**取回来，便于用户自证。
+        model = str((payload or {}).get("model") or "").strip()
+        if not model:
+            return self._error(400, "model required")
+        realm = (payload or {}).get("realm") or self._request_realm()
+        probe_payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+            "max_tokens": 16,
+        }
+        billed, usage, chunks = set(), None, 0
+        t0 = time.time()
+        try:
+            resp, acc, _ = open_upstream(probe_payload, target_realm=realm)
+            for line in iter_inner_sse(resp, holder=None):
+                chunks += 1
+                text = line.decode("utf-8", "replace")
+                for m in re.findall(r'"model"\s*:\s*"([^"]+)"', text):
+                    if "chat.completion" not in m:
+                        billed.add(m)
+                if '"usage"' in text and chunks > 1:
+                    usage = text
+                if chunks > 400:
+                    break
+            resp.close()
+        except UpstreamStatus as exc:
+            return self._json(200, {"ok": False, "model": model,
+                                    "error": "upstream status %s" % exc.status,
+                                    "detail": str(exc.detail)[:300],
+                                    "elapsed_ms": int((time.time() - t0) * 1000)})
+        except Exception as exc:
+            return self._json(200, {"ok": False, "model": model,
+                                    "error": str(exc)[:300],
+                                    "elapsed_ms": int((time.time() - t0) * 1000)})
+        got = sorted(billed)
+        mismatch = bool(got) and model not in got
+        if mismatch:
+            log("diag model-billing: requested=%s billed=%s (upstream re-routed)"
+                % (model, ",".join(got)), level="WARN", tag="diag")
+        return self._json(200, {
+            "ok": True,
+            "model": model,
+            "realm": realm,
+            "billed": got,
+            "billed_mismatch": mismatch,
+            "account": (acc.uid[:8] if acc else None),
+            "chunks": chunks,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        })
+
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
         if POOL is None:
@@ -11372,7 +11478,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/v1/responses", "/responses",
                 # Anthropic Messages（task-78 接线）：两条都要进白名单，
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
-                "/v1/messages", "/v1/messages/count_tokens"):
+                "/v1/messages", "/v1/messages/count_tokens",
+                # issue #113：模型计费自检（面板鉴权，见下方分支）
+                "/diag/model-billing"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -11388,6 +11496,12 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if path == "/diag/model-billing":
+            # issue #113：模型计费自检（面板鉴权）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_diag_billing(payload)
         if is_account_route:
             return self._handle_accounts(path, payload)
         # 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑

@@ -22,6 +22,20 @@
 - 指定区域：`X-Realm: cn|intl` 请求头，或 `?realm=` 查询参数
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
 
+## 计费模型自检（`POST /diag/model-billing`，面板鉴权）
+
+上游可能**按另一个模型名记账**：网关身份发出的请求，上游在 chunk 里回报的 `model` 常常是 `auto`（实测 dfmodel / kmodel_latest 都是），而同一账号用官方 CLI 请求就会记成真实模型名。这影响的是**上游侧的使用明细/额度归属**，不是网关路由。
+
+```bash
+curl -s -X POST http://127.0.0.1:8790/diag/model-billing \
+  -H "Content-Type: application/json" -H "X-Panel-Token: $TOKEN" \
+  -d '{"model":"DeepSeek-Flash","realm":"cn"}'
+```
+
+返回 `{ok, model, realm, billed: [...], billed_mismatch, account, chunks, elapsed_ms}`；`billed_mismatch=true` 表示上游按别的名字记账。发的是最小请求（1 个 ping 词 + `max_tokens=16`），耗时通常 1–3 秒。
+
+面板「模型库」每行的 **自检** 按钮就是调它。
+
 ## 输出上限（max_tokens）
 
 官方模型清单里没有 `maxOutputTokens`，但上游对超限请求会回 `400 invalid_parameter_error: Range of max_tokens should be [1, 131072]`。网关把这行错误当成**学习信号**：
