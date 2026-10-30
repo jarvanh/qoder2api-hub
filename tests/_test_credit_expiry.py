@@ -138,6 +138,24 @@ _deg_cred = dict(_deg.credits, remain=0, remain_effective=0, size=0,
 check("E5b 退化 body → ledger_is_unknown 判为 True（未知账本，不当 0 用）",
       _T.ledger_is_unknown(_deg_cred) is True, _deg_cred.get("expires_at"))
 
+# ---- E6：正常毫秒时间戳不得被占位判据误伤（v1.7.15，v1.7.14 的回归）------
+# v1.7.14 用 `raw >= _EXPIRY_NEVER_EPOCH` 判占位，但真实毫秒（≈1.79e12）
+# 数值上**大于**秒级占位（2.53e11）→ expires_at 原样留毫秒、expires_kind
+# 误报 never，下游「配额刷新」提示整体静默消失。实测 131 号部署后立刻复现。
+import time as _time
+_ms_shape = _quota_shape(top_expires=(_time.time() + 2 * 3600) * 1000)
+_ms = _fetch(_ms_shape)
+check("E6 正常毫秒 expiresAt → 归一到秒（不留 1.79e12）",
+      _ms.credits.get("expires_at") == int((_time.time() + 2 * 3600))
+      or abs(_ms.credits.get("expires_at", 0) - _time.time()) < 3 * 3600,
+      _ms.credits.get("expires_at"))
+check("E6b 正常毫秒 expiresAt → expires_kind='refresh'（不得误报 never）",
+      _ms.credits.get("expires_kind") == "refresh",
+      (_ms.credits.get("expires_kind"), _ms.credits.get("expires_at")))
+check("E6c 毫秒形态占位也必须保住（253402214400000 → 秒级占位）",
+      A.normalize_expiry_never_aware(253402214400000) == 253402214400,
+      A.normalize_expiry_never_aware(253402214400000))
+
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))
 print("RESULT: %s (exit %d)" % ("RED" if FAIL else "GREEN", 1 if FAIL else 0))

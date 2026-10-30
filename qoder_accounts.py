@@ -994,6 +994,31 @@ def normalize_epoch(value):
     return int(number)
 
 
+def normalize_expiry_never_aware(value):
+    """归一为**秒级** epoch，同时保住「永不过期」占位（v1.8.0）。
+
+    normalize_epoch 的毫秒启发式是 `>1e11 即 /1000`，而占位 253402214400
+    （秒级 9999-12-31）本身也 >1e11 → 被抹成 253402214（≈1978 年），使
+    `>= LEDGER_NEVER_EPOCH` 一类的占位判据永不成立：退化 body（全 0 +
+    isQuotaExceeded）会被当成「真实余额 0」而非「账本未知」，可能误触发
+    限额护栏误拦账号。
+
+    ⚠️ 不能用区间判别（v1.7.14 初版就踩了这点）：真实**毫秒**时间戳
+    （2026-10 ≈ 1.79e12）在数值上**大于**秒级占位 2.53e11，
+    `n >= _EXPIRY_NEVER_EPOCH` 会把正常时间戳误判成占位 —— 后果是
+    expires_at 原样留毫秒（下游算出的「还剩多久」变成 2.5 年）、
+    expires_kind 误报 never（「配额刷新」提示被整体吞掉）。
+    因此只**精确匹配**占位值本身，外加其毫秒形态。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if number == _EXPIRY_NEVER_EPOCH or number == _EXPIRY_NEVER_EPOCH * 1000:
+        return _EXPIRY_NEVER_EPOCH            # 占位（秒形态或毫秒形态）：原样保住
+    return normalize_epoch(value)             # 正常时间戳：按原启发式归一
+
+
 def shared_unlimited(credits):
     """共享池是否是「不设上限」（cap=-1，issue #67）。"""
     if not isinstance(credits, dict):
@@ -3134,18 +3159,11 @@ class Account(object):
             _prev_eff = (self.credits or {}).get("remain_effective")
         except Exception:
             _prev_eff = None
-        # 「永不过期」占位是**秒级** 253402214400（≈ 公元 9999 年），而
-        # normalize_epoch 的毫秒启发式（>1e11 即除以 1000）会把它抹成
-        # 253402214（≈1978 年）—— 于是 qoder_tasks.ledger_is_unknown()
-        # 的 `>= LEDGER_NEVER_EPOCH` 判据永远不成立，退化 body（全 0 +
-        # isQuotaExceeded）会被当成「真实余额 0」而非「账本未知」，可能
-        # 误触发限额护栏误拦账号。占位值先按原值短路，其余才走归一。
-        try:
-            _raw_top = float(q.get("expiresAt") or 0)
-        except (TypeError, ValueError):
-            _raw_top = 0.0
-        _top_exp = (int(_raw_top) if _raw_top >= _EXPIRY_NEVER_EPOCH
-                    else normalize_epoch(q.get("expiresAt")))
+        # 占位保真 + 单位归一见 normalize_expiry_never_aware（v1.7.15）：
+        # v1.7.14 初版用 `>=` 区间判别占位，而真实毫秒时间戳（≈1.79e12）
+        # 数值上大于秒级占位（2.53e11），会把正常刷新时刻误判成 never
+        # （expires_at 留毫秒 + 配额刷新提示被整体吞掉）。
+        _top_exp = normalize_expiry_never_aware(q.get("expiresAt"))
         # 包级到期是否真的可得（packages 里带 expires_at / days_left 才算）：
         # 上游当前只给汇总桶，下游不得拿 credits.expires_at 去推「资源包要作废」。
         _pkg_exp_known = any(
