@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.12"
+VERSION = "1.7.13"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6654,7 +6654,7 @@ def _envelope_retry_wait(exc, attempt):
     return attempt
 
 
-def should_retry_envelope(exc, emitted_bytes, attempt):
+def should_retry_envelope(exc, emitted_bytes, attempt, model=""):
     # issue #37：坏参数是**模型内容问题**，不是瞬时上游故障——绝不自动重发
     # （否则会重复计费，且下一次很可能同样非法）。客户端想重试由它自己决定。
     """流内错误信封是否值得**重开上游**再试。
@@ -6670,6 +6670,16 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     _q = _envelope_queue_wait(exc)
     if _q > 0:
+        # fork：QD_QUEUE_FAST_MODELS 命中的模型不等队列——上游常把 10605 装在
+        # HTTP 200 的流内信封里投递，这里不拦住就会睡 retryAfterSeconds×N 轮。
+        # 立即放弃，由调用方转 429 + Retry-After（与 HTTP 层 fast 语义一致）。
+        # modelKey 藏在多层转义的 detail JSON 里：去掉全部反斜杠后平铺匹配。
+        _flat = (getattr(exc, "detail", "") or "").replace("\\", "")
+        _mk = re.search(r'"modelKey"\s*:\s*"([\w.\-]+)"', _flat)
+        if _is_fast_queue_model(model, _mk.group(1) if _mk else ""):
+            log("envelope queue on model '%s' - fast reject per "
+                "QD_QUEUE_FAST_MODELS" % model, level="WARN", tag="chat")
+            return False
         # queue: wait per retryAfterSeconds, allow more rounds than transient
         return (_q <= QUEUE_WAIT_MAX_SECS
                 and attempt < max(QUEUE_MAX_ROUNDS, TRANSIENT_MAX_RETRIES))
@@ -6708,7 +6718,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 return obj, account
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
-                if not should_retry_envelope(exc, False, attempt):
+                if not should_retry_envelope(exc, False, attempt, model=model):
                     # issue #71：排队耗尽 -> 429 + Retry-After（不是 403）
                     raise _as_rate_limited_for_queue(exc, model)
                 log("in-stream envelope status %s on model '%s' "
@@ -11171,7 +11181,7 @@ class Handler(BaseHTTPRequestHandler):
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             # 控制帧（response.created 等）先于数据，不能算
                             # “已输出”；以上游数据行计数判断能否重开。
-                            if should_retry_envelope(exc, False, attempts) \
+                            if should_retry_envelope(exc, False, attempts, model=model) \
                                     and consumed.get("n", 0) == 0:
                                 attempts += 1
                                 log("responses in-stream envelope status %s "
@@ -11668,7 +11678,7 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
-                            if should_retry_envelope(exc, emitted, attempts):
+                            if should_retry_envelope(exc, emitted, attempts, model=model):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
                                     "model '%s' (try %d/%d), reopening upstream"

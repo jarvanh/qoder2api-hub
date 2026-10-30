@@ -1,4 +1,4 @@
-"""fork v1.7.11：QD_QUEUE_FAST_MODELS 按模型排队策略。
+"""fork：QD_QUEUE_FAST_MODELS 按模型排队策略（v1.7.11 HTTP 层 + v1.7.12 信封层）。
 
     python tests/_test_fork_fast_queue_models.py
 
@@ -8,8 +8,11 @@
   未命中模型 → 维持全局档；带通配的条目进 glob 匹配
 - 全局 wait 档下命中名单仍强制 fast（名单语义优先于全局档）
 - open_upstream 重试循环消费点：fast 模型排队时不进 on_queue 分支、
-  直接 raise UpstreamQueued（源码静态断言 + visible_queue_acquire 行为）
+  直接 raise UpstreamQueued（源码静态断言）
 - 三个流式 handler 消费点均带 model 上下文（queue_mode(model...)）
+- v1.7.12 信封层：流内 10605 信封（多层转义 JSON）按公开名 / detail 里
+  modelKey 命中名单 → 不再睡 retryAfterSeconds×N 轮，立即转 429；
+  非名单模型照旧；未设名单行为与 1.7.10 一致；emitted 计费安全优先
 """
 import json
 import os
@@ -30,6 +33,17 @@ def _restore():
     P.QUEUE_MODE = _ORIG_MODE
     P.QUEUE_FAST_MODELS = _ORIG_FAST
     P.QUEUE_FAST_MODEL_GLOBS = _ORIG_GLOBS
+
+
+def _envelope_with(modelkey):
+    """真实形态的多层转义信封 detail（线上 09:16 日志同款）。"""
+    inner = ('{"isQueued":true,"modelKey":"%s","queueCount":0,'
+             '"retryAfterSeconds":30,"subCode":"RESOURCE_LIMIT"}' % modelkey)
+    mid = json.dumps({"code": "10605", "message": inner,
+                      "subCode": "RESOURCE_LIMIT"})
+    outer = json.dumps({"code": "403", "message": mid,
+                        "subCode": "RESOURCE_LIMIT"})
+    return P.UpstreamStatus(403, outer)
 
 
 try:
@@ -95,11 +109,41 @@ try:
     check("fast 拒绝时打 WARN 日志（可观测）",
           "fast reject per QD_QUEUE_FAST_MODELS" in _src)
 
-    # ------------------------------------------------- visible_queue_acquire
+    # ------------------------------------------------- fast 拒绝语义不变
     print("[fork] fast 拒绝语义不变（UpstreamQueued → 503 + Retry-After）")
     _exc = P.UpstreamQueued(30, '{"code":"10605","isQueued":true}', waited=0)
     check("UpstreamQueued.status = 503", _exc.status == 503)
     check("UpstreamQueued.retry_after = 上游秒数", _exc.retry_after == 30)
+
+    # ------------------------------------------------- v1.7.12 信封层
+    print("[fork12] 信封层：流内 10605 信封也按名单 fast")
+    P.QUEUE_MODE = "visible"
+    P.QUEUE_FAST_MODELS = frozenset({"dfmodel", "deepseek-flash"})
+    P.QUEUE_FAST_MODEL_GLOBS = ()
+    _e_df = _envelope_with("dfmodel")
+    check("信封排队秒数解析不变（retryAfterSeconds=30）",
+          P._envelope_queue_wait(_e_df) == 30,
+          P._envelope_queue_wait(_e_df))
+    check("信封层公开名命中 → 不重试（fast）",
+          P.should_retry_envelope(_e_df, False, 0, model="DeepSeek-Flash") is False)
+    check("信封层仅 modelKey 命中（转义 detail 提取）→ fast",
+          P.should_retry_envelope(_e_df, False, 0, model="WhateverName") is False)
+    _e_km = _envelope_with("kmodel")
+    check("信封层非名单模型照旧等待重试",
+          P.should_retry_envelope(_e_km, False, 0, model="GLM-5.3-Flash") is True)
+    P.QUEUE_FAST_MODELS = frozenset()
+    check("未设名单时信封层行为与 1.7.10 一致（等待重试）",
+          P.should_retry_envelope(_e_df, False, 0, model="DeepSeek-Flash") is True)
+    _e_403 = P.UpstreamStatus(403, '{"code":"403","message":"forbidden"}')
+    P.QUEUE_FAST_MODELS = frozenset({"dfmodel"})
+    check("非排队信封（普通 403）不受名单影响",
+          P.should_retry_envelope(_e_403, False, 0, model="DeepSeek-Flash") is True)
+    check("已吐字节（emitted）绝不重试——计费安全优先",
+          P.should_retry_envelope(_e_df, True, 0, model="DeepSeek-Flash") is False)
+    check("三个流内调用点均传 model 上下文",
+          "should_retry_envelope(exc, False, attempt, model=model)" in _src)
+    check("信封层 fast 拒绝打 WARN 日志（可观测）",
+          "envelope queue on model" in _src and "fast reject per" in _src)
 finally:
     _restore()
 

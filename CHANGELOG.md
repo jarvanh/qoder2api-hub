@@ -9,6 +9,10 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.13
+
+fork 维护版：**信封层也按 QD_QUEUE_FAST_MODELS 快速拒绝**。线上验证发现 10605 排队常以 HTTP 200 + 流内 SSE 信封投递，v1.7.11 盖住的 HTTP 层 fast 不触发（线上 `fast reject` 0 次实锤），流内信封重试循环仍睡 retryAfterSeconds×N（约 99s）。本次：`should_retry_envelope` 增加 model 参数，排队类信封命中名单立即放弃重试（由调用方转 429 + Retry-After，与 HTTP 层语义一致）；modelKey 藏在多层转义的 detail JSON，去反斜杠平铺后正则提取兼底；三个流内调用点（aggregate/responses/chat）全部传 model 上下文；emitted>0 绝不重试的计费安全语义不变；未设名单行为与 1.7.10 一致。测试套件扩到 27 checks（信封层 9 条），#87/#99/#71/queue403 排队回归全绿。
+
 ## v1.7.12
 
 fork 维护版：合并上游 v1.7.10（#112 usage 归一 OpenAI 标准位 / 计费模型自检 /diag/model-billing 与面板自检按钮 / #113 QD_COSY_CLIENTTYPE·QD_COSY_UA 客户端身份可覆盖 / PR #114 原生对话框 i18n 与 i18n 工具链 / #111 账号表七列排序+持久化），保留 fork QD_QUEUE_FAST_MODELS 按模型排队策略与 110 日界停放语义。
