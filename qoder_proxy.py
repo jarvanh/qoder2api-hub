@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.16"
+VERSION = "1.7.17"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4179,9 +4179,54 @@ _HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档
 _HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
 
-_ECHO_LOOSE_RE = re.compile(
-    r'^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$',
-    re.DOTALL)
+# issue #37/#60 follow-up：模型把含真实换行/制表符的参数（Bash 命令、文件正文、
+# 多行字符串）照格式复述时，JSON 字符串里出现**裸控制字符**——这是被 JSON 语法
+# 禁止的，json.loads 会在整段上报错，于是可执行的调用被误杀成 InvalidToolArguments。
+# 只替换真实控制字节（0x00-0x1F）；已正确转义的 `\n` 是「反斜杠+n」两个字符、不含
+# 真实 0x0A，天然不受影响，因此无需像引号那样对已转义形式做占位保护。
+_CTRL_ESCAPE_MAP = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+                    0x0C: "\\f", 0x0D: "\\r"}
+
+
+def _escape_raw_control_chars(s):
+    """把字符串里真实的 0x00-0x1F 控制字节转成 JSON 合法转义（\\n/\\t/\\u00XX）。"""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if o < 0x20:
+            out.append(_CTRL_ESCAPE_MAP.get(o) or ("\\u%04x" % o))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _fix_echo_args(raw):
+    """回声 arguments 内容的修复阶梯：原样 → 转义裸控制字符 → 补引号 → 反双重编码。
+
+    任一变体能过 json.loads 就返回该变体；全部失败返回 None（宁可失败也不猜）。
+    第四级覆盖 flatten 的**常态**形态：arguments 本是「JSON 文本再转义成字符串」
+    （`{\\"cmd\\": \\"ls\\"}`）。外层数组整体合法时 strict 解析直接还原、走不到这里；
+    但多调用数组里**别的** item 坏了会让外层解析失败、全体落入本阶梯——此时若只按
+    「JSON 文档」验证，这种合法的双重编码体会被误杀、整个数组一起放弃。把它重新包成
+    JSON 字符串解码一次，解出的文本再验证，是文档就收下。
+    """
+    for cand in (raw, _escape_raw_control_chars(raw),
+                 _repair_json_lenient(raw), _repair_json_quotes(raw)):
+        if not cand:
+            continue
+        try:
+            json.loads(cand)
+            return cand
+        except Exception:
+            pass
+        try:
+            inner = json.loads('"' + cand + '"')
+            if isinstance(inner, str) and inner.strip():
+                json.loads(inner)
+                return inner
+        except Exception:
+            continue
+    return None
 
 
 def _repair_json_quotes(text):
@@ -4189,30 +4234,144 @@ def _repair_json_quotes(text):
 
     模型会写出 `"arguments": "{"filename":"a.png"}"` —— 内部引号没转义，
     连外层数组都不是合法 JSON。这里先把已转义的占位，再把裸引号转义，复原。
+    随后再把参数里裸出的真实控制字符转义（issue #37 follow-up）——这两类是
+    Bash/文件类工具调用回声里最常见的坏形，修好后调用可正常执行而不是报错。
+
+    注意它只适用于**字符串形态**的 arguments 内容（整段都是待转义的文本）；
+    对象形态（`{"command": "..."}`）请走 _repair_json_lenient——这里会把结构引号
+    一起转义，喂给对象形态只会更坏。
     """
     ph = "\x00"
     s = (text or "").replace('\\"', ph)
     s = s.replace('"', '\\"')
-    return s.replace(ph, '\\"')
+    s = s.replace(ph, '\\"')
+    return _escape_raw_control_chars(s)
+
+
+_JSON_STRUCT_AFTER = ",:}]"      # 闭引号之后合法的非空白后继
+
+
+def _repair_json_lenient(text):
+    """逐字符扫描修复「结构合法、字符串内部脏」的 JSON（issue #37 follow-up）。
+
+    模型复述 arguments 的两种坏形会**同时**出现（Kimi 实测）：字符串里有裸控制
+    字符，还有未转义的引号（Bash 命令里的 `"..."`、文件正文里的中文引号对）。
+    现有修补器各治一种，且 _repair_json_quotes 会把对象形态的结构引号一起毁掉。
+    这里保留结构、只动字符串内部：字符串态里遇到 `"`，看其后第一个非空白字符——
+    属于 `, : } ]` 或 EOF 判为真闭引号，否则是内容里的裸引号，补转义；裸控制
+    字节顺手转义；已正确的 `\\"` 序列原样跳过。修好的文本必须再由 json.loads
+    验证（调用方阶梯负责），验证不过就当没救回来——不会比失败更坏。
+    """
+    s = text or ""
+    out = []
+    in_str = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < n and s[j] in " \t\r\n":
+                    j += 1
+                if j >= n or s[j] in _JSON_STRUCT_AFTER:
+                    in_str = False
+                    out.append('"')
+                else:
+                    out.append('\\"')     # 字符串内容里的裸引号
+                i += 1
+                continue
+            o = ord(ch)
+            if o < 0x20:
+                out.append(_CTRL_ESCAPE_MAP.get(o) or ("\\u%04x" % o))
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_SALVAGE_ITEM_HEAD = re.compile(
+    r'\{\s*"name"\s*:\s*"([^"]*)"\s*,\s*"arguments"\s*:\s*')
+_SALVAGE_CLOSE_RE = re.compile(r'"\s*\}\s*(?:,\s*)?$')
+
+
+def _salvage_echo_item(seg):
+    r"""从一段「{"name":"…","arguments":<值>}」抢救出一个调用项。
+
+    信任 flatten 的模板骨架（键名 name/arguments、键序、item 以 `}` 收尾），
+    只怀疑 arguments **值内部**是否坏了（未转义引号、裸换行/制表符、原生对象
+    ——issue #37/#60 实测的坏形都只坏在值里，数组边界几乎总是完整）。用尾部
+    闭合锚点 `"\s*}`（或对象形态的裸 `}`）定位值的右端，交给 _fix_echo_args
+    的三级修复阶梯验证。seg 为单个数组元素文本；失败返回 None。
+    """
+    m = _SALVAGE_ITEM_HEAD.match(seg)
+    if not m:
+        return None
+    name = m.group(1)
+    if not name:
+        return None
+    tail = seg[m.end():]
+    cands = []
+    cm = _SALVAGE_CLOSE_RE.search(tail)
+    if cm:
+        v = tail[:cm.start()].rstrip()
+        if v.startswith('"'):
+            cands.append(v[1:])          # 字符串形态：去外层引号取内容
+        else:
+            cands.append(v)              # 原生对象形态（"arguments": {…}）
+    # 回退（issue #60 原始形态：值内未转义引号让 `…"}"` 收尾锚点也坏了）：
+    # 信任数组骨架——剥掉 item 的收尾 `}` 后剩下的应当是带引号值字面量。
+    body = tail.strip()
+    if body.endswith("},"):
+        body = body[:-2].rstrip()
+    elif body.endswith("}"):
+        body = body[:-1].rstrip()
+    for extra in (body, body[1:-1] if len(body) >= 2
+                  and body[0] == '"' and body[-1] == '"' else None):
+        if extra is not None and extra not in cands:
+            cands.append(extra)
+    for base in cands:
+        if not base:
+            continue
+        fixed = _fix_echo_args(base)
+        if fixed is not None:
+            return {"name": name, "arguments": fixed}
+    return None
 
 
 def _salvage_echo_array(rest):
-    """宽松重建「[{"name":…,"arguments":"<未转义 JSON>"}]」（issue #60）。
+    """宽松重建「[{"name":…,"arguments":<坏 JSON>}, …]」（issue #60 + follow-up）。
 
-    严格 json.loads 失败时才调用；只处理**单调用**形态（模型复述几乎都是单调用），
-    重建后再交给调用方做同一套严格校验（name 命中声明、arguments 合法）。
+    严格 json.loads 失败时才调用；形态同样支持：按 `{"name"` 锚点切
+    段（arguments 值里几乎不会出现 `{"name"` 这一带引号的模板串）。只要有任一段
+    救不回就整体放弃（保持既有严格语义：要么全部还原成可执行调用，要么按坏块
+    处理）——半截还原会让模型以为工具已执行，比失败更危险。
     """
-    m = _ECHO_LOOSE_RE.match((rest or "").strip())
-    if not m:
+    s = (rest or "").strip()
+    if not (s.startswith("[") and s.endswith("]")):
         return None
-    name, raw_args = m.group(1), m.group(2)
-    for cand in (raw_args, _repair_json_quotes(raw_args)):
-        try:
-            json.loads(cand)
-            return [{"name": name, "arguments": cand}]
-        except Exception:
-            continue
-    return None
+    inner = s[1:-1]
+    starts = [m.start() for m in _SALVAGE_ITEM_HEAD.finditer(inner)]
+    if not starts:
+        return None
+    out = []
+    for i, st in enumerate(starts):
+        en = starts[i + 1] if i + 1 < len(starts) else len(inner)
+        item = _salvage_echo_item(inner[st:en].strip())
+        if item is None:
+            return None
+        out.append(item)
+    return out or None
 
 
 def parse_leaked_tool_calls(text, allowed_names=None):
@@ -4421,6 +4580,13 @@ def _json_array_prefix_ok(text):
         if ("arguments" in s and (
                 msg.startswith("Expecting ',' delimiter")
                 or msg.startswith("Expecting property name"))):
+            return True
+        if "arguments" in s and msg.startswith("Invalid control character"):
+            # issue #37 follow-up：arguments 值里有**裸**换行/制表符（Bash 命令、
+            # 多行文件正文）时 json 在字符串内部报这里。和 #60 同理：不是截断，
+            # 而是留给流末 salvage 重建（_fix_echo_args 阶梯会把控制字符转义）。
+            # 该报错只可能发生在字符串字面量内部（结构位之间的控制符是合法空白），
+            # 且这里仅在「已是 marker+数组候选」的 hold 里调用，宽松只影响延迟。
             return True
         if msg.startswith("Extra data"):
             # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
@@ -5777,6 +5943,13 @@ def extract_session_key(headers, payload):
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
 
+# issue #37 follow-up：坏工具回声是**采样随机**的模型内容问题——重试一轮大概率
+# 就好。默认允许同账号**至多 1 次**自动重发（仅当尚未向客户端吐出任何字节时，
+# 该前提由 should_retry_envelope 里 isinstance(exc, InvalidToolArguments) 分支后的
+# emitted_bytes 守卫强制）；重复计费的顾虑用保守默认兜住，0 = 旧「永不重发」语义，
+# QD_BAD_ARGS_MAX_RETRIES 启动时读取（含 #72 EmptyToolEcho——它继承本类）。
+BAD_ARGS_MAX_RETRIES = max(0, int(os.environ.get("QD_BAD_ARGS_MAX_RETRIES") or 1))
+
 # issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
 # 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
 # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
@@ -6671,8 +6844,11 @@ def _envelope_retry_wait(exc, attempt):
 
 
 def should_retry_envelope(exc, emitted_bytes, attempt, model=""):
-    # issue #37：坏参数是**模型内容问题**，不是瞬时上游故障——绝不自动重发
-    # （否则会重复计费，且下一次很可能同样非法）。客户端想重试由它自己决定。
+    # issue #37 follow-up：坏工具回声/残缺回声是**采样随机**的模型内容问题，
+    # 下一轮大概率正常——默认允许同账号至多 BAD_ARGS_MAX_RETRIES 次自动重发；
+    # 重复计费顾虑由「保守默认 1 次 + 未吐出字节才重发」双重兜住，
+    # QD_BAD_ARGS_MAX_RETRIES=0 恢复旧「永不重发」语义。客户端语义不变：
+    # 预算耗尽仍按 fail-closed 把明确失败返回给客户端。
     """流内错误信封是否值得**重开上游**再试。
 
     关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
@@ -6681,7 +6857,11 @@ def should_retry_envelope(exc, emitted_bytes, attempt, model=""):
     瞬时类（418/5xx/provider_error，且非客户端参数错），就值得重开。
     """
     if isinstance(exc, InvalidToolArguments):
-        return False
+        # 回声块在缓冲里判坏时必然还没吐出字节；emitted 为真说明模型已产出
+        # 正文混着坏回声，重发会让客户端看到两段矛盾内容——绝不重开。
+        if emitted_bytes or attempt >= BAD_ARGS_MAX_RETRIES:
+            return False
+        return True
     if emitted_bytes:
         return False
     _q = _envelope_queue_wait(exc)

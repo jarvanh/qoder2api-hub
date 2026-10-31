@@ -314,13 +314,20 @@ check("#37 混合批次抛出前没有正常收尾、也没有 marker 泄漏",
       [(r["finish"], r["marker"]) for _, r in _mixed_runs])
 
 # ---------------------------------------------------------------------------
-# 6) 重试与账号冷却必须显式排除本异常（不是账号问题，也不许重复计费重发）
+# 6) 重试与账号冷却：坏回声**不是账号问题**（冷却必须排除）；重发只在
+#    「零字节 + 预算内」时发生（issue #37 follow-up：默认 BAD_ARGS_MAX_RETRIES=1，
+#    模型采样随机，重一轮大概率好；吐出过字节绝不重发——客户端会看到矛盾内容）
 # ---------------------------------------------------------------------------
-check("#37 should_retry_envelope(attempt=0) is False",
-      P.should_retry_envelope(P.InvalidToolArguments(), 0, 0) is False)
+check("#37 should_retry_envelope(零字节, attempt=0) 按预算重发一次",
+      P.should_retry_envelope(P.InvalidToolArguments(), 0, 0)
+      is (P.BAD_ARGS_MAX_RETRIES >= 1))
 check("#37 should_retry_envelope 在已发字节 / 用完重试预算时同样 False",
       P.should_retry_envelope(P.InvalidToolArguments(), 123, 0) is False
       and P.should_retry_envelope(P.InvalidToolArguments(), 0, 99) is False)
+check("#37 #72 EmptyToolEcho 继承同一重发策略",
+      P.should_retry_envelope(P.EmptyToolEcho(5, "marker_only"), 0, 0)
+      is (P.BAD_ARGS_MAX_RETRIES >= 1)
+      and P.should_retry_envelope(P.EmptyToolEcho(5, "marker_only"), 1, 0) is False)
 
 _acc = A.Account({"uid": "issue37-uid", "realm": "cn", "accessToken": "tok"})
 _before = (_acc.cooldown_until, _acc.last_error)
