@@ -20,3 +20,8 @@ usage/
 .mimosa/
 _shots/
 umid/
+
+# 本地调试环境（含 PAT 的 .env 绝不进构建上下文）
+.env
+.venv/
+_tmp_*

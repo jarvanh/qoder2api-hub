@@ -14,8 +14,10 @@
 
 1. **官方动态接口** `/algo/api/v2/model/list`：需要账号，返回官方当前的清单。每次获取成功都会写入磁盘缓存
 2. **磁盘缓存** `accounts/models-cache-<区域>.json`：上次从动态接口获取成功的结果，7 天内有效。容器重启或上游暂时不可用时先用它，不必退回到可能已经过时的内置快照
-3. **本机官方客户端的模型目录缓存** `~/.qoder*/.models/<uid>/catalog-v6`：离线也能用
+3. **本机官方客户端的模型目录缓存** `~/.qoder*/.models/<uid>/catalog-v7`（官方 1.1.81+ 写 v7，老客户端的 catalog-v6 兜底）：离线也能用
 4. **仓库内置的快照** `qoder_catalog_cn.json` / `qoder_catalog_intl.json`：可以用 `python _refresh_catalog.py` 从本机客户端更新
+
+官方改**显示名**（如 kmodel_latest 从 Kimi-K3 改为 Kimi-K3.1-Pro）而快照还没跟上时，动态清单里的新名字也能被解析成上游 key——动态清单一到手就会把「显示名 -> key」注册进解析器；改名窗口期内请求路径会用离线源兜底补注册（不出网、不碰账号池）。
 
 清单在内存中缓存 5 分钟。想立即重新获取，调用 `GET /models/refresh`（需要 API Key）。
 

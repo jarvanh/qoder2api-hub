@@ -39,12 +39,12 @@ P.record_usage("Kimi-K3", {"prompt_tokens": 10, "completion_tokens": 5,
 P.record_usage("DeepSeek-Flash", {"prompt_tokens": 3, "completion_tokens": 1,
                                   "total_tokens": 4})
 _r = _rows()
-check("不一致时写入 billed_model", _r[0].get("billed_model") == "auto", _r[0])
+check("#121：不再写 billed_model（上游回报 auto 不携带计费信息）",
+      "billed_model" not in _r[0], _r[0])
 check("一致时不写 billed_model（行格式零变化）",
       "billed_model" not in _r[1], _r[1])
 check("上游没带 model 字段时不写", "billed_model" not in _r[2], _r[2])
-check("面板最近请求有计费替换徽标",
-      "billed_model" in _dash and _dash.count("badge bad") > 1)
+check("面板不再显示计费替换徽标", "billed_model" not in _dash)
 P.USAGE_DIR = _orig_dir_u
 P._usage.clear(); P._usage.update(_orig_usage)
 

@@ -27,31 +27,15 @@ check('UA 可用 QD_COSY_UA 覆盖',
 check('版本覆盖原本就有（QD_COSY_VERSION）', 'QD_COSY_VERSION' in _sign)
 
 print("[#113] 计费自检端点")
-check('有 /diag/model-billing 路由',
-      'if path == "/diag/model-billing":' in _src)
-_i = _src.index('def _handle_diag_billing')
-_j = _src.index('def _handle_accounts', _i)
-_seg = _src[_i:_j]
-_route = _src[_src.index('if path == "/diag/model-billing"'):][:600]
-check('走面板鉴权（dispatch 段里先查 panel_ok）',
-      'panel password required' in _route)
-check('取上游回报的 model 名（不是本地推断）',
-      'billed.add(m)' in _seg and 'chat.completion' in _seg)
-check('回报 billed / billed_mismatch / account / elapsed_ms',
-      all(k in _seg for k in ('billed_mismatch', 'elapsed_ms', 'account')))
-check('不一致时打 WARN 日志',
-      'upstream re-routed' in _seg)
-_okfalse = chr(34) + "ok" + chr(34) + ": False"
-check('上游错误也返回结构化 JSON 而不是 500 堆栈',
-      _seg.count(_okfalse) >= 2)
+check('#121：自检端点已移除（不再对外承诺计费口径）',
+      '/diag/model-billing' not in _src or '已移除' in _src)
+# issue #121 之后端点与面板入口都已移除，这里只保留身份覆盖相关的断言。
 
 print("[#113] 面板可见性")
-check('模型库每行有「自检」按钮',
-      'checkModelBilling' in _dash and 'bill-check' in _dash)
-check('自检结果区分一致/不一致',
-      "billed_mismatch ? \"bad\" : \"ok\"" in _dash)
-check('最近请求的 billed_model 徽标仍在（v1.7.8 的能力）',
-      'billed_model' in _dash)
+check('模型库的「自检」按钮已移除（#121）',
+      'checkModelBilling' not in _dash)
+check('不再出现 billed_mismatch 文案', 'billed_mismatch' not in _dash)
+check('最近请求的计费徽标已移除（#121）', 'billed_model' not in _dash)
 
 print("[#113] 未伪造任何身份")
 # 只允许出现在注释里（说明为什么这么做）；不允许有代码分支靠这个哨兵值绕过授权
@@ -62,22 +46,14 @@ check('没有把 vsc 白名单哨兵写进代码分支（只在注释里解释�
 check('机器指纹相关头未变（不新增伪造项）',
       '"cosy-machinetoken"' not in _sign or True)
 
-print("[#113] 不一致日志：每小时同组合只提醒一次（上游常统一回报 auto）")
+print("[#113/#121] 不再记录/告警 上游回报的模型名（#121）")
 _orig_log = P.log
 _calls = []
-P.log = lambda msg, **kw: _calls.append((msg, kw))
-P._BILLED_WARN_AT.clear()
-_u = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
-      "model": "auto"}
-for _ in range(3):
-    P.record_usage("DeepSeek-Flash", dict(_u))
-_billed_logs = [c for c in _calls if "different model name" in c[0]]
-check("同一 (请求, 回报) 组合只提醒一次", len(_billed_logs) == 1, len(_billed_logs))
-check("提醒文案指向自检端点", "/diag/model-billing" in (_billed_logs[0][0] if _billed_logs else ""))
-P.record_usage("GLM-5.3", dict(_u))
-check("换模型重新提醒一次",
-      len([c for c in _calls if "different model name" in c[0]]) == 2)
+P.log = lambda msg, **kw: _calls.append(msg)
+P.record_usage("DeepSeek-Flash", {"prompt_tokens": 1, "completion_tokens": 1,
+                             "total_tokens": 2, "model": "auto"})
 P.log = _orig_log
-P._BILLED_WARN_AT.clear()
+check("不再因模型名不一致打日志（#121）",
+      not [m for m in _calls if "different model name" in m], _calls[:2])
 
 finish()

@@ -22,6 +22,26 @@ import os
 import time
 import uuid
 
+
+_host_log = None
+
+
+def log(*args, **kwargs):
+    """日志转发：宿主在 import 后调用 _bind_log(log) 注入（保持本模块零依赖、
+    只 import 标准库）；未注入时静默丢弃——日志绝不能影响协议输出。"""
+    fn = _host_log
+    if fn is None:
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _bind_log(fn):
+    global _host_log
+    _host_log = fn
+
 # ---------------------------------------------------------------------------
 # 常量与开关
 # ---------------------------------------------------------------------------
@@ -485,9 +505,16 @@ def chat_to_messages(chat_obj, model=None):
             inp = {}
         if not isinstance(inp, (dict, list)):
             inp = {"value": inp}
+        _tool_name = str(fn.get("name") or "")
+        if not _tool_name:
+            # issue #116（非流式侧）：空 name 会让下游整轮 malformed —— 宁可
+            # 不还原这一个调用，也不发坏块。
+            log("anthropic: dropped tool_use without name (id=%s) - issue #116"
+                % (tc.get("id") or "-"), level="WARN", tag="anthropic")
+            continue
         content.append({"type": "tool_use",
                         "id": str(tc.get("id") or _new_id("toolu_")),
-                        "name": str(fn.get("name") or ""),
+                        "name": _tool_name,
                         "input": inp})
     return {
         "id": _new_id("msg_"),
@@ -515,6 +542,12 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
     text_index = None
     thinking_index = None
     tool_index = {}
+    # issue #116：上游偶发「新 index 的首帧不带 name」，而 content_block_start
+    # 一旦发出就不能再补 name（Anthropic 协议不允许改已发出的块）——下游会拿到
+    # 空 name 并把整轮判成 malformed。所以先缓冲：name 非空才发 start，期间到达的
+    # arguments 先攒着，start 之后按序补发。
+    pending_tools = {}      # ci -> {ai, id, name, args}
+    dropped_tools = []      # 流结束仍无 name 的块（丢弃并记日志）
     open_blocks = []
     finish = "stop"
     mode = thinking_mode()
@@ -595,25 +628,57 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
                 fn = tc.get("function")
                 fn = fn if isinstance(fn, dict) else {}
                 args = fn.get("arguments") or ""
-                if ci not in tool_index:
+                if ci not in pending_tools:
                     ai = next_index
                     next_index += 1
                     tool_index[ci] = ai
-                    open_blocks.append(ai)
-                    yield ev("content_block_start", {
-                        "index": ai,
-                        "content_block": {"type": "tool_use",
-                                          "id": str(tc.get("id")
-                                                    or _new_id("toolu_")),
-                                          "name": str(fn.get("name") or ""),
-                                          "input": {}}})
+                    pending_tools[ci] = {"ai": ai,
+                                         "id": str(tc.get("id") or ""),
+                                         "name": str(fn.get("name") or ""),
+                                         "args": []}
+                slot = pending_tools[ci]
+                if not slot["name"]:
+                    slot["name"] = str(fn.get("name") or "")
+                if not slot["id"]:
+                    slot["id"] = str(tc.get("id") or "")
                 if args:
-                    yield ev("content_block_delta", {
-                        "index": tool_index[ci],
-                        "delta": {"type": "input_json_delta",
-                                  "partial_json": args}})
+                    slot["args"].append(args)
+                # name 已知 -> 需要时才开块，然后把队列里的分片按序发完；
+                # name 未知 -> 继续攒（绝不发空 name 的 start）。
+                if slot["name"]:
+                    if slot["ai"] not in open_blocks:
+                        open_blocks.append(slot["ai"])
+                        yield ev("content_block_start", {
+                            "index": slot["ai"],
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": slot["id"] or _new_id("toolu_"),
+                                "name": slot["name"],
+                                "input": {}}})
+                    _queued = slot["args"]
+                    slot["args"] = []
+                    for piece in _queued:
+                        yield ev("content_block_delta", {
+                            "index": slot["ai"],
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": piece}})
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    # issue #116：仍有块没等到 name —— 不发 start（发了就是空 name），整块丢弃并
+    # 降级 stop_reason，避免下游一直等一个永远不会到来的工具结果。
+    for _ci, _slot in list(pending_tools.items()):
+        if _slot["ai"] in open_blocks:
+            continue
+        dropped_tools.append(_slot)
+        log("anthropic stream: dropped tool_use block without name "
+            "(index=%s, id=%s, args_chars=%d) - issue #116"
+            % (_ci, _slot["id"] or "-",
+               sum(len(a) for a in _slot["args"])),
+            level="WARN", tag="anthropic")
+    if dropped_tools and finish == "tool_calls":
+        _kept_text = text_index is not None or thinking_index is not None
+        if not _kept_text:
+            finish = "stop"
     for i in sorted(open_blocks):
         yield ev("content_block_stop", {"index": i})
     final = chat_usage_to_anthropic(

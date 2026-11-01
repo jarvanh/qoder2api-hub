@@ -2714,20 +2714,6 @@ async function loadModels(){
   }
 }
 
-// issue #113：模型「计费自检」
-async function checkModelBilling(model, btn){
-  if(btn){ btn.disabled = true; btn.textContent = "检测中"; }
-  try{
-    const r = await postJSON("/diag/model-billing", {model: model});
-    if(!r.ok){ toast(model + " 自检失败: " + (r.error || "未知错误"), "bad"); return; }
-    const billed = (r.billed || []).join(", ") || "(上游未回报模型名)";
-    toast(r.billed_mismatch
-      ? (model + " → 上游实际按 " + billed + " 计费（计费与限额都按它算）")
-      : (model + " → 上游按 " + billed + " 计费，一致"),
-      r.billed_mismatch ? "bad" : "ok");
-  }catch(e){ toast("自检请求失败: " + e.message, "bad"); }
-  finally{ if(btn){ btn.disabled = false; btn.textContent = "自检"; } }
-}
 function renderAvailableModels(){
   const tb = document.querySelector('#modelsTable tbody');
   if(!tb) return;
@@ -2866,10 +2852,7 @@ function renderAvailableModels(){
         + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
         + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
       : '';
-    const _billBtn = // issue #113：一键「计费自检」——上游是否按另一个模型计费，比日志更直观
-    ' <button class="bill-check" title="发一个最小请求，返回上游实际按哪个模型计费（kmodel_latest 这类被上游改路由时能立刻看出来）"'
-      + ' onclick="checkModelBilling(\'' + esc(m.id) + '\', this)" style="font-size:10px;padding:1px 6px;margin-left:4px">自检</button>';
-    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + _billBtn + '</div>'];
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -4874,10 +4857,7 @@ async function refreshInner(){
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model)
-      + (r.billed_model && r.billed_model !== r.model
-        ? ' <span class="badge bad" title="上游实际按 ' + esc(r.billed_model) + ' 计费（该模型对网关身份未开放或被回退，计费与限额按它算）">' + '计费→' +
-            esc(r.billed_model) + '</span>'
-        : '') + '</td>'
+        + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'

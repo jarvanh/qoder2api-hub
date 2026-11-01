@@ -89,6 +89,16 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 | [开发与测试](docs/development.md) | 模块结构、测试、维护脚本 |
 | [更新日志](CHANGELOG.md) | 各版本变更 |
 
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
+---
+
 ## 致谢
 
 - [mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)：双区常量表、OAuth 设备授权与 PAT 交换、COSY 签名与自定义 Base64、签到与保活排程
