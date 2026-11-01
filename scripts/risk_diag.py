@@ -133,6 +133,7 @@ def main(argv):
         ("QD_TEAM_MAX_CONCURRENCY", "单号并发上限（默认 1）"),
         ("QD_TEAM_MIN_GAP_MS", "单号最小请求间隔(ms，默认 400)"),
         ("QD_STRUCTURED_TOOL_HISTORY", "结构化工具历史 on/off/auto"),
+        ("QD_ERROR_COOLDOWN_WAIT_MAX", "短频控自吞预算(s，默认10)"),
         ("QD_TOOL_RESULT_SCOPE", "工具结果削减范围 tail/all/turn"),
         ("QD_MACHINE_IDENTITY_CACHE", "设备身份缓存"),
         ("QD_KEEP_TOPLEVEL_IMAGES", "顶层重复图片(应关)"),

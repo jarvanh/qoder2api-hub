@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.19"
+VERSION = "1.7.20"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6360,7 +6360,20 @@ class RateLimited(Exception):
 # 账号级错误短冷却的“等待续上”上限：单账号池在传输/瞬时故障后只有
 # 3s（多账号 15s）冷却，此时**等待**比报 429 更正确——429 只留给真正的
 # 上游频控（model_cooldowns，由上游 HTTP 429 设置）。
-ERROR_COOLDOWN_WAIT_MAX = 10.0
+# fork v1.7.20：预算开放为 QD_ERROR_COOLDOWN_WAIT_MAX（默认 10s 不变）。
+# 部署侧调大（如 30s）后，常见 ≤30s 的上游短频控窗在服务端自吞（排队路径
+# 既有 600s 等待预算先例，30s 远在其内），客户端不再收到瞬态 429。
+def _parse_wait_max(raw):
+    """QD_ERROR_COOLDOWN_WAIT_MAX 解析：非法/非正回退默认 10.0（宁可少等）。"""
+    try:
+        v = float((raw or "").strip() or 10.0)
+    except (TypeError, ValueError):
+        return 10.0
+    return v if v > 0 else 10.0
+
+
+ERROR_COOLDOWN_WAIT_MAX = _parse_wait_max(
+    os.environ.get("QD_ERROR_COOLDOWN_WAIT_MAX"))
 
 
 def _realm_ready_total(realm, model=None):
@@ -6385,7 +6398,7 @@ def _short_error_cooldown_wait(realm, model, exclude=None):
 
     两条冷却来源**一起收集、取最小值**（#29 起）：
       · cooldown_until：账号级错误/传输冷却（原有语义）；
-      · model_cooldowns[model]：**仅当剩余 <= ERROR_COOLDOWN_WAIT_MAX(10s)** 时纳入；
+      · model_cooldowns[model]：**仅当剩余 <= ERROR_COOLDOWN_WAIT_MAX（默认 10s，QD_ERROR_COOLDOWN_WAIT_MAX 可调）** 时纳入；
         超出预算的长频控仍交回 429 路径（客户端退避），不在这里吞掉。
     为什么不再短路：旧实现「遇到任一 model_cooldowns > now 就 return 0」，会让
     「号 A 长频控」连带把「号 B 只有 3s 可自愈」一起放弃（#29 的次生坑）。

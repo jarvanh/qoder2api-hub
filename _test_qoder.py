@@ -733,6 +733,18 @@ finally:
     import shutil as _sh14
     _sh14.rmtree(_td14, ignore_errors=True)
 
+# (e) fork v1.7.20：等待预算可调（QD_ERROR_COOLDOWN_WAIT_MAX，默认 10s 不变）
+_pwm = P._parse_wait_max
+check("wait-max parse: 空/缺省 -> 10.0",
+      _pwm("") == 10.0 and _pwm(None) == 10.0)
+check("wait-max parse: '30' -> 30.0", _pwm("30") == 30.0)
+check("wait-max parse: 带空白 ' 25.5 ' -> 25.5", _pwm(" 25.5 ") == 25.5)
+check("wait-max parse: 非数字回退 10.0（宁可少等）", _pwm("abc") == 10.0)
+check("wait-max parse: 0/负数回退 10.0",
+      _pwm("0") == 10.0 and _pwm("-5") == 10.0)
+check("wait-max 默认常量仍为 10.0（环境未设时行为零变化）",
+      P.ERROR_COOLDOWN_WAIT_MAX == 10.0, P.ERROR_COOLDOWN_WAIT_MAX)
+
 # favicon 404 静默
 check("log_message silences favicon regardless of status (code present)",
       'req_path == "/favicon.ico"' in open(
