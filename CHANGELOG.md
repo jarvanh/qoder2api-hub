@@ -9,6 +9,21 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.18
+
+fork 维护版：**Kimi 加入结构化工具历史 auto 白名单**（坏工具回声的治本项落地）。
+
+- **背景**：治本方案「结构化 tool_calls/tool 历史直传」此前因账号池撞 Qoder 日计费上限
+  顺延端到端验证；2026-11-01 上限重置后补跑。
+- **验证**：`tests/manual_kimi_structured_e2e.py` 对真实 Kimi-K3.1-Pro 三组请求全过——
+  工具结果被正确消费、回复零 LEAK_MARKER 泄漏、复跑稳定。顺带修掉脚本 T2 自身矛盾
+  （指令 "call get_time twice" 与单次结果历史不符，模型合法续发工具调用被误判为失败）。
+- **改动**：`STRUCTURED_TOOL_HISTORY_WHITELIST` 增加 `kimi` 与上游 key `kmodel`
+  （Kimi 上游 key 为 `kmodel` / `kmodel_latest`，公开名以 Kimi 开头，同 deepseek/dfmodel
+  双词条保留）；`_test_issue60_followup.py` / `_test_issue79_structured_realm.py` 的
+  kimi 排除断言改为正向断言，未验证 provider 样本换 MiniMax（`mmodel`）。
+- INTL 通道维持排除（task-31 未在 INTL 取得结果）；id 不齐备回退文本化的 fail-safe 不变。
+
 ## v1.7.17
 
 fork 维护版：**坏工具回声从「必然报错」变成「自动重发 + 更大抢救面」**——直击

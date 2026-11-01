@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.17"
+VERSION = "1.7.18"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5457,8 +5457,12 @@ def _current_turn_start(messages):
 # _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
 # issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
 # 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
+# 2026-11-01 Kimi E2E 验证通过（tests/manual_kimi_structured_e2e.py，Kimi-K3.1-Pro
+# 三组全过：工具结果消费 / 零 marker 泄漏 / 复跑稳定）-> 加入 auto 白名单。
+# Kimi 上游 key 是 `kmodel` / `kmodel_latest`，公开名以 Kimi 开头——同 deepseek/dfmodel 理由双词条保留。
 STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
-                                   "deepseek", "dfmodel")
+                                   "deepseek", "dfmodel",
+                                   "kimi", "kmodel")
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
@@ -5496,10 +5500,12 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     """本次请求是否走结构化工具历史。
 
     - off          -> False（一键回退文本化）
-    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - on           -> True（显式强制：临时对未加白 provider 验证用）
     - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
         task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
-        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+        故 auto 不在 INTL 启用。DeepSeek 由报告者 v1.5.4 验证；Kimi 于
+        2026-11-01 补跑 E2E 三组全过后加白（v1.7.18）；MiniMax / INTL
+        仍未验证，同样排除。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):

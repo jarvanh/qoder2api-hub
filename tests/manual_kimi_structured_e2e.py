@@ -7,7 +7,8 @@ marker）——但 auto 白名单一直把 kimi 排除在外，因为「待补�
 就是那个验证：给真实 Kimi 发一条带结构化历史的会话，看上游是否正常消化。
 
 跑法（三选一，按账号配额情况自选）：
-  1) 主网关（auto 白名单不含 kimi，等于没开——仅对照用）:
+  1) 主网关（v1.7.18 起 auto 白名单已含 kimi；要文本化对照就把
+     QD_STRUCTURED_TOOL_HISTORY 设 off）:
        python tests/manual_kimi_structured_e2e.py http://127.0.0.1:8790 qd-<key> Kimi-K3.1-Pro
   2) 测试容器（强制结构化，推荐——不影响主网关其它流量）:
        docker run -d --name q2api-kimi-test --rm \
@@ -110,7 +111,7 @@ def main():
     p2 = build_request()
     p2["messages"] = [
         {"role": "system", "content": p2["messages"][0]["content"]},
-        {"role": "user", "content": "Read /tmp/poem.txt then call get_time twice."},
+        {"role": "user", "content": "Read /tmp/poem.txt then call get_time once."},
         {"role": "assistant", "content": "", "tool_calls": [
             {"id": "call_kimi_e2e_2a", "type": "function",
              "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/poem.txt\"}"}},

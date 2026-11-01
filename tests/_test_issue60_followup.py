@@ -67,8 +67,14 @@ check("#60f 上游 key `dfmodel` 命中结构化直传（此前只写 deepseek �
 check("#60f deepseek-* 仍命中", P.structured_tool_history_enabled(
     model="deepseek-v4-flash", model_key="deepseek-v4-flash",
     realm="cn", messages=_msgs) is True)
-check("#60f 未验证的 provider 仍排除（kimi）",
+check("#60f kimi 端到端验证通过已加白（2026-11-01 E2E 三组全过）",
       P.structured_tool_history_enabled(model="kimi-k2", model_key="kimi-k2",
+                                        realm="cn", messages=_msgs) is True)
+check("#60f 上游 key kmodel_latest 同样命中（dfmodel 同理）",
+      P.structured_tool_history_enabled(model="Kimi-K3.1-Pro", model_key="kmodel_latest",
+                                        realm="cn", messages=_msgs) is True)
+check("#60f 未验证 provider 仍排除（MiniMax/mmodel）",
+      P.structured_tool_history_enabled(model="minimax-m3.1", model_key="mmodel",
                                         realm="cn", messages=_msgs) is False)
 
 # ---------------------------------------------------------------- marker 变体

@@ -110,8 +110,10 @@ check("cn + deepseek 前缀 → True",
       _enabled("cn", model="deepseek-v4", key="deepseek-v4") is True)
 check("realm=None → False（回归本体）", _enabled(None) is False)
 check("intl + dfmodel → False（INTL 仍排除）", _enabled("intl") is False)
-check("cn + 非白名单模型 → False",
-      _enabled("cn", model="Kimi-K2", key="kimi") is False)
+check("cn + kimi（已验证加白）→ True",
+      _enabled("cn", model="Kimi-K2", key="kimi") is True)
+check("cn + 未验证 provider → False",
+      _enabled("cn", model="MiniMax-M3.1-Flash", key="mmodel") is False)
 check("cn + tool id 不齐 → False（fail-safe）", _enabled("cn", ids_ok=False) is False)
 
 print("\n[issue79] 三态开关")
