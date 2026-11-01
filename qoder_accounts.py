@@ -1507,6 +1507,14 @@ class Account(object):
         self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        # 当日签到实得奖励（2026-11-01）：只在真实领取时写入、同日不变 ——
+        # 与 lastCreditsDelta（最近一次余额变化，会被消耗覆盖）语义分离，
+        # 供看板显示「签到 +N」（像 workbuddy/autoclaw）。
+        self.last_checkin_reward = data.get("lastCheckinReward")
+        try:
+            self.last_checkin_reward_at = float(data.get("lastCheckinRewardAt") or 0)
+        except (TypeError, ValueError):
+            self.last_checkin_reward_at = 0.0
         # 面板展示：最近一次积分变化（签到 +100 / 消耗 -35）与时间
         self.last_credits_delta = data.get("lastCreditsDelta")
         try:
@@ -1566,6 +1574,8 @@ class Account(object):
             "creditsDegraded": self.credits_degraded,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCheckinReward": self.last_checkin_reward,
+            "lastCheckinRewardAt": self.last_checkin_reward_at,
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
             "checkinWhenDisabled": bool(self.checkin_when_disabled),
@@ -1684,6 +1694,8 @@ class Account(object):
             "orgLabel": self.org_label(),
             "checkedInToday": self._checkin_stamped_today(),
             "lastCheckinDate": str(self.last_checkin or "")[:10],
+            "lastCheckinReward": self.last_checkin_reward,
+            "lastCheckinRewardAt": self.last_checkin_reward_at,
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
             "checkinWhenDisabled": bool(self.checkin_when_disabled),
@@ -2398,7 +2410,13 @@ class Account(object):
             # #25-e：上游已领 -> 本地同步盖章（否则 lastCheckin 恒 null，
             # can_checkin 恒 True，调度器每轮重走该号——naonao 实测）。
             if not self._checkin_stamped_today():
-                self._stamp_checkin()
+                # 上游已领 -> 本地补章；奖励字段缺当日记录时顺带回填
+                # （status 的 rewardCredits 在 CLAIMED 态即今日实得），
+                # 让「签到 +N」对历史已签账号也成立（2026-11-01）。
+                if not self._checkin_reward_stamped_today():
+                    self._stamp_checkin(reward=st.get("reward_credits"))
+                else:
+                    self._stamp_checkin()
             return {"ok": True, "already": True, "msg": "今日已签到",
                     "streak_days": st["streak_days"], "reward_credits": st["reward_credits"]}
         if not st["active"]:
@@ -2433,7 +2451,7 @@ class Account(object):
                 return {"ok": True, "already": True, "msg": "今日已签到（复查确认）"}
             return {"ok": False, "error": str(res.get("error") or res)[:160]}
         reward = int(res.get("rewardCredits") or 0)
-        self._stamp_checkin()
+        self._stamp_checkin(reward=reward)
         # issue #40 后续：签到发的积分要**立刻反映到面板**。上游把奖励记进
         # addOnQuota，不刷余额的话面板仍显示旧值（报告者看到的
         # 「提示 +100 积分但余额不显示」）。失败不影响签到结果本身。
@@ -2988,10 +3006,24 @@ class Account(object):
                          % reason,
                 "anomaly": anomaly}
 
-    def _stamp_checkin(self):
+    def _stamp_checkin(self, reward=None):
         self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+        if reward is not None:
+            try:
+                self.last_checkin_reward = int(reward)
+            except (TypeError, ValueError):
+                pass
+            self.last_checkin_reward_at = time.time()
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
+
+    def _checkin_reward_stamped_today(self):
+        """当日是否已记过签到奖励（回填守卫：避免调度轮询反复覆盖）。"""
+        try:
+            return bool(self.last_checkin_reward_at) and time.strftime(
+                "%Y-%m-%d", time.localtime(self.last_checkin_reward_at)) == time.strftime("%Y-%m-%d")
+        except Exception:
+            return False
 
     def _other_realm_quota_hint(self):
         """issue #40 探测：令牌是否属于**另一个区域**（realm 标记错误）。
