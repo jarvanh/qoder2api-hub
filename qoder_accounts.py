@@ -2892,12 +2892,23 @@ class Account(object):
             res = self.claim_campaign(cid)
             if res.get("ok"):
                 amount = res.get("amount") or c["benefit"]["amount"] or 0
-                self._stamp_checkin()
                 if res.get("replayed"):
+                    # 2026-11-01：replay 不在此记奖励 —— 当日已记过会重复
+                    # 累加，统一走函数尾部 already 回填（有当日守卫）。
                     already.append(c)
+                    self._stamp_checkin()
                 else:
                     claimed.append(c)
                     earned += int(amount or 0)
+                    # 2026-11-01：真实新领取的奖励记入 lastCheckinReward
+                    # （同日累加），看板「签到 +N」数据源，与 sash 路径同语义。
+                    _rw = int(amount or 0)
+                    if _rw and self._checkin_reward_stamped_today():
+                        try:
+                            _rw = int(self.last_checkin_reward or 0) + _rw
+                        except (TypeError, ValueError):
+                            pass
+                    self._stamp_checkin(reward=(_rw or None))
                 if res.get("redemption_code"):
                     codes.append({"campaign": label,
                                   "code": res["redemption_code"]})
@@ -2919,9 +2930,21 @@ class Account(object):
             # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
             # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
             time.sleep(claim_gap)
-        if already and not self._checkin_stamped_today():
+        if already:
             # #25-e：已有 CLAIMED 的签到类活动 = 今日已领 -> 本地盖章一次。
-            self._stamp_checkin()
+            # 2026-11-01：奖励缺当日记录时按 benefit.amount 求和回填（官方
+            # 客户端已签/旧版部署期间已签的账号也能显示「签到 +N」）；
+            # 已有当日记录则不重算（防重放重复累加）。
+            if not self._checkin_reward_stamped_today():
+                _rw = 0
+                for c in already:
+                    try:
+                        _rw += int((c.get("benefit") or {}).get("amount") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                self._stamp_checkin(reward=(_rw or None))
+            elif not self._checkin_stamped_today():
+                self._stamp_checkin()
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, "、".join(self.campaign_label(c) for c in claimed))
