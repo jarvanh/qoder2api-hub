@@ -9,6 +9,23 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.23
+
+fork 维护版：**池级配额耗尽的对外语义改为 402**（对齐 zcode2api b779919，2026-11-01）。
+
+- **背景**：110 日计数停放（billingUntil）/余额停放把整池挡住后，选号空手只会抛
+  502「no usable account」——下游 OmniRoute 把 502/503 当 node 故障熔断连坐健康模型，
+  也不会按「仅配额耗尽回退」切下一腿（2026-11-01 `free`/`deepseek-v4.1-flash`
+  链路的连环失败即此形态：停放账号被反复撞墙，错误被当冷却记账）。
+- **改动**：`open_upstream` 池耗尽抛出点新增 `_realm_quota_parked()` 判定
+  （enabled 账号全部被 billing_until / balance_until / G2-G4 当日预算护栏挡住；
+  错误冷却与频控**不算**配额）→ 抛 `QuotaExhausted`；chat / responses / anthropic
+  三个出口回 **402 + Retry-After + type=model_no_quota**（到点自动解封语义），
+  `_exc_http_status` 同步认 402；`record_error` 状态码同步，面板统计不失真。
+- **不变**：部分账号可用、错误冷却/频控导致的空手仍走既有 502/503/429 语义；
+  OmniRoute 对 402 无条件判 QUOTA_EXHAUSTED（cooldownMs=0，不污染连接）。
+- 新套件 `tests/_test_quota_egress_402.py`；版本断言跟进 1.7.23。
+
 ## v1.7.20
 
 fork 维护版：**短频控自吞预算开放为 `QD_ERROR_COOLDOWN_WAIT_MAX`**（默认 10s 不变，行为零变化）。

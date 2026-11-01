@@ -62,10 +62,10 @@ import qoder_updater
 import qoder_webtools
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates,
-                            local_vm_status)
+                            local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.22"
+VERSION = "1.7.23"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6357,6 +6357,62 @@ class RateLimited(Exception):
             "upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+class QuotaExhausted(Exception):
+    """池级配额耗尽（402 语义；对齐 zcode2api b779919，2026-11-01）。
+
+    与 502「no usable account」的差别：enabled 账号全部被**配额类**字段
+    挡住（110 日计数停放 / 余额 402 停放 / 当日预算护栏），到点自动解封。
+    下游 OmniRoute 的分类器对 402 无条件判 QUOTA_EXHAUSTED（cooldownMs=0，
+    不污染连接），命中其「仅配额耗尽回退」；502/503 会被当 node 故障熔断
+    连坐健康模型。message 保持 "no usable account" 前缀：HTTP 出口的既有
+    翻译分支不改条件即可接住（isinstance 优先分流）。
+    """
+
+    def __init__(self, realm, wait, model=None):
+        self.realm = realm
+        self.model = model
+        self.wait = max(1, int(wait or 1))
+        super(QuotaExhausted, self).__init__(
+            "no usable account for realm '%s': all parked on quota "
+            "(billing/balance daily reset)" % realm)
+
+
+def _realm_quota_parked(realm, model=None):
+    """True 仅当该区域 enabled 账号**全部**被配额类字段挡住（选号必然空手）。
+
+    与 realm_model_throttled 同构的池级判定；配额类字段 = ready() 里消费的
+    billing_until / balance_until / G2-G4 当日预算护栏（全部纯内存读）。
+    cooldown_until / model_cooldowns 是错误冷却与频控，**不算**配额——
+    否则传输抖动把整池冷 15s 会误报成「额度耗尽」。
+    返回 (是否全停放, Retry-After 秒)：秒 = 最早一个账号的解封时刻
+    （任一账号解封即可服务，取 min 而非 max）。
+    """
+    if not POOL:
+        return (False, 0)
+    existing = [a for a in POOL.accounts
+                if a.realm == realm and a.enabled and a.access_token]
+    if not existing:
+        return (False, 0)
+    now = time.time()
+
+    def _deadline(a):
+        ds = []
+        if a.billing_until > now:
+            ds.append(a.billing_until)
+        if a.balance_until > now:
+            ds.append(a.balance_until)
+        if (a.daily_limit_blocked() or a.credit_limit_blocked(model)
+                or a.model_token_limit_blocked(model)):
+            # 当日预算护栏无独立时刻字段，按日界解封（与 110 同一钟）
+            ds.append(next_daily_reset(now))
+        return min(ds) if ds else None
+
+    deadlines = [d for d in (_deadline(a) for a in existing) if d]
+    if not deadlines or len(deadlines) < len(existing):
+        return (False, 0)
+    return (True, max(1, int(min(deadlines) - now + 0.999)))
+
+
 # 账号级错误短冷却的“等待续上”上限：单账号池在传输/瞬时故障后只有
 # 3s（多账号 15s）冷却，此时**等待**比报 429 更正确——429 只留给真正的
 # 上游频控（model_cooldowns，由上游 HTTP 429 设置）。
@@ -7320,6 +7376,8 @@ def _exc_http_status(exc, default=502):
     """
     if isinstance(exc, RateLimited):
         return 429
+    if isinstance(exc, QuotaExhausted):
+        return 402
     for attr in ("status", "http_error", "code"):
         v = getattr(exc, attr, None)
         if isinstance(v, int):
@@ -8220,6 +8278,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
+    quota_parked, quota_wait = _realm_quota_parked(realm, model)
+    if quota_parked:
+        # 池级配额耗尽：402 语义（下游 OmniRoute 的「仅配额耗尽回退」靠它命中）
+        raise QuotaExhausted(realm, quota_wait, model=model)
     raise RuntimeError(
         "no usable account for realm '%s': all are disabled, cooling down, or expired"
         % realm)
@@ -11619,11 +11681,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message,
+            record_error(model, 402 if isinstance(exc, QuotaExhausted) else 502,
+                         message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
+            if isinstance(exc, QuotaExhausted):
+                # 池级配额耗尽走 402（2026-11-01，对齐 zcode2api b779919）：
+                # OmniRoute 分类器对 502/503 判 node 故障（熔断连坐健康模型）、
+                # 对 429 无条件判 RATE_LIMITED；402 无条件判 QUOTA_EXHAUSTED
+                # （cooldownMs=0，不污染连接），恰好命中其「仅配额耗尽回退」。
+                return self._error(
+                    402, "所有账号配额已用尽（日计数/余额停放），到点自动解封",
+                    err_type="model_no_quota", retry_after=exc.wait)
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -11929,11 +12000,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message,
+            record_error(model, 402 if isinstance(exc, QuotaExhausted) else 502,
+                         message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
+            if isinstance(exc, QuotaExhausted):
+                # 池级配额耗尽走 402（2026-11-01，对齐 zcode2api b779919）：
+                # OmniRoute 分类器对 502/503 判 node 故障（熔断连坐健康模型）、
+                # 对 429 无条件判 RATE_LIMITED；402 无条件判 QUOTA_EXHAUSTED
+                # （cooldownMs=0，不污染连接），恰好命中其「仅配额耗尽回退」。
+                return self._error(
+                    402, "所有账号配额已用尽（日计数/余额停放），到点自动解封",
+                    err_type="model_no_quota", retry_after=exc.wait)
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -12459,11 +12539,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message,
+            record_error(model, 402 if isinstance(exc, QuotaExhausted) else 502,
+                         message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          stream=want_stream,
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
+            if isinstance(exc, QuotaExhausted):
+                # 池级配额耗尽走 402（2026-11-01，对齐 zcode2api b779919）：
+                # OmniRoute 分类器对 502/503 判 node 故障（熔断连坐健康模型）、
+                # 对 429 无条件判 RATE_LIMITED；402 无条件判 QUOTA_EXHAUSTED
+                # （cooldownMs=0，不污染连接），恰好命中其「仅配额耗尽回退」。
+                return self._error(
+                    402, "所有账号配额已用尽（日计数/余额停放），到点自动解封",
+                    err_type="model_no_quota", retry_after=exc.wait)
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
