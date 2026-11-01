@@ -2409,14 +2409,14 @@ class Account(object):
         if st["today_checked_in"]:
             # #25-e：上游已领 -> 本地同步盖章（否则 lastCheckin 恒 null，
             # can_checkin 恒 True，调度器每轮重走该号——naonao 实测）。
-            if not self._checkin_stamped_today():
-                # 上游已领 -> 本地补章；奖励字段缺当日记录时顺带回填
-                # （status 的 rewardCredits 在 CLAIMED 态即今日实得），
-                # 让「签到 +N」对历史已签账号也成立（2026-11-01）。
-                if not self._checkin_reward_stamped_today():
-                    self._stamp_checkin(reward=st.get("reward_credits"))
-                else:
-                    self._stamp_checkin()
+            # 上游已领 -> 奖励缺当日记录就回填（2026-11-01）：status 的
+            # rewardCredits 在 CLAIMED 态即「今日实得」。回填**不依赖本地
+            # 盖章状态** —— 「官方客户端已签/旧版部署期间已签」的账号也能
+            # 在下次巡检补上「签到 +N」，不必等到下一个签到日。
+            if not self._checkin_reward_stamped_today():
+                self._stamp_checkin(reward=st.get("reward_credits"))
+            elif not self._checkin_stamped_today():
+                self._stamp_checkin()
             return {"ok": True, "already": True, "msg": "今日已签到",
                     "streak_days": st["streak_days"], "reward_credits": st["reward_credits"]}
         if not st["active"]:
