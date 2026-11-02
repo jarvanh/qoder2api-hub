@@ -458,7 +458,8 @@ def chat_usage_to_anthropic(usage):
         except (TypeError, ValueError):
             return 0
     prompt = max(0, _int(u.get("prompt_tokens")))
-    cached = _int(u.get("prompt_cache_hit_tokens")) or _int(
+    cached = _int(u.get("cached_tokens")) or _int(
+        u.get("prompt_cache_hit_tokens")) or _int(
         details.get("cached_tokens")) or _int(pdet.get("cached_tokens"))
     cached = max(0, min(cached, prompt))
     return {

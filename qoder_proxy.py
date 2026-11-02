@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.23"
+VERSION = "1.7.24"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -492,7 +492,8 @@ def _extract_usage(usage):
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
-        "cached_tokens": usage.get("prompt_cache_hit_tokens")
+        "cached_tokens": usage.get("cached_tokens")
+        or usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
         "total_tokens": usage.get("total_tokens") or 0,
         # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
@@ -3279,7 +3280,8 @@ def normalize_usage_for_client(usage):
     pdet = usage.get("prompt_tokens_details")
     pdet = dict(pdet) if isinstance(pdet, dict) else {}
     val = None
-    for cand in (usage.get("prompt_cache_hit_tokens"),
+    for cand in (usage.get("cached_tokens"),
+                 usage.get("prompt_cache_hit_tokens"),
                  det.get("cached_tokens") if isinstance(det, dict) else None,
                  pdet.get("cached_tokens")):
         try:
@@ -5204,8 +5206,9 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
       - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
     """
     hold = None          # 正在暂存的候选正文（None = 未暂存）
-    hold_frames = 0      # 连续未增长的帧数（空转保护，issue #16/#36 后续）
+    hold_frames = 0      # 连续未增长帧数（空转保护，issue #16/#36 后续）
     finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
+    tail_usage = []      # hold 期间到达的 usage 垫底帧（流末补发）
     recovered = False
     meta = {"id": None, "model": None, "created": None}
 
@@ -5244,6 +5247,13 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             yield raw
             continue
         if hold is not None:
+            if not choices and isinstance(payload.get("usage"), dict):
+                # 回读暂存期间到达的 usage 垫底帧：没有正文增量、不影响候选
+                # 判定，此前会掉进下面的 continue 被静默吞掉 —— 触发回读的
+                # 轮次调用方整轮收不到 usage（只剩客户端自估的输入 tokens）。
+                # 缓存到流末、跟在收尾帧之后发（保持 usage 垫底的标准顺序）。
+                tail_usage.append(payload)
+                continue
             hold += piece
             # issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的
             # 合法回声块（每帧 1 字符也会推进长度）交给 32KB 字符上限兜底——
@@ -5372,6 +5382,17 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 只发 content 会把起点整帧吞掉，下游 index 永远缺 name。
             yield _content_chunk(meta, piece, delta, fin)
             continue
+        if (finished is not None and hold is None and not choices
+                and isinstance(payload.get("usage"), dict)):
+            # 上游流尾顺序是 [finish] -> [usage]（OpenAI 标准也是 usage 垫底）。
+            # 收尾帧被扣到这里说明回读判定早已结束（hold 为空、不可能再改写
+            # finish_reason），继续扣它只会把 usage 顶到 finish 前面 —— 按
+            # 「末帧 usage」解析的客户端（OpenAI Chat 格式）就此读不到
+            # 输出/缓存 tokens。这里先放行收尾帧再透传 usage，恢复标准顺序。
+            _fp, _ffin = finished
+            finished = None
+            yield ("data: " + json.dumps(_fp, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
         yield raw
 
     if hold is not None:
@@ -5456,6 +5477,9 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+    for _up in tail_usage:
+        yield ("data: " + json.dumps(_up, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
 
 
 def _dsml_tail_hold(text):
@@ -5495,6 +5519,7 @@ def _sse_recover_dsml(frames, allowed_names=None):
     buf = ""
     tail = ""
     finish = None
+    tail_usage = []      # DSML 缓冲期间到达的 usage 垫底帧（流末补发）
     meta = {"id": None, "model": None, "created": None}
     recovered = False
 
@@ -5511,6 +5536,21 @@ def _sse_recover_dsml(frames, allowed_names=None):
             continue
         choices = payload.get("choices") if isinstance(payload, dict) else None
         if not isinstance(choices, list) or not choices:
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("usage"), dict)):
+                if buf or tail:
+                    # DSML 缓冲期间到达的 usage 垫底帧：流末可能还要改写
+                    # finish_reason，缓存到收尾帧之后补发（不吞、不抢序）。
+                    tail_usage.append(payload)
+                    continue
+                if finish is not None:
+                    # usage 垫底帧到达且无缓冲可改写 finish_reason：先放行
+                    # 被扣的收尾帧再透传 usage，保持 [finish] -> [usage] ->
+                    # [DONE] 标准顺序（同 _recover_leaked_tool_calls_inner）。
+                    _fp, _ffin = finish
+                    finish = None
+                    yield ("data: " + json.dumps(_fp, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
             yield raw
             continue
         if not meta["id"] and payload.get("id"):
@@ -5609,6 +5649,9 @@ def _sse_recover_dsml(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+    for _up in tail_usage:
+        yield ("data: " + json.dumps(_up, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
 
 
 def _sse_guard_truncated_tool_args(frames):
@@ -9092,7 +9135,8 @@ def _responses_usage(u):
     return {
         "input_tokens": u.get("prompt_tokens") or 0,
         "input_tokens_details": {
-            "cached_tokens": u.get("prompt_cache_hit_tokens")
+            "cached_tokens": u.get("cached_tokens")
+            or u.get("prompt_cache_hit_tokens")
             or det.get("cached_tokens") or pdet.get("cached_tokens") or 0,
         },
         "output_tokens": u.get("completion_tokens") or 0,
