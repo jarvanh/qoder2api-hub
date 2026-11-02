@@ -206,6 +206,9 @@ check("E3b 防过度：纯详情（amount=0）不算已领（不盖章，归 vie
 
 e4 = _mk("e4")
 e4.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+# v1.7.22 起 already 分支的短路条件是「当日已记过签到奖励」（回填不依赖本地盖章），
+# 因此桩账号需同时盖奖励时间戳才构成完全短路；只盖 last_checkin 会走一次合法回填写盘
+e4.last_checkin_reward_at = time.time()
 saves = {"n": 0}
 _orig_save = A.Account.save
 
