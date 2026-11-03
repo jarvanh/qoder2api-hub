@@ -888,6 +888,33 @@ CREDIT_USAGE_TTL = 300
 # gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
 CLAIM_GAP_DEFAULT = 1.0
 
+def _campaign_list_needs_retry(st, only_kinds=None):
+    """活动列表要不要重试（issue #130）。
+
+    只在「查询成功但**没有可领项**」时重试：空列表、showCampaign=false、
+    或列表里没有任何 claim_status=CLAIMABLE 且属于 only_kinds 的活动。
+    查询本身失败不在这里重试（上层有自己的错误路径）。
+    """
+    if not isinstance(st, dict) or not st.get("ok"):
+        return False
+    items = st.get("campaigns") or []
+    if not items:
+        return True
+    if st.get("show_campaign") is False and not st.get("claimable"):
+        return True
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("claim_status") or "").upper() != "CLAIMABLE":
+            continue
+        if only_kinds is not None:
+            kind = str((c.get("benefit") or {}).get("kind") or "").upper()
+            if kind not in only_kinds:
+                continue
+        return False
+    return True
+
+
 def campaign_label(c):
     """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
     c = c or {}
@@ -1439,6 +1466,27 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------
+# issue #131-4：accounts/ 下与**系统文件/目录**同名的 uid 必须挡住 —— 否则
+# 导入一个 uid="settings" 的账号会写进 accounts/settings.json，把面板密码摘要与
+# API Key 列表整体覆盖（实测会导致默认密码 admin 重新可用、Key 全清）。
+RESERVED_ACCOUNT_UIDS = frozenset({
+"settings", "machine_identity", "usage", "usage-summary",
+"scheduler", "state", "models-cache", "max-output-limits",
+})
+
+
+def is_reserved_account_uid(uid):
+    """该 uid 会不会撞上 accounts/ 里的系统文件（issue #131-4）。"""
+    low = str(uid or "").strip().lower()
+    if not low:
+        return False
+    if low in RESERVED_ACCOUNT_UIDS:
+        return True
+    # 前缀撞车也要挡：models-cache-cn / usage-2026 之类同样是系统命名空间
+    return any(low.startswith(prefix + "-") for prefix in (
+        "models-cache", "max-output-limits", "usage"))
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -1716,6 +1764,9 @@ class Account(object):
         base = Path(directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
+        if is_reserved_account_uid(safe_uid):
+            # 双重防线：即使上游没拦住，落盘这一步也不许覆盖系统文件。
+            raise ValueError("reserved account uid: %r" % safe_uid)
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
         tmp = base / (name + ".tmp")
@@ -1729,6 +1780,7 @@ class Account(object):
             os.replace(tmp, path)
         self.path = str(path)
         return self.path
+
     def delete(self):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
@@ -2830,7 +2882,20 @@ class Account(object):
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
         # （设计 §9.1）。身份真被服务端作废时由 campaigns() 的自愈兜底刷新。
         native_machine_identity(self.realm, self.uid)
+        # issue #130：同一请求上游偶发返回「没有每日活动 / claimable=false」
+        # （报告者实测 10 次里 2 次），一次空结果就放弃会让当天签到直接丢掉。
+        # 这里对**空结果/无可领项**重试两次（0.8s、2.0s 退避），拿到可领项即停。
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
+        for _wait in (0.8, 2.0):
+            if not _campaign_list_needs_retry(st, only_kinds):
+                break
+            try:
+                time.sleep(_wait)
+            except Exception:
+                pass
+            _retry = self.campaigns(force=True)
+            if _retry.get("ok"):
+                st = _retry
         if not st.get("ok"):
             next_at, next_note = next_checkin_window()
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
@@ -4662,6 +4727,11 @@ def normalise_import_row(row, realm=None):
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
         uid = "p-" + uuid.uuid4().hex[:24]
+    elif is_reserved_account_uid(uid):
+        # issue #131-4：第三方账号文档可能带这种记录；明确拒绝，
+        # 而不是静默改名（改名会让用户以为导入成功却多出一个假号）。
+        raise ValueError("uid %r is reserved by system files; rename the "
+                         "record before importing" % uid)
     exp = normalize_epoch(pick("expiresAt"))
     if not exp:
         exp = int(time.time()) + 3600

@@ -375,7 +375,6 @@
     "需要升级或购买千问官方套餐开放": "Requires an upgrade or an official Qwen plan",
     "检测中...": "Detecting...",
     "物理机": "Bare metal",
-    "官方风控桥不可用，以下为本机交叉校验": "The official risk bridge is unavailable; the results below come from local cross-checks",
     "需重启网关": "Gateway restart required",
     "本机虚拟化检测（当前网关进程版本较旧）": "Local virtualization check (gateway process is outdated)",
     "该功能需要 v1.1.4+ 的网关进程：重启网关后点「重新检测」。": "This needs gateway v1.1.4+. Restart the gateway, then click Re-check.",
@@ -613,7 +612,12 @@
     "输入自定义密钥，或点击右侧生成": "Enter a custom key, or generate one on the right",
     "编辑 API Key": "Edit API key",
     "新建 API Key": "New API key",
-    "活动页/二维码": "Event page / QR code"
+    "活动页/二维码": "Event page / QR code",
+    "本地硬件：": "Local hardware: ",
+    "官方风控：": "Official risk: ",
+    "判定为虚拟机": "reported as a VM",
+    "判定为物理机": "reported as a physical machine",
+    "官方风控：桥不可用（本机未找到 runtime-info），以下为本机交叉校验": "Official risk: bridge unavailable (runtime-info not found on this machine); showing local cross-check instead"
   },
   "patterns": {
     " 积分{2}{3}": " credits{2}{3}",

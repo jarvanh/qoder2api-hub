@@ -281,13 +281,37 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
         return None
     if target in allowed:
         return target
-    # clamp：取 rank 最接近且不超过的档；全超 -> 取最高档
-    tr = EFFORT_RANK[target]
-    lower = [x for x in allowed if EFFORT_RANK[x] <= tr]
-    if lower:
-        return max(lower, key=lambda x: EFFORT_RANK[x])
-    return min(allowed, key=lambda x: EFFORT_RANK[x])
+    # issue #126：clamp 必须**双向就近**（同距时偏向模型默认档），与
+    # qoder_proxy.normalize_reasoning_effort 同一策略。旧实现只向下取，
+    # dfmodel（low/high/max）上的 medium/high 会被压成 low —— 静默降档。
+    _def = _default_effort_from(catalog_meta, allowed)
+    want = EFFORT_RANK[target]
+    ref = EFFORT_RANK.get(_def, want)
 
+    def _key(cand):
+        return (abs(EFFORT_RANK[cand] - want), abs(EFFORT_RANK[cand] - ref))
+
+    return sorted(allowed, key=_key)[0]
+
+
+def _default_effort_from(catalog_meta, allowed):
+    """该模型的默认档（thinking_config.is_default），否则取允许表中间档。
+
+    与 qoder_proxy.default_effort 同一策略；本模块只 import 标准库，无法反向
+    引用 proxy，所以这里保留一份最小实现（两处口径由测试交叉校验，issue #126）。
+    """
+    tc = (catalog_meta or {}).get("thinking_config")
+    tc = tc if isinstance(tc, dict) else {}
+    en = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
+    efforts = en.get("efforts") if isinstance(en.get("efforts"), dict) else {}
+    for name, cfg in efforts.items():
+        if isinstance(cfg, dict) and cfg.get("is_default"):
+            cand = str(name).strip().lower()
+            if cand in EFFORT_RANK:
+                return cand
+    if not allowed:
+        return ""
+    return allowed[len(allowed) // 2]
 
 def _efforts_from_meta(meta):
     """从 catalog 元数据读档位（fallback；接线时应显式传 supported 以避免双实现）。

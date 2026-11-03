@@ -9,6 +9,127 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.25
+
+fork 维护版：合并上游 v1.7.14–v1.7.19（6 提交，2026-11-03）。
+
+- **上游要点**：#131 安全审计六项（白名单回写丢失/Web 工具绕授权且不记账/uid=settings 覆盖系统配置/匿名注销/SSRF 三条绕过）、#130 活动列表抖动重试与调度器 fired 持久化、#128/#129 会话按单次提问切分 + 每次调用积分展示、#123 后续诊断增强、#126/#127 思考档位双向 clamp 与 namespace/MCP 工具展开。
+- **冲突处理**：`VERSION` 进位 1.7.25；CHANGELOG 上游六节改题「上游 vX（并入）」——fork 1.7.14–1.7.19 版本号早已占用，避免同名节歧义。
+- **fork 保留**：QD_QUEUE_FAST_MODELS 按模型排队、坏工具回声重发、池级配额 402 语义、QD_ERROR_COOLDOWN_WAIT_MAX 短频控预算、110 日界停放语义、结构化工具历史 auto 白名单。
+- **验证**：待本轮全量套件结果补充。
+
+## 上游 v1.7.19（2026-11-03 并入，上游原题 v1.7.19）
+
+**🔒 安全与正确性修复（#131 审计报告，6 项）**
+
+1. **模型白名单在保存时丢失**：`runtime_settings_view()` 不回显 `models`（与 `note`），面板「读 → 改 → 存」是整表覆盖链，缺字段等于把白名单写成空列表 —— **授权范围被放大**。
+   现在：视图回显 `models`/`note`；保存侧区分「字段未提交（保留旧值）」与「显式提交空列表（清除限制）」；前端仅在行内有该字段时才提交（`undefined` 会被 JSON 丢掉）。
+2. **声明 Web 工具可绕过模型封禁 / Key 白名单**：`_handle_web_tools()` 此前直接 `open_upstream()`，跳过了 `_model_precheck()`。现在在推理前统一判一次（封禁 + Key 白名单 + 跨区），拒绝走 400。
+3. **Web 工具推理不记账**：该分支每轮推理都没有 `record_usage()` → 看板/按 Key 账号统计、以及按本地流水折叠的每日限额都漏计。
+   现在每轮按真实账号/Key/模型记一条，多轮消耗累加后作为本次响应 `usage` 返回；记账失败只 WARN，不影响推理。
+4. **导入 `uid=settings` 会覆盖系统配置**：账号文件名直接是 `<uid>.json`，保留名会写进 `accounts/settings.json`（面板密码摘要与 API Key 列表被整体覆盖，默认密码 `admin` 重新可用）。
+   现在：`RESERVED_ACCOUNT_UIDS` + 前缀撞车判定（`models-cache-*` / `usage-*` 等），导入阶段**明确拒绝**（不静默改名），`Account.save()` 再加一道落盘防线。
+5. **匿名 `POST /panel/logout` 注销所有会话**：该分支在 `_panel_ok()` 之前执行 `PANEL.revoke_all()`（换签名密钥 = 踢掉全部浏览器）。现在先认证，未认证返回 401。
+6. **网页抓取 SSRF 三条绕过**：
+   - 用 `ipaddress` 判「全球单播」（修掉 `100.65/100.127/198.18` 等漏网段，含 IPv6）；
+   - **解析一次并钉死到连接**（`_PinnedHTTP(S)Connection` 连 IP、TLS 用 `server_hostname` 保原域名证书校验），彻底堵 DNS 重绑定；
+   - **代理不再豁免检查**：域名一律解析校验，抓取直连钉好的 IP；重定向逐跳重新校验。
+
+**验证**：新增 `tests/_test_issue131_audit_fixes.py`（34 条：白名单回写链、Web 工具前置检查与记账接点、保留 uid 三处防线、注销鉴权顺序、9 组地址分类 + 钉死连接 + 逐跳重定向）；全量 **105 suites / 2736 checks / 0 failed**。
+
+## 上游 v1.7.18（2026-11-03 并入，上游原题 v1.7.18）
+
+**🐛 问题修复（#130：CN 每日签到始终领不到 + 调度器重放）**
+
+1. **活动列表抖动导致「没有可领活动」直接放弃**：`GET /sash/api/v1/me/campaigns` 实测 10 次里 2 次返回空/无每日活动，旧实现一次空结果就结束本轮，当天签到整段丢掉。
+   新增 `_campaign_list_needs_retry()`：查询成功但**没有可领项**（空列表 / `showCampaign:false` / 无 `CLAIMABLE`）时重试两次（0.8s、2.0s 退避），拿到可领项即停；查询失败仍走上层错误路径。
+2. **`SAME_PERSON_ALREADY_CLAIMED` 被当成失败**：上游按「人」（机器身份）去重，单账号池也会返回这个码。旧文案写成「同一设备下其他账号本轮已领」——对单账号池是误导，且不盖本地签到章 → 每个排程点都会重打一次上游。
+   现在：文案改成「本轮无需再领：上游按「人」去重（原码）…单账号池也会出现，不是本号凭证问题」，**盖本地签到章**并返回 `blocked: [failureCode]`，本轮按成功收尾（不再走 sash 兜底白打一次）。
+3. **调度器 `_fired` 只在内存**：重启会把 3 小时内的排程点再跑一遍（实测两次签到相隔 3 秒）。
+   现在 `_fired` 随状态文件持久化（只留近 3 天、只接受「过去 3 天内且不在未来」的值，脏数据不会锁死排程）；`_apply_schedule` **不再清空** `_fired`（改排程也不会重放已过时点）。
+
+**验证**：新增 `tests/_test_issue130_checkin_claim.py`（14 条：重试判据五态、blocked 语义与盖章、返回码透出、fired 持久化/脏数据/导出窗口、改排程不重放）；全量 **104 suites / 2702 checks / 0 failed**。
+
+## 上游 v1.7.17（2026-11-03 并入，上游原题 v1.7.17）
+
+**🔧 会话分组改成「一次对话一个 id」（#128 后续）**
+
+v1.7.15 把整个**对话窗口**固定成同一个 id，导致用量面板里一条窗口跨几小时的记录看不出单次对话时长。现在按「一次用户提问 + 其后的工具步进」切分：
+
+- 会话键 = 显式键（如有）**+ 最后一条 user 消息的摘要**；工具步进时最后一条 user 消息不变 → 仍归同一条；用户下一次提问 → 换新 id；
+- 因此 `business.begin_at` 反映的是**这次对话**的起点，面板能看出单次耗时；
+- `request_id` / `request_set_id` 仍逐请求唯一（计费与限额不受影响）；
+- 仍未拿到任何线索时保持旧行为；`QD_CONVERSATION_SHARE=0` 可整体关闭。
+
+**✨ 新增：每次调用的积分消耗可视化（#129）**
+
+- 「最近请求」新增 **积分** 列：单次扣费（≥100 用醒目色），有折扣时把原价划掉，悬停显示「本次扣费 / 原价 / 是否计费」；
+- 表格下方显示 **本页 N 次调用合计 X 积分**（含折扣前原价），失败行不计入；
+- 后端 usage 行本来就带 `credit` / `original_credits`，这次只是把它摆到台面上。
+
+顺带回答 #129 里「官网显示 Auto」：那是 v1.7.10 之前的归因缺口，PR #119（v1.7.11）已让 `business.model_key` 随请求下发，上游现在就按真实模型记账；老版本继续显示 Auto 属预期。
+
+**验证**：更新 `_test_issue128_conversation_split.py`（24 条，覆盖「工具步进同一条 / 新提问换 id / TTL / LRU」）、新增 `_test_issue129_credits_ui.py`（14 条）；全量 **103 suites / 2688 checks / 0 failed**。
+
+## 上游 v1.7.16（2026-11-03 并入，上游原题 v1.7.16）
+
+**🔍 诊断增强（#123 后续）**
+
+- **账号「测试」失败不再只显示 `upstream status 403`**：信封层异常现在有专门分支，回包带 `detail`（上游原文，截断 400 字符）与 `hint`（人话解释），日志也带业务码线索。`hint` 覆盖实测过的码：`10605`→上游排队、`112`→额度耗尽、`110`→当日次数上限、`430`→版本过低、`TOKEN_EXPIRE`→凭证过期。
+- **`/diag/vm` 标注判定来源**：新增 `bridge_exe`（找到的 runtime-info 路径，空串=没有）、`bridge_available`、`bridge_vm_info`（只带 `isVm/brand/percentage/vmTypeCode` 四个键）、`local_evidence`（本地交叉校验证据）。
+- **面板把两个来源分开写**：`本地硬件：…` 与 `官方风控：…` 各占一行；桥不可用时明确写「桥不可用（本机未找到 runtime-info），以下为本机交叉校验」——不再把本地结论冒充成官方判定。
+
+**📌 国际版签到（#123 主体的调查结论）**
+
+实测（v1.7.15 + 真实 intl 账号）：`/sash/api/v1/me/daily-check-in/status` 及其 6 个同义变体在 intl 上**全部 404**；活动接口在正确主机 `center.qoder.sh` 上返回 `showCampaign:false / campaigns:[]`；而 `qoder.com` 网页侧同名接口返回 **401 `missing cookie header`**。结论：intl 的每日 100 Credits 走的是**网页会话（cookie）**通道，桌面/CLI 的 COSY token 打不通——这也是网关「暂无可领取」而官方客户端能领的原因。要支持它需要引入浏览器 cookie 这一类凭据，属于新特性，等确认后单独实现。
+
+**验证**：新增 `tests/_test_issue123b_diagnostics.py`（20 条：403 分支/五种业务码 hint/VM 来源字段/面板双来源文案/SBC 判定不回归）；`i18n/en.json` 同步了新的面板文案。全量 **102 suites / 2672 checks / 0 failed**。
+
+## 上游 v1.7.15（2026-11-03 并入，上游原题 v1.7.15）
+
+**🐛 问题修复：一次对话被上游拆成 N 条（#128）**
+
+Codex 里一次约 10 分钟的对话，在 Qoder 用量面板里变成**几十条 <1min 的对话**，与官网用量记录一一对应；一天二十来次对话被放大成五百多条，直接撞上每日对话上限（`code 110`），换模型也受同一上限约束。
+
+**根因**：上游按请求体里的会话身份归组「一条对话」，而网关每个 HTTP 请求都新造 `business.id` / `chat_record_id` / `begin_at` / `session_id`。一个 agent 回合里有几十次工具步进（每次都是一次 HTTP 请求），上游就记成几十条独立对话。
+
+**改法**：引入**会话身份**（`ConversationIdentity`），同一客户端会话复用同一组值：
+
+| 字段 | 行为 |
+|---|---|
+| `business.id` / `chat_record_id` | 同一会话恒定（= 会话 id） |
+| `business.begin_at` | 固定为会话**起点**，不再每次刷新（10 分钟对话就是一条 10 分钟记录） |
+| `session_id` | 前缀缓存命中时仍用缓存 id（保留热路由收益）；未命中时用会话 id 兜底 |
+| `request_id` / `request_set_id` | **仍然每请求唯一** —— 计费与限额按请求计数，绝不能被并掉 |
+
+会话键来源（按优先级）：
+1. 客户端显式携带：`X-Conversation-Id` / `X-Session-Id` / `session_id` / `metadata.conversation_id`；
+2. 退化为「首条 user 消息 + 系统提示 + 模型」的摘要 —— Codex 全量回放历史，首条消息在一次对话里恒定，因此同一对话稳定命中、不同对话不会串；
+3. 两者都拿不到 → **保持旧行为**（每次新造），绝不把无关请求并成一条。
+
+另有 LRU（4096 条 / 6 小时 TTL）防内存膨胀；`QD_CONVERSATION_SHARE=0` 可整体关闭回到 v1.7.14 行为。
+
+**验证**：新增 `tests/_test_issue128_conversation_split.py`（22 条：显式键/历史退化/换模型分叉/关闭开关/出站四字段稳定性/无身份时不误并/LRU 上限与 TTL）；全量 **101 suites / 2653 checks / 0 failed**。
+
+## 上游 v1.7.14（2026-11-03 并入，上游原题 v1.7.14）
+
+**🐛 问题修复**
+
+- **thinking.budget_tokens 档位单向 clamp**（#126）：`effort_from_anthropic` 的 clamp 只向下取，导致 `medium`（16384）在只支持 `low/high/max` 的模型（`dfmodel` 等）上被压成 **low**，同一语义走 `output_config.effort` 却得到 **high** —— 两条路径结论相反，静默降档。
+  改为**双向就近 + 同距偏模型默认档**，与 `normalize_reasoning_effort` 同一策略；`medium → high`、`ultrathink(31999) → high`、`>32768 → max`。两处实现由测试交叉校验（避免再次分叉）。
+
+**✨ 新增：namespace / MCP 工具不再静默消失**（#127 F1 + F3）
+
+- `type:"namespace"` 容器**递归展开**（`tools` / `children` / `functions`，深度上限 4）成平铺 `function` 条目——容器本身不出站，因此不会触发 #63 的 `unknown variant namespace`；容器内不带 `type` 的子项按 `function` 处理；
+- 回程把 `namespace` 补回 **`response.output_item.added` 那一帧**（客户端按 `(name, namespace, kind)` 匹配执行器，只在 `.done` 补会匹配不到）；
+- `custom_tool_names()` 递归进容器：Codex Desktop 把 `exec` 这类 freeform 工具嵌在 namespace 里，漏掉会让调用以 `function_call` 返回、执行器匹配不到 → 模型无限重试；
+- 合并 `input` 里的 `additional_tools`（Codex Desktop 0.162+ 把整份工具清单放在那里）；
+- 重名策略显式化：**同名只留第一个** + WARN（展平后无法区分两个 server 的同名工具）。
+
+**未做（如实记录）**：#127 的 F2（Codex remote compaction）、F4（`web_search`/`web_fetch` 本地代跑）、F5（`previous_response_id` 提示头）——F2 需要「摘要轮 + 收起工具 + 只发 done 帧」的完整契约，F4 会引入网关主动出网，都按独立特性排期；F5 是可选提示，等维护者确认语义再动。`docs/clients.md` 已同步更新（可用的与仍不支持的写清楚）。
+
+**验证**：新增 `tests/_test_issue126_127_effort_namespace.py`（30 条：档位对照表与两条路径交叉校验、namespace 展开/映射/custom 递归/重名/深度、additional_tools 合并、非流式与流式回程 namespace 逐帧断言）；同时修正 `_test_issue56_62.py` 里按旧单向 clamp 写死的期望（medium → high）。全量 **100 suites / 2631 checks / 0 failed**。
+
 ## v1.7.24
 
 fork 维护版：合并上游 v1.7.13（usage 帧序修复，2026-11-02）。

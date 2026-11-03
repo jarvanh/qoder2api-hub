@@ -25,9 +25,11 @@ def eff(payload, supported=SUP):
 check("#62 adaptive+low -> low",
       eff({"thinking": {"type": "adaptive"},
            "output_config": {"effort": "low"}}) == "low")
-check("#62 adaptive+medium -> low（supported 无 medium，向下 clamp）",
+# issue #126：clamp 改为**双向就近**（同距偏默认档），medium 不再被单向压到 low。
+# 这条与 qoder_proxy.normalize_reasoning_effort 的结论一致（medium -> high）。
+check("#62 adaptive+medium -> high（#126 双向就近）",
       eff({"thinking": {"type": "adaptive"},
-           "output_config": {"effort": "medium"}}) == "low")
+           "output_config": {"effort": "medium"}}) == "high")
 check("#62 adaptive+high -> high",
       eff({"thinking": {"type": "adaptive"},
            "output_config": {"effort": "high"}}) == "high")

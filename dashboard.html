@@ -2927,10 +2927,24 @@ async function loadVmState(force){
       : '本机虚拟化检测';
     const ev = document.getElementById("vmEvidence");
     if(ev){
+      // issue #123 后续：两个来源分开写，避免「本地：单板计算机」与
+      // 「官方风控：KVM」并排出现时看起来自相矛盾。
       const lines = [];
-      if(r.score !== null && r.score !== undefined) lines.push('风控评分 ' + r.score + '/100');
-      if(r.source === 'local') lines.push('官方风控桥不可用，以下为本机交叉校验');
-      (r.evidence || []).slice(0, 3).forEach(function(x){ lines.push(String(x)); });
+      const localLine = (r.local_evidence || r.evidence || [])
+        .filter(function(x){ return String(x).indexOf('单板计算机') === 0; })[0];
+      if(localLine) lines.push('本地硬件：' + String(localLine).replace('检测到', ''));
+      const bi = r.bridge_vm_info || {};
+      if(bi.isVm !== undefined && bi.isVm !== null){
+        lines.push('官方风控：' + (bi.isVm ? '判定为虚拟机' : '判定为物理机')
+          + (bi.brand ? ' · ' + String(bi.brand) : '')
+          + (bi.percentage !== undefined && bi.percentage !== null ? ' · 评分 ' + bi.percentage : '')
+          + (bi.vmTypeCode !== undefined && bi.vmTypeCode !== null ? ' · 类型码 ' + bi.vmTypeCode : ''));
+      } else if(r.bridge_available === false){
+        lines.push('官方风控：桥不可用（本机未找到 runtime-info），以下为本机交叉校验');
+      }
+      (r.evidence || []).slice(0, 3).forEach(function(x){
+        if(String(x).indexOf('单板计算机') !== 0) lines.push(String(x));
+      });
       ev.innerHTML = lines.map(esc).join('<br>');
     }
     const card = document.getElementById("cardVmState");
@@ -4772,6 +4786,47 @@ function effortCell(r){
   return '<span class="badge warn" title="请求 ' + esc(req) + '，实际下发 ' + esc(eff) + '：归一化时被挪档">' + mono(req) + ' → ' + mono(eff) + '</span>';
 }
 
+// issue #129：每次调用的积分消耗可视化
+function creditCell(r){
+  if(r.error) return '<span style="color:var(--dim)">—</span>';
+  const c = Number(r.credit || 0);
+  const orig = Number(r.original_credits || 0);
+  if(!c && !orig) return '<span style="color:var(--dim)">0</span>';
+  const shown = (c || orig);
+  const txt = shown >= 100 ? shown.toFixed(0) : shown.toFixed(2);
+  // 有折扣（original_credits > credit）时把原价划掉，避免「怎么这么贵」的误读
+  const disc = (orig > c + 1e-9)
+    ? ' <span style="font-size:10px;color:var(--dim);text-decoration:line-through">'
+      + (orig >= 100 ? orig.toFixed(0) : orig.toFixed(2)) + '</span>'
+    : '';
+  const color = shown >= 100 ? 'color:#e08b2b' : 'color:var(--accent2)';
+  return '<b style="' + color + '">' + txt + '</b>' + disc;
+}
+
+function creditTitle(r){
+  const c = Number(r.credit || 0), orig = Number(r.original_credits || 0);
+  const parts = ['本次扣费 ' + c + ' 积分'];
+  if(orig > c + 1e-9) parts.push('原价 ' + orig + '（当前有折扣/谷时价）');
+  if(r.billable === false) parts.push('上游标记为不计费');
+  return parts.join(' · ');
+}
+
+function recentCreditSummary(rows){
+  let sum = 0, sumOrig = 0, n = 0;
+  (rows || []).forEach(function(r){
+    if(r.error) return;
+    const c = Number(r.credit || 0), o = Number(r.original_credits || 0);
+    sum += c; sumOrig += (o > c ? o : c); n += 1;
+  });
+  if(!n) return '';
+  const disc = sumOrig > sum + 1e-9
+    ? '（原价 <span style="text-decoration:line-through">' + sumOrig.toFixed(2) + '</span>）'
+    : '';
+  return '<div class="legend" style="margin-top:6px"><span>本页 ' + n + ' 次调用合计 '
+    + '<b style="color:var(--accent2)">' + sum.toFixed(2) + '</b> 积分' + disc
+    + '；单次扣费按积分列（鼠标悬停看明细）</span></div>';
+}
+
 async function refreshInner(){
   let usage, recent, perf;
   try{
@@ -4853,7 +4908,7 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model)
@@ -4871,7 +4926,9 @@ async function refreshInner(){
         + '<td style="color:var(--think)">' + fmt(r.reasoning_tokens) + '</td>'
         + '<td>' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
+        + '<td style="text-align:right" title="' + esc(creditTitle(r)) + '">' + creditCell(r) + '</td>'
       + '</tr>').join('') + '</tbody></table>'
+      + recentCreditSummary(rows)
     : '<div class="empty">还没有请求记录</div>';
   renderEffortByKey();   // 样本变了就重算档位分布
   renderRealmActual();   // #26：卡片「最近一次对话的出口」也读这批 usage 行（不再依赖响应头）
@@ -5419,6 +5476,11 @@ async function saveApiKeys(btn){
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
     note: (row.note || '').trim(),
+    // issue #131-1：白名单必须随载荷回去 —— 少了它服务端只能按「没提交」
+    // 处理（会保留旧值），但显式清空就再也做不到了；带上才能区分两者。
+    // 没有该字段时 JSON 序列化会直接丢掉它 -> 服务端按「未提交」保留旧值；
+    // 只有真的加载过白名单的行才会显式提交（含空数组=清除限制）。
+    models: Array.isArray(row.models) ? row.models.slice() : undefined,
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
