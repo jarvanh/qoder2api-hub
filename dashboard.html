@@ -2574,12 +2574,29 @@ async function loadUpdateState(force, btn){
       state.innerHTML = '发现新版本 <b style="color:var(--accent)">' + esc(r.latest) + '</b>'
         + '（当前 ' + esc(r.current) + '）';
       state.style.color = 'var(--accent)';
+      // issue #132：按钮是否渲染以 /update/plan 的 can_apply 为准 ——
+      // 「环境变量禁用 / 容器内 / 非本机访问」三种情况后端必然 403，
+      // 此前仍给一个按了就报错的按钮。
+      let plan = null;
+      try{ plan = await getJSON('/update/plan'); }catch(e){ plan = null; }
+      const canApply = !!(plan && plan.can_apply);
+      const why = ((plan && plan.apply_blocked_reasons) || []).filter(Boolean);
       if(actions){
-        actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 10px;'
-          + 'margin-right:10px;background:var(--accent);color:#fff;border-color:var(--accent)" '
-          + 'onclick="applyUpdate(this)">一键更新</button>'
-          + (r.url ? ('<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
-          + 'style="color:var(--dim);text-decoration:underline">发布说明 →</a>') : '');
+        const releaseLink = r.url
+          ? ('<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
+             + 'style="color:var(--dim);text-decoration:underline">发布说明 →</a>')
+          : '';
+        if(canApply){
+          actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 10px;'
+            + 'margin-right:10px;background:var(--accent);color:#fff;border-color:var(--accent)" '
+            + 'onclick="applyUpdate(this)">一键更新</button>' + releaseLink;
+        } else {
+          // 必然失败的动作不给按钮：直接说清原因 + 给手动路径
+          actions.innerHTML = '<span style="font-size:11px;color:var(--warn)">'
+            + esc(why.length ? ('无法一键更新：' + why.join('；')) : '无法一键更新')
+            + '</span> <span style="font-size:11px;color:var(--dim)">'
+            + '（可手动：下载新 release 覆盖安装目录后重启进程）</span> ' + releaseLink;
+        }
       }
       setUpdateBadge(r);      // 顶部徽标提醒升级
     } else {
@@ -4297,7 +4314,12 @@ async function testAccount(uid, btn){
     if(r.ok){
       toast('测试通过 (' + r.elapsed_ms + 'ms) [' + r.model + ']: ' + (r.reply || '正常'), 'ok');
     } else {
-      toast('测试失败: ' + (r.error || r.status || '异常'), 'bad');
+      // issue #134：后端已给人话 hint（额度耗尽 / 上游排队 / 凭证过期…），
+      // 以前只显示上游原文，用户得自己从 JSON 里读码。这里 hint 优先。
+      const _head = r.hint ? (r.hint + '  ') : '';
+      const _tail = r.hint ? ('（' + (r.error || r.status || '异常') + '）')
+                           : (r.error || r.status || '异常');
+      toast('测试失败: ' + _head + _tail, 'bad');
     }
     await loadAccounts();
   }catch(e){

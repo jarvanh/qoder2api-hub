@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.25"
+VERSION = "1.7.26"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6229,6 +6229,40 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
+def _default_test_model(realm=None):
+    """账号「测试」的默认模型：优先**免费**模型（issue #134）。
+
+    面板测试的定位是「凭证 + 通道是否活着」。此前固定 auto，零额度账号必然
+    403（code 112），看起来像凭证坏了。免费模型的成本是 0，最适合探活；
+    找不到免费模型时退回 auto（保持旧行为，不猜）。
+    """
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    try:
+        models = [m for m in qoder_catalog.models_for_realm(r)
+                  if isinstance(m, dict) and m.get("enable") is not False]
+    except Exception:
+        models = []
+
+    def _name(m):
+        try:
+            return str(qoder_catalog.display_id(m) or m.get("key") or "")
+        except Exception:
+            return str(m.get("key") or "")
+
+    # 三层优先级：真正 0 价（price_factor == 0）> 标了 is_free > auto。
+    # 注意 is_free 的语义是「含免费权益」，不代表 0 价（Qwen3.8-Max 是 0.2x），
+    # 所以不能用它当第一档（issue #134 里报告者也提到要挑免费模型）。
+    for pick in (lambda m: m.get("price_factor") == 0,
+                 lambda m: bool(m.get("is_free"))):
+        for m in models:
+            try:
+                if pick(m) and _name(m):
+                    return _name(m)
+            except Exception:
+                continue
+    return "auto"
+
+
 def _quota_hint(detail):
     """上游 detail -> 人话解释（issue #123 后续）。只认已实测过的码。"""
     d = str(detail or "")
@@ -10516,10 +10550,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/update/plan":
             # 一键更新前的预检（issue: 一键更新）：能不能更新、当前/目标版本、
             # 是否容器、是否被禁用。不下载任何东西。
+            # issue #132：面板只凭 /update/check 的 has_update 就渲染按钮，
+            # 在「环境变量禁用 / 容器内 / 非本机访问」三种必然失败的情况下
+            # 仍然给出一个按了就报错的动作。这里把**权威可执行性**一并回显。
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
-            return self._json(200, update_plan_info())
+            _info = update_plan_info()
+            _client = (self.client_address or ["?"])[0]
+            _loopback = _is_loopback(_client)
+            _reasons = []
+            if _info.get("disabled"):
+                _reasons.append("已被环境变量禁用（QD_UPDATE_DISABLE=1）")
+            if _info.get("container"):
+                _reasons.append("运行在容器里：请改用镜像更新")
+            if not _loopback and not _update_allow_remote():
+                _reasons.append("仅允许在本机打开面板执行"
+                                "（或设置 QD_UPDATE_ALLOW_REMOTE=1）")
+            if not _info.get("has_update"):
+                _reasons.append("当前已是最新版本")
+            _info["client_is_loopback"] = bool(_loopback)
+            _info["can_apply"] = bool(_info.get("can_apply")) and not _reasons
+            _info["apply_blocked_reasons"] = _reasons
+            return self._json(200, _info)
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
             # 以官方风控桥 runtime-info 的 vmInfo 为准，桥不可用时本机交叉校验。
@@ -11748,7 +11801,10 @@ class Handler(BaseHTTPRequestHandler):
             account = POOL.get(uid)
             if not account:
                 return self._error(404, "no such account")
-            test_model = payload.get("model") or "auto"
+            # issue #134：默认用免费模型探活，零额度号也能测出凭证好坏；
+            # 显式传 model 时仍以调用方为准。
+            test_model = (payload.get("model")
+                          or _default_test_model(acc_realm(account)))
             test_payload = {
                 "model": test_model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -11789,8 +11845,13 @@ class Handler(BaseHTTPRequestHandler):
                 wall_ms = int((time.time() - t0) * 1000)
                 _detail = str(getattr(exc, "detail", "") or "")[:400]
                 _hint = _quota_hint(_detail)
-                account.note_error("HTTP %s: %s" % (exc.status, _detail[:80]),
-                                   cooldown=60)
+                # issue #134：额度耗尽的号本来就不能服务请求，**测试**再去给它
+                # 叠一分钟冷却纯属副作用（连点两次测试就把它压住了）。
+                # 只有真正的凭证/服务端故障才记冷却。
+                if "112" not in _detail and "110" not in _detail \
+                        and "10605" not in _detail and "isQueued" not in _detail:
+                    account.note_error(
+                        "HTTP %s: %s" % (exc.status, _detail[:80]), cooldown=60)
                 log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
                     % (account.uid[:8], test_model, wall_ms, exc.status,
                        _hint or _detail[:120]), level="WARN", tag="accounts")
