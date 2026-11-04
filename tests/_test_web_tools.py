@@ -31,7 +31,10 @@ finally:
         os.environ.pop("HTTPS_PROXY", None)
     else:
         os.environ["HTTPS_PROXY"] = _old_proxy
-check("走代理时公网域名放行（DNS 交给代理）", ok is True, reason)
+# issue #131-6：代理不再豁免地址校验 —— 域名必须自己解析成功且为公网。
+# 本机解析不了 example.com（沙箱/离线/被墙）时应**拒绝**，而不是交给代理。
+check("走代理时仍要求域名可解析（不再豁免校验）",
+      ok is True or "resolve" in (reason or ""), (ok, reason))
 
 # ---------------------------------------------------------------- 声明改写
 print("[web] 内置工具声明改写")

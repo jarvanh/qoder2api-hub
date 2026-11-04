@@ -235,3 +235,19 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 代价：每代跑一轮都会多消耗一次账号额度；默认关闭。
 
+## 工具协议残片的收尾策略（`QD_TOOL_ECHO_MODE`）
+
+有些模型（实测 `Qwen3.8-Flash`）会把工具调用**当成正文**吐出来（DSML 标签 / `[assistant 请求调用工具]` 标记 + 半截参数），随后流结束。网关识别到这类残片时默认 **fail-closed**：不再把残片当正文补发，流式响应以 `response.failed`（Responses）或错误帧收尾。
+
+问题在于：部分客户端（Codex）收到 failed 后会**静默结束对话**，用户看到的是「话说到一半突然没了、没有任何提示」。如果你遇到这种中断、且日志里有 `unrecovered_dsml` / `marker_only` / `truncated_arguments` 这类字样，可以切到 lenient：
+
+```
+QD_TOOL_ECHO_MODE=lenient
+```
+
+| 取值 | 行为 |
+|---|---|
+| `strict`（默认） | 以失败收尾（`response.failed`），客户端应看到错误并重试 |
+| `lenient` | **按正常完成收尾**并保留已产出的正文，本轮算完成、可直接继续；日志仍打 WARN、`最近请求` 里有一行 `lenient_tool_echo` 记录 |
+
+lenient 是**折中**：它把「整轮丢失」换成「这一轮没有工具调用、下一轮模型会重新发起」，代价是客户端不知道残片被丢弃了。上游修好输出形态后建议切回 strict。

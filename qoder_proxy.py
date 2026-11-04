@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.26"
+VERSION = "1.7.27"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -495,6 +495,11 @@ def _extract_usage(usage):
         "cached_tokens": usage.get("cached_tokens")
         or usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
+        # issue #129 后续：区分「真的没命中」与「上游没回报缓存字段」；
+        # 后者在面板显示成 `?`，且不计入「全价请求」。
+        "cached_reported": bool(
+            "cached_tokens" in usage or "prompt_cache_hit_tokens" in usage
+            or "cached_tokens" in details or "cached_tokens" in prompt_details),
         "total_tokens": usage.get("total_tokens") or 0,
         # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
         # 恒为 None -> 所有 usage 记录成 0（历史数据无法回填，原始值未落盘）。
@@ -534,6 +539,41 @@ def row_matches_realm(row, realm):
     if model:
         return detect_model_realm(model) == realm
     return realm == "cn"
+
+
+# issue #129 后续：积分三段折算系数（每千 token 的积分）。默认值来自报告者的实测
+# 拟合（244 条 DeepSeek-Flash 实扣 + 110 条 Qwen3.8-Flash 名义，残差 <1%）；
+# 可用 QD_CREDIT_COEF="非缓存,缓存,输出" 覆盖成自己算出来的系数。
+_CREDIT_COEF_DEFAULT = (1.069, 0.086, 4.277)
+
+
+def credit_coefficients():
+    """(非缓存输入, 缓存输入, 输出) 每千 token 积分系数。"""
+    raw = str(os.environ.get("QD_CREDIT_COEF") or "").strip()
+    if raw:
+        try:
+            parts = [float(x) for x in raw.replace(",", " ").split()]
+            if len(parts) == 3 and all(x >= 0 for x in parts):
+                return tuple(parts)
+        except Exception:
+            pass
+    return _CREDIT_COEF_DEFAULT
+
+
+def split_credit(prompt_tokens, cached_tokens, completion_tokens):
+    """按三段折算积分：非缓存输入 / 缓存输入 / 输出（issue #129 后续）。"""
+    a, b, c = credit_coefficients()
+    try:
+        p = max(0, int(prompt_tokens or 0))
+        cached = max(0, int(cached_tokens or 0))
+        out = max(0, int(completion_tokens or 0))
+    except (TypeError, ValueError):
+        return {"input": 0.0, "cached": 0.0, "output": 0.0}
+    cached = min(cached, p)
+    fresh = max(0, p - cached)
+    return {"input": round(fresh * a / 1000.0, 4),
+            "cached": round(cached * b / 1000.0, 4),
+            "output": round(out * c / 1000.0, 4)}
 
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
@@ -1149,6 +1189,18 @@ def recent_usage(limit=100, realm=None, page=1):
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     page_rows = matching[start_idx:end_idx]
+    # issue #129 后续：每行带上「积分三段折算」（非缓存输入 / 缓存输入 / 输出），
+    # 让面板单行就能看出成本落在哪一段；'billable=false' 的行是名义成本，
+    # 前端会换样式标注，避免被当成真实扣费。
+    for _row in page_rows:
+        if not isinstance(_row, dict) or _row.get("error"):
+            continue
+        try:
+            _row["credit_split"] = split_credit(_row.get("prompt_tokens"),
+                                                _row.get("cached_tokens"),
+                                                _row.get("completion_tokens"))
+        except Exception:
+            pass
     return {
         "total": total,
         "page": page,
@@ -1885,6 +1937,10 @@ def _day_key(ts):
         return ""
 
 
+# issue #129 后续：多少 prompt token 以上、且缓存为 0，算「全价请求」
+FULL_PRICE_PROMPT_MIN = int(os.environ.get("QD_FULL_PRICE_PROMPT_MIN") or 100000)
+
+
 def compute_usage_stats(range=None, since=None, until=None,
                         heatmap_days=365, top_n=5):
     """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
@@ -1899,6 +1955,11 @@ def compute_usage_stats(range=None, since=None, until=None,
 
     tot = {"requests": 0, "errors": 0, "tokens": 0,
            "prompt": 0, "completion": 0, "cached": 0}
+    # issue #129 后续：报告者按小时拟合出的最大成本项是「缓存为 0 的超长 prompt」
+    # （一天里 9 次这类请求就占了 30% 积分）。这里把这类请求单独计数并统计积分占比，
+    # 让用户能直接看到「换前缀 / 新开会话」的代价。
+    full_price = {"requests": 0, "prompt": 0, "credit": 0.0}
+    total_credit = 0.0
     models = {}       # model -> {"tokens","requests"}
     accounts = {}     # account -> {"tokens","requests"}
     providers = {}    # provider -> {"tokens","requests"}
@@ -1968,6 +2029,21 @@ def compute_usage_stats(range=None, since=None, until=None,
                     tot["prompt"] += prompt
                     tot["completion"] += int(r.get("completion_tokens") or 0)
                     tot["cached"] += cached
+                    _credit = r.get("credit") or 0
+                    try:
+                        _credit = float(_credit)
+                    except (TypeError, ValueError):
+                        _credit = 0.0
+                    total_credit += _credit
+                    # 缓存字段**缺失**的行（老模型不回报）不算「全价」——按全价估会偏高。
+                    _cached_known = r.get("cached_reported")
+                    if _cached_known is None:
+                        _cached_known = True     # 历史行没有该字段：按旧口径计入
+                    if (prompt >= FULL_PRICE_PROMPT_MIN and cached <= 0
+                            and _cached_known):
+                        full_price["requests"] += 1
+                        full_price["prompt"] += prompt
+                        full_price["credit"] += _credit
                     m = r.get("model") or "(unknown)"
                     _bump(models, m, tokens)
                     _bump(accounts, r.get("account") or "(unattributed)", tokens)
@@ -2058,6 +2134,14 @@ def compute_usage_stats(range=None, since=None, until=None,
         "models": _rank(models, 10),
         "providers": _rank(providers, 10),
         "cache": {"windows": cache_rows},
+        "full_price": {
+            "requests": full_price["requests"],
+            "prompt": full_price["prompt"],
+            "credit": round(full_price["credit"], 2),
+            "credit_share": (round(full_price["credit"] * 100.0 / total_credit, 1)
+                             if total_credit > 0 else None),
+            "threshold": FULL_PRICE_PROMPT_MIN,
+        },
         "hourly": {"points": hours},
         "heatmap": {"days": heat_days,
                      "max": max([d["tokens"] for d in heat_days] or [0])},
@@ -4295,6 +4379,17 @@ def _echo_names_all_undeclared(text, allowed_names):
     if not names:
         return False
     return all(n not in allowed_names for n in names)
+
+
+# issue #135：工具协议回声的收尾策略。
+#   strict  （默认）= fail-closed：流式响应以 response.failed / error 帧收尾，
+#                     让客户端知道这一轮没有完成（correctness 优先）。
+#   lenient        = 遇到 InvalidToolArguments 时**按正常结束收尾**（保留已产生的
+#                     正文），用于上游爱吐协议残片的模型（实测 Qwen3.8-Flash），
+#                     避免 Codex 这类客户端在收到 failed 后直接静默结束对话。
+TOOL_ECHO_MODE = (os.environ.get("QD_TOOL_ECHO_MODE") or "strict").strip().lower()
+if TOOL_ECHO_MODE not in ("strict", "lenient"):
+    TOOL_ECHO_MODE = "strict"
 
 
 class InvalidToolArguments(UpstreamStatus):
@@ -9993,6 +10088,25 @@ def stream_responses_events(inner_lines, model, holder):
     yield ev("response.completed", {"response": final})
 
 
+def _responses_completed_quiet(holder, model=""):
+    """issue #135：lenient 模式下用「正常完成」收尾（保留已产出的正文）。"""
+    holder = holder or {}
+    text = holder.get("text") or holder.get("content") or ""
+    return ("event: response.completed\ndata: " + json.dumps({
+        "type": "response.completed",
+        "response": {
+            "id": holder.get("id") or "resp_lenient",
+            "object": "response",
+            "status": "completed",
+            "model": model or "",
+            "output": ([{"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": text}]}]
+                        if text else []),
+            "usage": _responses_usage(holder.get("usage")) or {},
+        },
+    }, ensure_ascii=False) + "\n\n")
+
+
 def _responses_failed_frame(holder, code, message):
     """Responses 流的终态失败事件（response.failed）。
 
@@ -12602,6 +12716,29 @@ class Handler(BaseHTTPRequestHandler):
                             cur.close()
                         except Exception:
                             pass
+                if pump_exc is not None and isinstance(
+                        pump_exc, InvalidToolArguments) \
+                        and TOOL_ECHO_MODE == "lenient":
+                    # issue #135：上游只吐了工具协议残片（Qwen3.8-Flash 实测高频）。
+                    # strict（默认）会让这一轮流以 response.failed 结束，某些客户端
+                    # （Codex）收到后直接静默结束对话 —— 用户看到的就是「话说到一半
+                    # 突然没了，而且没有任何提示」。lenient 下改为正常收尾：保留已产生
+                    # 的正文，本轮算完成，用户可以直接继续。
+                    log("lenient tool-echo: converting fail-closed to normal "
+                        "completion (%s) - issue #135" % str(pump_exc)[:160],
+                        level="WARN", tag="chat")
+                    record_error(model, 200, "lenient_tool_echo: %s"
+                                 % str(pump_exc)[:160],
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
+                    try:
+                        self._sse_write(_responses_completed_quiet(holder, model))
+                    except Exception:
+                        pass
+                    self._sse_end()
+                    return
                 if pump_exc is not None:
                     # issue #100：pump 出来的可能是 RateLimited（排队耗尽），
                     # 它没有 .status —— 统一经 _exc_http_status 取，别再裸读。

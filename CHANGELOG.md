@@ -11,6 +11,14 @@
 
 ## v1.7.25
 
+## v1.7.27（fork 维护版）
+
+fork 维护版：合并上游 v1.7.21–v1.7.22（#129 后续 全价请求统计 + 积分三段拆分列 + #135 QD_TOOL_ECHO_MODE 工具回声兜底）。
+
+- **上游要点**：v1.7.22 = 积分三段拆分列（非缓存输入+缓存输入+输出，billable=false 名义渲染、cached_reported 标记）+ QD_TOOL_ECHO_MODE 兜底模式（strict 默认 fail-closed / lenient 工具残片正常收尾，救 Codex「说到一半自己结束」）；v1.7.21 = 全价请求可视化（`/usage/stats` full_price 卡：prompt≥QD_FULL_PRICE_PROMPT_MIN 且零缓存）+ 两处测试维护。
+- **冲突处理**：VERSION 进位 1.7.27。
+- **fork 保留**：QD_QUEUE_FAST_MODELS 按模型排队、坏工具回声重发、池级配额 402 语义、QD_ERROR_COOLDOWN_WAIT_MAX 短频控预算、110 日界停放语义、结构化工具历史 auto 白名单、签到奖励持久化。
+
 ## v1.7.26（fork 维护版）
 
 fork 维护版：合并上游 v1.7.20（#132 更新按钮 can_apply 门控 / #133 行为级回归套件 / #134 账号探活）。
@@ -20,7 +28,51 @@ fork 维护版：合并上游 v1.7.20（#132 更新按钮 can_apply 门控 / #13
 - **fork 保留**：QD_QUEUE_FAST_MODELS 按模型排队、坏工具回声重发、池级配额 402 语义、QD_ERROR_COOLDOWN_WAIT_MAX 短频控预算、110 日界停放语义、结构化工具历史 auto 白名单、签到奖励持久化。
 - **验证**：全量 `python tests/run_all.py` → **111 suites / 2945 checks / 0 failed**。
 
-## 上游 v1.7.20（2026-11-03 并入，上游原题 v1.7.20）
+## 上游 v1.7.22（并入 fork v1.7.27）
+
+**✨ 新增：积分三段拆分（#129 后续）**
+
+「最近请求」新增 **积分拆分** 列：单行按 token 折算成 **非缓存输入 + 缓存输入 + 输出** 三段，一眼看出成本落在哪段。
+
+- 系数来自报告者的实测拟合（244 条 DeepSeek-Flash 实扣 + 110 条 Qwen3.8-Flash 名义，残差 <1%）：`1.069 / 0.086 / 4.277`（每千 token 积分）；可用 `QD_CREDIT_COEF="非缓存,缓存,输出"` 覆盖。
+- `billable=false` 的行按**名义成本**渲染（斜体 + 「名义」标注），不会被当成真实扣费。
+- **缓存字段缺失**的行（老模型不回报 `prompt_cache_hit_tokens`）缓存段显示 `?`，并与「真的零命中」区分：新增 `cached_reported` 标记写进 usage 行，「全价请求」卡也只统计**确认零缓存**的行。
+- 表格下方的合计行同样按三段汇总（输入 X + 缓存 Y + 输出 Z）。
+- `/usage/recent` 每行附带 `credit_split`，外部脚本可直接用。
+
+**🐛 Codex 对话「说到一半自己结束」（#135）**
+
+上游（实测 Qwen3.8-Flash）会把工具调用当正文吐出（DSML/标记 + 半截参数），网关默认 fail-closed（#120 的语义）以 `response.failed` 收尾——部分客户端（Codex）收到后**静默结束对话，没有任何提示**，用户看到的就是「最后停在冒号上」。
+
+新增 `QD_TOOL_ECHO_MODE`：
+
+| 取值 | 行为 |
+|---|---|
+| `strict`（默认） | 保持 #120 的 fail-closed：以 `response.failed` 收尾 |
+| `lenient` | 这类残片改为**正常完成**收尾，保留已产出的正文；日志打 WARN，`最近请求` 留一行 `lenient_tool_echo` 记录 |
+
+即「整轮丢失」→「这一轮没有工具调用、下一轮模型重新发起」，可直接继续对话。文档写明了取舍（客户端不知道残片被丢弃，上游修好后应切回 strict）。
+
+**验证**：新增 `tests/_test_issue129c_credit_split.py`（20 条：系数/覆盖/三行现场数据复算/钳制/缺失字段/全价卡口径/面板列与合计）、`tests/_test_issue135_tool_echo_mode.py`（16 条：模式开关/判据/日志与记录/completed 帧形状/默认仍 strict）；全量 **110 suites / 2873 checks / 0 failed**。
+
+## 上游 v1.7.21（并入 fork v1.7.27）
+
+**✨ 新增：全价请求可视化（#129 后续）**
+
+报告者按小时拟合出一套系数并发现：**缓存为 0 的超长 prompt 是最容易被忽略的成本项**（某天 9 次这类请求就占了当日 30% 积分）。这类请求出现在「换前缀 / 新开会话 / 压缩历史后首轮」时，用户从单行日志里看不出来。
+
+- 后端 `/usage/stats` 新增 `full_price`：`{requests, prompt, credit, credit_share, threshold}`；
+  判据 = `prompt_tokens >= QD_FULL_PRICE_PROMPT_MIN`（默认 100000，可配）**且** `cached_tokens == 0`；占比按窗口内总积分算。
+- 面板「用量洞察」新增 **全价请求** 卡片：次数 + 积分 + 占窗口积分比例；没有这类请求时给正面文案（「前缀复用良好」），并写清降成本做法（保持前缀稳定、走压缩而不是重开）。
+
+**🧹 测试维护**
+
+- `_test_issue111_account_sort.js`：表头切片结束锚点收紧到「账号表 legend」——页面里新增的其它 `<div class="legend">` 会让裸锚点切出空串。
+- `_test_web_tools.py`：按 #131-6 的新语义更新断言（代理不再豁免地址校验，解析不了就拒绝）。
+
+**验证**：新增 `tests/_test_issue129b_full_price.py`（15 条：阈值/判据/占比/边界 + 面板卡片与文案，含真跑一遍统计的计数与占比校验）；全量 **108 suites / 2837 checks / 0 failed**。
+
+## v1.7.20
 
 **🐛 问题修复**
 
