@@ -9,7 +9,13 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
-## v1.7.25
+## v1.7.28（fork 维护版）
+
+fork 维护版：合并上游 v1.7.23–v1.7.25（#136 缓存会话键 / #137+#138 错误归类 / #139 排队诊断 / #140 伪 XML 工具调用回读）。
+
+- **上游要点**：v1.7.25 = `<tool_call>` 伪 XML 回读覆盖 chat/Responses/Anthropic 五条出口 + 结构化工具历史文档；v1.7.24 = 排队/额度错误不再被客户端判成 API Key 无效（统一 429，上游信封 401/403 改写为 HTTP_401/HTTP_403）+ `POST /diag/queue` 排队诊断 + 面板切换工具残片收尾；v1.7.23 = prompt 缓存 98%↔0% 抖动（session_id 改回整段对话，用量归组仍按提问；窗口键/亲和键不吃 system）。
+- **冲突处理**：`VERSION` 进位 1.7.28；`_error` 同时保留 fork 的 `fallback_hint`（OmniRoute 503 提示）与上游的 `_client_error_status`。
+- **fork 保留**：QD_QUEUE_FAST_MODELS 按模型排队、坏工具回声重发、池级配额 402 语义、QD_ERROR_COOLDOWN_WAIT_MAX 短频控预算、110 日界停放语义、结构化工具历史 auto 白名单、签到奖励持久化。
 
 ## v1.7.27（fork 维护版）
 
@@ -54,6 +60,66 @@ fork 维护版：合并上游 v1.7.20（#132 更新按钮 can_apply 门控 / #13
 即「整轮丢失」→「这一轮没有工具调用、下一轮模型重新发起」，可直接继续对话。文档写明了取舍（客户端不知道残片被丢弃，上游修好后应切回 strict）。
 
 **验证**：新增 `tests/_test_issue129c_credit_split.py`（20 条：系数/覆盖/三行现场数据复算/钳制/缺失字段/全价卡口径/面板列与合计）、`tests/_test_issue135_tool_echo_mode.py`（16 条：模式开关/判据/日志与记录/completed 帧形状/默认仍 strict）；全量 **110 suites / 2873 checks / 0 failed**。
+
+## 上游 v1.7.25（并入 fork v1.7.28）
+
+**🐛 修复：伪 XML 工具调用 `<tool_call>` 无法回读 → 整轮 502（#140，采纳报告者的 patch）**
+
+上游会把工具调用写成 `<tool_call> Bash {"command":"ls"} </tool_call>`（Qwen 系常见）。这个形态**不在任何既有解析器覆盖范围内**（marker+JSON 数组 / DSML 都不认），而 `_leak_residue_present()` 又因为 `<tool_call` 命中判成「协议残片」→ 直接 fail-closed → 客户端整轮静默中断。
+
+- 新增 `parse_tool_call_tags(text, allowed_names)`：支持 4 种形态 —— `Name {json}`、`{"name":…,"arguments":…}`、`Name({...})`、`<tool_call name="X">` 属性式；参数侧依次尝试严格 JSON → 去尾随逗号 → 转义内层裸引号（模型常写 `"command":"echo "hi" && ls"`）；
+- 流式 hold 判定补标签分支：此前 `_json_array_prefix_ok()` 只认 `[` 开头，`<tool_call` 一进来就被判成「候选被证伪」；
+- 五条出口全覆盖：chat 流式 / chat 非流式 / Responses 流式 / Responses 非流式 / Anthropic；
+- 防误伤守卫：未声明 tools 的会话不转换、解析出的名字必须全部命中声明集合、无 marker 时必须是「整段一个块」、未闭合代码围栏内视为文档示例、参数非法 JSON 不伪造调用。
+
+**📝 新增配置说明：结构化工具历史**
+
+`QD_STRUCTURED_TOOL_HISTORY` / `QD_STRUCTURED_TOOL_HISTORY_REALMS` 写进文档：文本化历史里那段 `[assistant 请求调用工具]` 脚手架会被模型复述（`marker_only` 502 的来源），想根治就把 INTL 也纳入结构化——**启动脚本里的示例保持注释状态**，默认值不变（网关仍只在 CN 用结构化）。
+
+**验证**：报告者提供的 3 个套件（`_test_issue137_tool_call_tags.py` 63 / `_test_issue138_502_forms.py` 49 / `_test_issue137_e2e.py` 22）全部绿；全量 **117 suites / 3099 checks / 0 failed**。
+
+## 上游 v1.7.24（并入 fork v1.7.28）
+
+**🐛 修复：排队 / 额度错误被客户端判成「API Key 无效」（#137，合并 PR #138）**
+
+上游排队（10605）、额度耗尽（112）、每日次数上限（110）都不是凭证问题，但错误文字里带着上游信封的 `{"code":"403"}`，按文字归类的客户端（DSH 的 pi-ai 适配层第一条规则就是 `\b(?:401|403)\b` → AUTH）会显示「API 密钥无效」，用户于是去换 Key，方向完全错了。
+
+- 这三类错误的**上游详情**里独立的 `401`/`403` 改写为 `HTTP_401`/`HTTP_403`（`v1.4030`、端口 `14031` 这类长数字不动）；
+- 文末附客户端分类器认得的英文原因：排队 `rate limit`、112 `quota exhausted`、110 `usage limit reached`；
+- 这三类对客户端**不再用 401/403**，统一改 429（与 OpenAI `insufficient_quota` 一致）：`_error` / 流内错误帧 / Responses 失败帧 / `_rate_limited` 全部同步；
+- 110 补上专门分支（此前落到兜底 `upstream 403`）。
+
+**🔍 新增：排队诊断（`POST /diag/queue`，面板鉴权，#139）**
+
+一次最小探测，回显 `kind`（ok/queued/exhausted/daily）、业务码、`retry_after`、`queue_count`、`identity_source`（native/derived）与一句话建议 —— 用来区分「上游模型排队」与「账号/身份被针对」。排队时明确提示「与 Key/账号凭证无关」并给出 `QD_QUEUE_WAIT_MODE=fast` 这个「立即返回 429、不等待」的开关。
+
+**✨ 面板可切换「工具协议残片收尾」（#135 后续）**
+
+上一版只能用环境变量 `QD_TOOL_ECHO_MODE`。现在「设置 → 工具协议残片收尾」有下拉框（strict / lenient），**改完立即生效**，无需重启；环境变量仍然优先（面板会标注「由环境变量固定为 …」）。后端新增 `POST /settings/tool-echo-mode`。
+
+**验证**：合并 PR 自带 `_test_issue137_error_class.py`(43)；新增 `_test_issue139_queue_diag.py`(14)、`_test_issue135b_echo_toggle.py`(19)；`/diag/queue` 走真实服务 e2e（200 + 401 两条路径）；全量 **114 suites / 2965 checks / 0 failed**。
+
+## 上游 v1.7.23（并入 fork v1.7.28）
+
+**🐛 修复：prompt 缓存 98% ↔ 0% 来回跳（#136，v1.7.17 引入的回归）**
+
+面板上缓存命中率在两个极值之间循环，同时**积分消耗明显变快** —— 因为 0% 那几行按全价（非缓存输入系数 1.069/千 token）计费。
+
+**根因**：v1.7.17 为满足「用量按一次提问归组」，把会话 id 改成**按提问**生成（最后一条 user 消息参与摘要），而 `session_id`（上游 prompt 缓存的键）用的是同一个 id —— 于是每次新提问 `session_id` 变化，上游缓存从 0 开始；同一提问内的工具步进 `session_id` 不变，缓存又命中。面板上就是 98% ↔ 0% 循环。
+
+**改法**：把两件事彻底解耦。
+
+| 字段 | 口径 | 用途 |
+|---|---|---|
+| `business.id` / `chat_record_id` | **一次提问**（最后一条 user 消息） | 用量面板归组（#128 的要求不变） |
+| `session_id`（上游缓存键） | **整段对话**（模型 + 首条 user 消息） | prompt 缓存命中 |
+
+顺带修掉第二层原因：**窗口键与账号亲和键都只用「首条 user 消息 + 模型」**，不再把 system 算进去 —— 很多客户端会在 system 里塞每轮都会变的运行时上下文（cwd / git 状态 / 时间），一旦算进键，长会话的键逐轮变化，账号被轮换、缓存整段丢失。
+
+**为什么这会推高积分**：`split_credit()` 里缓存段系数只有非缓存段的 8%，同一段历史命中与不命中差 12 倍；一次 20 万 token 的请求，命中时约 13 积分、不命中约 214 积分。面板「积分拆分」列可直接验证：修好后同一对话后续轮次的**缓存段应持续占大头**。
+
+**验证**：新增 `tests/_test_issue136_cache_session.py`（15 条：窗口 id 稳定 / 提问 id 变化 / system 变化不影响窗口键与亲和键 / 出站 session_id == window_id 且跨轮不变 / business.id 逐轮变化 / 三段拆分对比）；全量 **111 suites / 2889 checks / 0 failed**。
+
 
 ## 上游 v1.7.21（并入 fork v1.7.27）
 

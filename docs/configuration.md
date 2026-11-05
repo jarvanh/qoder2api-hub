@@ -235,6 +235,28 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 代价：每代跑一轮都会多消耗一次账号额度；默认关闭。
 
+### 结构化工具历史（`QD_STRUCTURED_TOOL_HISTORY` / `_REALMS`）
+
+网关把 assistant 的 tool_calls 写回历史有两种形态：
+
+- **结构化**：`tool_calls` 字段直传（上游原生支持时最干净）；
+- **文本化**：改写成 `[assistant 请求调用工具]` + JSON 数组塞进 `content` 里。
+
+文本化是兼容性兜底，但长会话里模型会**照抄这段脚手架**，回读链认不出来就只能 fail-closed（`502 … marker_only` / `unrecovered_falsified`）。
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `QD_STRUCTURED_TOOL_HISTORY` | `auto`（默认）/ `on` / `off` | `auto` = 仅 CN 用结构化 |
+| `QD_STRUCTURED_TOOL_HISTORY_REALMS` | 例如 `cn,intl` | 覆盖 `auto` 生效的区域集合 |
+
+INTL 默认仍走文本化（当年超时未取到验证结果）。如果你的 intl 账号在长会话里反复出现上面那两类 502，可以显式打开：
+
+```bash
+export QD_STRUCTURED_TOOL_HISTORY_REALMS="cn,intl"
+```
+
+启动脚本里那一行是**注释状态**的示例 —— 是否打开由你决定，网关不替你改默认值。
+
 ## 工具协议残片的收尾策略（`QD_TOOL_ECHO_MODE`）
 
 有些模型（实测 `Qwen3.8-Flash`）会把工具调用**当成正文**吐出来（DSML 标签 / `[assistant 请求调用工具]` 标记 + 半截参数），随后流结束。网关识别到这类残片时默认 **fail-closed**：不再把残片当正文补发，流式响应以 `response.failed`（Responses）或错误帧收尾。

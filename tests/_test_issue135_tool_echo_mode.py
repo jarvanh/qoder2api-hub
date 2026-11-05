@@ -24,7 +24,8 @@ print("[#135] lenient 只作用于「协议残片」这一类错误")
 _i = _src.index('if pump_exc is not None and isinstance(')
 _seg = _src[_i:_i + 1600]
 check("判据是 InvalidToolArguments", "InvalidToolArguments" in _seg.split("TOOL_ECHO_MODE")[0])
-check("且必须 lenient 才生效", 'TOOL_ECHO_MODE == "lenient"' in _seg)
+check("且必须 lenient 才生效",
+      'tool_echo_mode() == "lenient"' in _seg)
 check("会打 WARN（面板/日志可诊断）",
       "lenient tool-echo: converting fail-closed" in _seg)
 check("会写一条 error 行（带 lenient_tool_echo 标记）",
@@ -54,7 +55,7 @@ _empty = json.loads(_etxt.split("data: ", 1)[1])
 print("[#135] strict 仍是默认路径（回归保护）")
 check("failed 帧仍在（strict 用）", "_responses_failed_frame(" in _src)
 check("strict 下不写 lenient 分支日志的条件是 mode 判断在前",
-      _seg.index('TOOL_ECHO_MODE == "lenient"') < _seg.index("lenient tool-echo"))
+      _seg.index('tool_echo_mode() == "lenient"') < _seg.index("lenient tool-echo"))
 
 print("[#135] 文档")
 _doc = io.open(os.path.join(ROOT, "docs", "configuration.md"),

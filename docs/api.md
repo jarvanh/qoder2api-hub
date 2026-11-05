@@ -22,6 +22,30 @@
 - 指定区域：`X-Realm: cn|intl` 请求头，或 `?realm=` 查询参数
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
 
+## 排队诊断（`POST /diag/queue`，面板鉴权）
+
+上游对**模型**做并发排队（`10605` / `isQueued`）时，网关会按 `retryAfterSeconds` 等待重试，预算耗尽后返回 429 + `Retry-After`。这类错误与 Key/账号凭证无关，但客户端常常归类成「鉴权失败」（#137 之后文案已去敏并附英文原因）。
+
+想确认某个模型此刻是不是在排队：
+
+```bash
+curl -s -X POST http://127.0.0.1:8790/diag/queue \\
+  -H 'Content-Type: application/json' -H "X-Panel-Token: $TOKEN" \\
+  -d '{"model":"Qwen3.8-Flash","realm":"cn"}'
+```
+
+返回：
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | `ok` / `queued` / `exhausted` / `daily` / `error` |
+| `code` | 上游 HTTP 状态（排队是 403 信封 + 10605 业务码） |
+| `retry_after` / `queue_count` | 上游给的等待秒数与队列长度（有就回显） |
+| `identity_source` | `native`（官方风控桥）或 `derived`（派生身份）——判断「是否被当成陌生设备」 |
+| `advice` | 一句话结论 + 可执行建议 |
+
+`kind=queued` 时建议换模型/换区域，或设 `QD_QUEUE_WAIT_MODE=fast`（立即返回 429，不等待）。
+
 ## 输出上限（max_tokens）
 
 官方模型清单里没有 `maxOutputTokens`，但上游对超限请求会回 `400 invalid_parameter_error: Range of max_tokens should be [1, 131072]`。网关把这行错误当成**学习信号**：

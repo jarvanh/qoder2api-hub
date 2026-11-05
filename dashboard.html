@@ -2052,6 +2052,26 @@ window.initLangSystem();
       </div>
     </section>
 
+
+    <section id="sectionToolEcho">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">工具协议残片收尾 <em id="setToolEchoState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
+            有些模型（如 <code>Qwen3.8-Flash</code>）会把工具调用当正文吐出来（DSML 标记 + 半截参数）。
+            <b>strict</b>（默认）以 <code>response.failed</code> 收尾，客户端应看到错误并重试；
+            <b>lenient</b> 改为正常完成并保留已产出的正文 —— 用于「客户端收到 failed 后静默结束对话」的场景（Codex 实测）。
+            <br>lenient 是折中：那一轮没有工具调用，但对话不会断。上游修好后建议切回 strict。
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;white-space:nowrap">
+          <select id="setToolEcho" onchange="saveToolEchoMode(this.value)" style="font-size:12px;padding:4px 8px">
+            <option value="strict">strict（默认）</option>
+            <option value="lenient">lenient（容错）</option>
+          </select>
+        </label>
+      </div>
+    </section>
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -5226,6 +5246,13 @@ async function loadSettings(showToast){
     window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
     const wtBox = document.getElementById('setWebTools');
     if(wtBox) wtBox.checked = data.web_tools === true;
+    // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
+    const teBox = document.getElementById("setToolEcho");
+    const teState = document.getElementById("setToolEchoState");
+    if(teBox) teBox.value = data.tool_echo_mode || "strict";
+    if(teState) teState.textContent = data.tool_echo_mode_env
+      ? ("（由环境变量固定为 " + data.tool_echo_mode_env + "）")
+      : ("（" + (data.tool_echo_mode || "strict") + "）");
     const wtState = document.getElementById('setWebToolsState');
     if(wtState) wtState.textContent = data.web_tools ? '(已开启)' : '(已关闭)';
     const pwdState = document.getElementById('setPwdState');
@@ -5273,6 +5300,14 @@ async function loadSettings(showToast){
 
 
 // 本地 web 工具开关（唯一由模型驱动出网的能力，默认关闭）
+async function saveToolEchoMode(mode){
+  try{
+    const r = await postJSON("/settings/tool-echo-mode", {mode: mode});
+    toast("已切换为 " + (r.effective || mode) + "（立即生效）", "ok");
+    const st = document.getElementById("setToolEchoState");
+    if(st) st.textContent = "(" + (r.effective || mode) + ")";
+  }catch(e){ toast("保存失败: " + e.message, "bad"); }
+}
 async function saveWebTools(el){
   const on = !!(el && el.checked);
   el.disabled = true;

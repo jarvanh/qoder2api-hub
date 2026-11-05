@@ -187,7 +187,7 @@ try:
     check("非流式 aggregate 调用方补齐 except RateLimited（防掉 502）",
           _src16.count("except RateLimited as exc:") >= 8,
           _src16.count("except RateLimited as exc:"))
-    check("版本号递增 1.7.27", 'VERSION = "1.7.27"' in _src16)
+    check("版本号递增 1.7.28", 'VERSION = "1.7.28"' in _src16)
 finally:
     _restore()
 

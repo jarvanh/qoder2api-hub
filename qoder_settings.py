@@ -200,6 +200,23 @@ def set_model_context(accounts_dir, model, label):
     save(accounts_dir, data)
     return cur
 
+def tool_echo_mode(accounts_dir):
+    """面板可切换的「工具协议残片收尾策略」（issue #135）；默认空=跟随环境/内置。"""
+    val = str(load(accounts_dir).get("tool_echo_mode") or "").strip().lower()
+    return val if val in ("strict", "lenient") else ""
+
+
+def set_tool_echo_mode(accounts_dir, mode):
+    """写入收尾策略；传空串表示清除（回落到环境变量/内置默认）。"""
+    data = load(accounts_dir)
+    val = str(mode or "").strip().lower()
+    if val in ("strict", "lenient"):
+        data["tool_echo_mode"] = val
+    else:
+        data.pop("tool_echo_mode", None)
+    save(accounts_dir, data)
+    return tool_echo_mode(accounts_dir)
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):

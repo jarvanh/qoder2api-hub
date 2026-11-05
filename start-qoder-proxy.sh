@@ -106,4 +106,19 @@ echo
 # launcher can never leave an orphan holding the port.
 # issue #89: write the pid file here too, so stop-qoder-proxy.sh can find us
 PIDFILE="$HERE/qoder-proxy.pid"
+
+# issue #137 后续：INTL 出口也启用「结构化工具历史」。
+#
+# 不启用时，网关会把每次工具调用改写成一段文本塞进 assistant 历史
+# （`[assistant 请求调用工具]` + JSON 数组）。模型在长会话里会照抄这段
+# 脚手架，于是整轮被判成「无法还原的协议回声」而 502（issue #72）。
+# 启用后工具调用以结构化字段直传，历史里不再出现那段文本，模型无从复述。
+#
+# 2026-11-05 在本机 intl 账号 + DeepSeek-Flash 上实测：上游返回原生
+# tool_calls、正文为空，完全接受。网关自身的默认仍只对 cn 生效，这里只
+# 改**启动器**的默认值；显式传入的环境变量优先（想关掉就设成 cn）。
+# 网关默认只对 cn 生效。要在 intl 也启用（能根治「模型复述脚手架」类 502），
+# 取消下面一行的注释 —— 上行是 opt-in，不替用户改默认值：
+# export QD_STRUCTURED_TOOL_HISTORY_REALMS="cn,intl"
+
 exec "$PYEXE" "$SCRIPT" --port "$PORT" --pid-file "$PIDFILE"

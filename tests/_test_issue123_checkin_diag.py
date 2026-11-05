@@ -13,7 +13,7 @@ _src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 
 print("[#123] 路由与鉴权")
 check("允许清单里有 /diag/checkin",
-      '"/diag/checkin"):' in _src)
+      '"/diag/checkin"' in _src)
 check("dispatch 走 _handle_diag_checkin 且要 panel_ok",
       'if path == "/diag/checkin":' in _src
       and "_handle_diag_checkin(payload)" in _src)
