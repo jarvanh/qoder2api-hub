@@ -65,7 +65,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.28"
+VERSION = "1.7.31"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -7536,6 +7536,28 @@ RISK_STATS = {"queue": 0, "rate": 0, "rejected": 0, "version_gate": 0,
 RECOVERY_STATS = {"leak": 0, "dsml": 0}
 _RISK_LOCK = threading.Lock()
 
+# 进程级在途请求计数（看板「实时/并发」小卡真源）。
+# 只统计业务 POST（/v1/chat/completions 等），GET /health 等观测端点不计入。
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT = {"cur": 0, "peak": 0}
+
+
+def inflight_begin():
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["cur"] += 1
+        if _INFLIGHT["cur"] > _INFLIGHT["peak"]:
+            _INFLIGHT["peak"] = _INFLIGHT["cur"]
+
+
+def inflight_end():
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["cur"] = max(0, _INFLIGHT["cur"] - 1)
+
+
+def inflight_snapshot():
+    with _INFLIGHT_LOCK:
+        return {"inflight": _INFLIGHT["cur"], "inflight_peak": _INFLIGHT["peak"]}
+
 
 def note_risk(kind, detail=""):
     """记一次风控/排队信号（queue/rate/rejected/version_gate）。"""
@@ -11339,6 +11361,7 @@ class Handler(BaseHTTPRequestHandler):
                 "risk": risk_snapshot(),
                 "env": env_report(),
                 "quality": quality_snapshot(),
+                **inflight_snapshot(),
             }
             if self._key_ok():
                 info.update({
@@ -13510,6 +13533,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result)
 
     def do_POST(self):
+        # 在途计数：包住整个 POST 生命周期；health/models 是 GET，不受影响。
+        inflight_begin()
+        try:
+            return self._do_POST()
+        finally:
+            inflight_end()
+
+    def _do_POST(self):
         # #26：同 do_GET —— 每次请求入口清空，避免 keep-alive 复用实例时把上一次
         # chat 的出口/原因带到别的响应上。
         self.realm_used = ""
