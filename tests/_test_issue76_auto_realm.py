@@ -83,9 +83,12 @@ for fn in ENTRIES:
     check("%s：无『_request_realm() or CURRENT_REALM』" % fn,
           not any(l.strip().startswith(BUG) for l in body),
           [i for i, l in enumerate(body) if l.strip().startswith(BUG)][:3])
+    # fork 的 inflight 埋点把 do_POST 拆成 do_POST(包装) + _do_POST(业务)，
+    # 裸调用行随之落在 _do_POST 内；按函数归属守卫时同时接受包装层委托。
     check("%s：裸调用行存在（None 得以传下去）" % fn,
           any(l.strip().startswith(PLAIN) and " or " not in l
-              for l in body))
+              for l in body)
+          or (fn == "do_POST" and "return self._do_POST()" in "\n".join(body)))
 get_body = lines_of_func("do_GET")
 n_get = sum(1 for l in get_body if l.strip().startswith(BUG))
 check("do_GET：模型列表两处**保留** CURRENT_REALM（防过删，列表必须有确定区）",

@@ -38,12 +38,15 @@ RUN apk add --no-cache tzdata ca-certificates gcompat libstdc++ libgcc && \
     cp /usr/share/zoneinfo/${TZ} /etc/localtime && \
     echo "${TZ}" > /etc/timezone
 
-# Copy application files (Zero external pip dependencies needed -
-# AES/RSA/COSY signing are pure-stdlib implementations)
+# Optional image codec is bundled in official images; native text-only use stays stdlib.
+RUN python -m pip install --no-cache-dir "Pillow>=12.1.1,<14"
+
+# Copy application files (AES/RSA/COSY signing remain pure-stdlib implementations)
 COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_scheduler.py qoder_settings.py qoder_sign.py qoder_tasks.py \
      qoder_anthropic.py qoder_agents.py qoder_updater.py \
      qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_session_cache.py \
+     qoder_keepalive.py qoder_images.py qoder_cache.py \
      dashboard.html baseprompt.json ./
 
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）

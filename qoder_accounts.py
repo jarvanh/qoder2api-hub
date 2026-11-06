@@ -39,6 +39,214 @@ from qoder_sign import COSY_MACHINE_OS
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 用量/积分：跨区域自动探测（issue #141）
+# ---------------------------------------------------------------------------
+# INTL 的额度接口与 CN 不是一套：实测 openapi.qoder.sh 上 /api/v2/quota/usage
+# 常返回 404/403，而官网会话侧的 /sash/api/v1/me/* 才有数据。与其逐个区域写死，
+# 这里维护一份**候选矩阵**（主机 × 路径），按顺序试，第一个解析出数字的就记住：
+#   accounts/credits-source.json = {"intl": {"host": ..., "path": ..., "at": ...}}
+# 之后 fetch_credits 优先用它；探测失败再回退到默认 /api/v2/quota/usage。
+CREDITS_PATHS = (
+    "/api/v2/quota/usage",
+    "/api/v1/quota/usage",
+    "/api/v2/quota",
+    "/api/v2/user/quota",
+    "/api/v2/me/quota",
+    "/api/v2/credits/usage",
+    "/api/v2/credits",
+    "/api/v2/billing/quota",
+    "/sash/api/v1/me/quota",
+    "/sash/api/v1/me/credits",
+    "/sash/api/v1/me/usage",
+)
+CREDITS_SOURCE_FILE = "credits-source.json"
+_CREDITS_PROBE_TTL = 6 * 3600
+
+
+def credits_source_path(accounts_dir):
+    return os.path.join(accounts_dir, CREDITS_SOURCE_FILE)
+
+
+def load_credits_sources(accounts_dir):
+    try:
+        with open(credits_source_path(accounts_dir), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_credits_source(accounts_dir, realm, host, path, fields=None):
+    data = load_credits_sources(accounts_dir)
+    data[str(realm or "cn")] = {"host": host, "path": path,
+                                "fields": list(fields or []),
+                                "at": time.time()}
+    try:
+        os.makedirs(accounts_dir, exist_ok=True)
+        tmp = credits_source_path(accounts_dir) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, credits_source_path(accounts_dir))
+    except Exception:
+        pass
+    return data.get(str(realm or "cn"))
+
+
+def _num_or_none(value):
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bucket_from(src, kind, name):
+    """把上游任意额度对象归一成 {name, kind, remain, used, size, expires_at}。"""
+    if isinstance(src, (int, float)) and not isinstance(src, bool):
+        return {"name": name, "kind": kind, "remain": int(src),
+                "used": 0, "size": int(src)}
+    if not isinstance(src, dict):
+        return None
+    remain = _num_or_none(src.get("remaining"))
+    if remain is None:
+        remain = _num_or_none(src.get("remain"))
+    if remain is None:
+        remain = _num_or_none(src.get("balance"))
+    used = _num_or_none(src.get("used"))
+    size = _num_or_none(src.get("total"))
+    if size is None:
+        size = _num_or_none(src.get("cap"))
+    if size is None:
+        size = _num_or_none(src.get("size"))
+    if size is None and remain is not None and used is not None:
+        size = remain + used
+    if remain is None and size is not None and used is not None:
+        remain = max(0.0, size - used)
+    if remain is None and size is None:
+        return None
+    # 上游把展示名放在 displayLabels[].valueI18n（zh-CN / en-US），优先用它；
+    # 这样「SOTA 专属积分」这类活动包能显示成人话，而不是容器名。
+    label = ""
+    for dl in (src.get("displayLabels") or []):
+        if not isinstance(dl, dict):
+            continue
+        if str(dl.get("dimension") or "") != "title":
+            continue
+        i18n = dl.get("valueI18n") if isinstance(dl.get("valueI18n"), dict) else {}
+        label = str(i18n.get("zh-CN") or i18n.get("en-US")
+                      or dl.get("value") or "").strip()
+        if label:
+            break
+    if not label:
+        label = str(src.get("name") or "").strip()
+    out = {"name": (label or name), "kind": kind,
+           "remain": int(remain or 0), "used": int(used or 0),
+           "size": int(size or 0)}
+    if src.get("available") is not None:
+        out["available"] = bool(src.get("available"))
+    for key in ("expiresAt", "expireAt", "expires_at", "expiredAt",
+                "validUntil", "dueAt"):
+        if src.get(key) is not None:
+            out["expires_at"] = normalize_epoch(src[key])
+            break
+    for key in ("daysLeft", "days_left"):
+        if src.get(key) is not None:
+            out["days_left"] = src[key]
+            break
+    if src.get("noExpiry") is not None:
+        out["no_expiry"] = bool(src.get("noExpiry"))
+    return out
+
+
+_QUOTA_BUCKETS = (
+    # (字段名匹配, kind, 展示名) —— 顺序即优先级
+    (("userquota", "planquota", "subscriptionquota", "basequota", "plan"),
+     "plan", "套餐内 Credits"),
+    (("sota", "sotacredits", "sotaquota", "sotaspecial"),
+     "sota", "SOTA 专属积分"),
+    (("addonquota", "resourcepackage", "resourcepackages", "addon",
+      "package", "packages", "bonus"),
+     "pack", "资源包"),
+    # issue: INTL 实测 —— SOTA 专属积分在 dedicatedResourcePackages 里（数组），
+    # 名字在 displayLabels[].valueI18n（zh-CN: "SOTA 专属积分"）。
+    (("dedicatedresourcepackages", "dedicatedresourcepackage",
+      "exclusivepackages", "sotapackages"),
+     "sota", "专属积分包"),
+    (("orgresourcepackage", "sharedquota", "teamquota", "poolquota",
+      "sharedcredits"),
+     "shared", "共享额度池"),
+)
+
+
+def normalize_quota_payload(payload, realm=""):
+    """把任意区域的额度响应归一成「构成」列表（issue #141）。
+
+    策略：广度优先遍历 JSON，命中字段名（见 _QUOTA_BUCKETS）的 dict/数字就归一成
+    一个 bucket；同一 kind 的多个对象都保留（资源包可能有多份，各有有效期）。
+    返回 {"composition": [...], "remain": N, "used": N, "size": N, "fields": [...]}；
+    一个能识别的都没有时返回 None（调用方据此判「这个端点不适用」）。
+    """
+    if not isinstance(payload, (dict, list)):
+        return None
+    found = []
+    seen = set()
+    queue = [("", payload)]
+    while queue:
+        prefix, node = queue.pop(0)
+        if isinstance(node, dict):
+            for key, val in node.items():
+                low = str(key).lower()
+                kind = name = None
+                for keys, k, label in _QUOTA_BUCKETS:
+                    if low in keys:
+                        kind, name = k, label
+                        break
+                if kind and isinstance(val, (dict, list, int, float)) \
+                        and not isinstance(val, bool):
+                    items = val if isinstance(val, list) else [val]
+                    for idx, item in enumerate(items):
+                        bucket = _bucket_from(item, kind, name)
+                        if bucket:
+                            if len(items) > 1:
+                                bucket["name"] = "%s #%d" % (name, idx + 1)
+                            sig = (bucket["kind"], bucket.get("size"),
+                                   bucket.get("remain"), bucket.get("expires_at"))
+                            if sig not in seen:
+                                seen.add(sig)
+                                found.append(bucket)
+                if isinstance(val, (dict, list)):
+                    queue.append((prefix + "/" + low, val))
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    queue.append((prefix, item))
+    if not found:
+        return None
+    # 顶层用量百分比 / 到期时间（有就带上，不做推断）
+    top = payload if isinstance(payload, dict) else {}
+    out = {
+        "composition": found,
+        "remain": sum(b["remain"] for b in found
+                       if b["kind"] != "shared" and b.get("available", True)),
+        "used": sum(b["used"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
+        "size": sum(b["size"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
+        "fields": sorted({b["kind"] for b in found}),
+    }
+    for key in ("expiresAt", "expireAt", "expires_at"):
+        if top.get(key) is not None:
+            out["expires_at"] = normalize_epoch(top[key])
+            break
+    if top.get("totalUsagePercentage") is not None:
+        out["usage_pct"] = top.get("totalUsagePercentage")
+    if top.get("isQuotaExceeded") is not None:
+        out["exceeded"] = bool(top.get("isQuotaExceeded"))
+    return out
+
+
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
@@ -3136,8 +3344,147 @@ class Account(object):
                 "请在面板重新扫描/导入该账号（或把 realm 改成 %s）"
                 % (name, other))
 
+    # -- 用量端点自动探测（issue #141） -------------------------------
+    def probe_credits_endpoints(self, accounts_dir=None, limit=None):
+        """按「主机 × 路径」候选矩阵探测额度接口，返回逐项结果。
+
+        limit: 只探测前 N 个候选（None = 全部）。命中者写入
+        accounts/credits-source.json，之后 fetch_credits 优先用它。
+        """
+        cfg = get_realm_config(self.realm)
+        hosts = []
+        for h in (cfg.get("openapi"), cfg.get("website")):
+            h = str(h or "").rstrip("/")
+            if h and h not in hosts:
+                hosts.append(h)
+        # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
+        known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
+        order = []
+        if isinstance(known, dict) and known.get("host") and known.get("path"):
+            order.append((str(known["host"]).rstrip("/"), str(known["path"])))
+        for host in hosts:
+            for path in CREDITS_PATHS:
+                if (host, path) not in order:
+                    order.append((host, path))
+        if limit is None:
+            limit = 4          # 默认只试 4 个：面板 90s 超时之外的候选没意义
+        rows = []
+        hit = None
+        tried = 0
+        for host, path in order:
+            if True:
+                if limit is not None and tried >= limit:
+                    break
+                tried += 1
+                url = host + path
+                row = {"url": url, "host": host, "path": path,
+                       "status": None, "ok": False, "fields": []}
+                try:
+                    body = http_json(url, method="GET",
+                                      headers=self.headers(),
+                                      timeout=8, retries=0)
+                except urllib.error.HTTPError as exc:
+                    row["status"] = exc.code
+                    rows.append(row)
+                    continue
+                except Exception as exc:
+                    row["status"] = 0
+                    row["error"] = str(exc)[:120]
+                    rows.append(row)
+                    continue
+                row["status"] = 200
+                norm = normalize_quota_payload(body, self.realm)
+                if norm:
+                    row["ok"] = True
+                    row["fields"] = norm["fields"]
+                    row["composition"] = norm["composition"]
+                    if hit is None:
+                        hit = (host, path, norm)
+                else:
+                    row["note"] = "200 but no recognizable quota fields"
+                rows.append(row)
+            if limit is not None and tried >= limit:
+                break
+        if hit and accounts_dir:
+            save_credits_source(accounts_dir, self.realm, hit[0], hit[1],
+                                hit[2]["fields"])
+        return {"ok": bool(hit), "realm": self.realm, "rows": rows,
+                "hit": ({"host": hit[0], "path": hit[1],
+                         "composition": hit[2]["composition"]}
+                        if hit else None)}
+
+    def _credits_from_composition(self, norm):
+        """把归一化的「构成」落成 credits 结构（issue #141）。"""
+        comp = list(norm.get("composition") or [])
+        shared = next((b for b in comp if b.get("kind") == "shared"), None)
+        packages = []
+        for b in comp:
+            if b.get("kind") == "shared":
+                continue
+            item = {"name": b.get("name") or "额度",
+                    "remain": int(b.get("remain") or 0),
+                    "used": int(b.get("used") or 0),
+                    "size": int(b.get("size") or 0),
+                    "kind": b.get("kind") or "pack"}
+            for key in ("expires_at", "days_left", "no_expiry"):
+                if b.get(key) is not None:
+                    item[key] = b[key]
+            packages.append(item)
+        self.credits = {
+            "remain": int(norm.get("remain") or 0),
+            "used": int(norm.get("used") or 0),
+            "size": int(norm.get("size") or 0),
+            "exceeded": bool(norm.get("exceeded")),
+            "usage_pct": norm.get("usage_pct"),
+            "expires_at": norm.get("expires_at"),
+            "shared": shared,
+            "packages": packages,
+            # issue #141：构成明细（套餐内 / 资源包 / SOTA / 共享池）
+            "composition": comp,
+            "source": norm.get("source") or "",
+            "updated_at": time.time(),
+            "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.last_quota_anomaly = None
+        self.credits_degraded = None
+        self.revive_balance_cooldown()
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return {"ok": True, "credits": self.credits}
+
+    def _fetch_credits_via_source(self, accounts_dir, src):
+        """按已探测到的端点取额度；失败返回 None（调用方回退默认路径）。"""
+        if not isinstance(src, dict):
+            return None
+        host = str(src.get("host") or "").rstrip("/")
+        path = str(src.get("path") or "")
+        if not host or not path:
+            return None
+        try:
+            body = http_json(host + path, method="GET", headers=self.headers(),
+                             timeout=20, retries=0)
+        except Exception:
+            return None
+        norm = normalize_quota_payload(body, self.realm)
+        if not norm or not norm.get("size"):
+            return None
+        norm["source"] = host + path
+        return self._credits_from_composition(norm)
+
     def fetch_credits(self):
-        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
+        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。
+
+        issue #141：INTL 上这个端点经常 404/403，所以先用**自动探测**到的
+        （主机, 路径）组合；没有记录或取不到时再走默认路径，全部失败则
+        触发一次探测并重试——探测结果按区域缓存 6 小时。
+        """
+        _dir = os.path.dirname(self.path) if self.path else None
+        _srcs = load_credits_sources(_dir) if _dir else {}
+        _src = _srcs.get(str(self.realm or "cn"))
+        if _src:
+            _hit = self._fetch_credits_via_source(_dir, _src)
+            if _hit:
+                return _hit
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_QUOTA
         hint = ""
@@ -3152,6 +3499,15 @@ class Account(object):
                     q = http_json(url, method="GET",
                                   headers=self.desktop_headers(), timeout=30)
                 except Exception as exc2:
+                    # issue #141：默认端点失败 -> 主动探测一次（限 6 个候选），
+                    # 命中就立刻改用新端点，别让 INTL 用户一直看到 0/0。
+                    if _dir:
+                        _probe = self.probe_credits_endpoints(_dir, limit=6)
+                        if _probe.get("hit"):
+                            _retry = self._fetch_credits_via_source(
+                                _dir, _probe["hit"])
+                            if _retry:
+                                return _retry
                     hint = self._other_realm_quota_hint()
                     return {
                         "ok": False,
@@ -3161,8 +3517,21 @@ class Account(object):
                                     (" ｜ " + hint) if hint else ""),
                     }
             else:
+                if _dir:
+                    _probe = self.probe_credits_endpoints(_dir, limit=6)
+                    if _probe.get("hit"):
+                        _retry = self._fetch_credits_via_source(
+                            _dir, _probe["hit"])
+                        if _retry:
+                            return _retry
                 return {"ok": False, "http": exc.code, "error": str(exc)}
         except Exception as exc:
+            if _dir:
+                _probe = self.probe_credits_endpoints(_dir, limit=6)
+                if _probe.get("hit"):
+                    _retry = self._fetch_credits_via_source(_dir, _probe["hit"])
+                    if _retry:
+                        return _retry
             return {"ok": False, "error": str(exc)}
         # #25-d：非 dict 响应（解析失败形态）直接走退化路径——旧实现会在这里
         # 抛 AttributeError，且不留任何现场。
@@ -3207,6 +3576,15 @@ class Account(object):
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
+        # issue #141 后续：老口径只累加 userQuota + addOnQuota，**漏掉 SOTA 专属积分**
+        # 之类的新容器（INTL 实测 1800 资源包 + 2000 SOTA，面板却只显示 1800）。
+        # 归一器认得这些容器，就用它的合计覆盖；共享池照旧单列（组织级去重）。
+        _norm = normalize_quota_payload(q, self.realm) or {}
+        _comp = _norm.get("composition") or []
+        if _comp:
+            remain = int(_norm.get("remain") or remain)
+            size = int(_norm.get("size") or size)
+            used = int(_norm.get("used") or used)
         # ---- #25-d：退化 body 合理性守卫（保守）--------------------------
         # 形态（naonao 实测）：isQuotaExceeded=true + 两个 quota 全 0/缺键。
         # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
@@ -3312,9 +3690,29 @@ class Account(object):
             "package_expiry_known": _pkg_exp_known,
             "shared": shared,
             "packages": _pkgs,
+            # issue #141：把响应归一成「构成」（套餐内 / 资源包 / SOTA / 共享池）。
+            # 归一器认得字段名，认不出就为空——不臆造。
+            "composition": _comp,
+            "source": url,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 旧解析只认 userQuota + addOnQuota，SOTA 等容器会被漏掉，于是面板
+        # 「剩余」比官方少一块（现场：官方 1800+2000=3800，网关只显示 1800）。
+        # 有构成时以构成为准重算主数字（不含共享池——组织级、单独去重）。
+        _comp = [b for b in (self.credits.get("composition") or [])
+                 if b.get("kind") != "shared"]
+        if _comp:
+            _r = sum(int(b.get("remain") or 0) for b in _comp)
+            _u = sum(int(b.get("used") or 0) for b in _comp)
+            _s = sum(int(b.get("size") or 0) for b in _comp)
+            if _r or _s:
+                self.credits["remain"] = _r
+                self.credits["used"] = _u
+                self.credits["size"] = _s
+                _shared_remain = int((shared or {}).get("remain") or 0) \
+                    if (shared and shared.get("available", True)) else 0
+                remain_effective = int(_r) + _shared_remain
         # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
         # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
         try:

@@ -76,8 +76,10 @@ check("#37 合法参数：不判为 bad-args",
       not P._echo_with_bad_args(_echo(_GOOD), {"Write"}))
 check("#37 内层真实 LF：判为 bad-args",
       P._echo_with_bad_args(_echo(_BAD_LF), {"Write"}))
-check("#37 内层未转义引号：判为 bad-args",
-      P._echo_with_bad_args(_echo(_BAD_QUOTE), {"Write"}))
+# DSH 现场：内层引号未转义现在会被 _repair_args_json 修好并还原成真实调用，
+# 所以不再是 bad-args（修不好时才 fail-closed）。
+check("#37 内层未转义引号：可修复 -> 不判 bad-args",
+      not P._echo_with_bad_args(_echo(_BAD_QUOTE), {"Write"}))
 check("#37 内层截断（缺右花括号）：判为 bad-args",
       P._echo_with_bad_args(_echo('{"file_path":"D:/x.txt"'), {"Write"}))
 check("#37 尾部多余文本：判为 bad-args",

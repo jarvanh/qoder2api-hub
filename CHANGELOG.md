@@ -8,6 +8,129 @@
 - 补丁号累计到 **14** 之后，下一次发布升**次版本**并把补丁号归零：
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
+- 按维护者本次要求，从本版切换为 **1.8.0**；不追改已发布的 1.7.x 标签。
+
+## v1.8.1（fork 维护版）
+
+fork 维护版：合并上游 v1.7.26–v1.8.0（额度构成/SOTA、缓存保温、/credits/probe 双路由、DSH 504 首字超时换号 + 工具参数坏 JSON 修复、网关性能与图片转换超时恢复）。
+保留 fork 的 QD_QUEUE_FAST_MODELS 快速排队、坏工具回声重发、池级配额 402、110 日界停放、inflight 在途埋点与结构化工具历史 auto 白名单。
+
+## 上游 v1.7.26–v1.8.0（并入 fork v1.8.1）
+
+### v1.8.0
+
+**性能优化（保持请求/工具/计费语义）**
+
+- 长历史文本清洗增加等价快速路径；模板深拷贝不再 JSON 往返。项目内置 Python 3.12.14 的合成 40 条长历史构造中位数 22.11 → 3.08 ms。
+- DSML/tool-tag 普通正文帧只复制修改路径，不再逐帧 JSON 深拷贝；1,000 帧分别 23.55 → 15.32 ms、29.97 → 19.77 ms，保留其他 choice/usage/扩展字段及全部工具守卫。
+- 出站大小预检按 Base64 精确长度计算，真实账号与 session 确定后只编码一次；最终实际发送体再次检查大小，保留超限 413。
+- 看板 stats/analytics 使用固定 10s、32 项/16 MiB 的有界结果缓存；同 key 并发只计算一次，日志追加/截断/轮换及账号元数据变化立即失效。最近请求行数也按日志指纹复用。
+- 修复日用量缓存持续轮询会永久续命的问题：LRU 访问不再修改数据到期时间。
+- 提供离线合成基准 `scripts/benchmark_gateway.py` 与 `docs/performance-v1.8.0.md`；15,000 行日志缓存命中示例 stats 353.53 → 0.334 ms、analytics 325.85 → 0.175 ms，仅代表日志不变的重复查询，不是上游 TTFT 承诺。
+- `/health.analytics_cache` 可查看缓存命中与合并等待；Docker 包含所有新增模块与图片编解码组件。
+
+**图片转换超时修复（上一轮本机修复正式入镜像）**
+
+- 区分 provider 的 `Image conversion timeout` 和首字超时，返回 `upstream_image_conversion_timeout`，不再误称“已对同账号自动重试仍失败”。
+- 新增可选图片预处理：大 PNG/BMP/TIFF 可在保持像素尺寸的前提下压缩；不删图，透明图无损，带色彩/EXIF/DPI/像素比例元数据、动画和高位深图保守透传。相同图片使用有界内存缓存，避免历史重放每轮重新转码；不下载远程图片。
+- HTTP 与 SSE 共享一次图片转换重试预算，固定原账号；耗尽后不轮换/冷却健康账号；已有输出不重发。团队账号先释放旧租约，避免重开时等待自己的并发位。
+- 官方镜像复制图片模块并内置 Pillow；本地无 Pillow 时保留原始图片，`/health.image_preflight` 可确认实际解释器是否支持。
+- 用户提供的 12 张原图离线处理：7,539,371 → 3,152,544 字节；报错预览图 780,734 → 559,736 字节，1920×1080 不变。此为输入减负与重试放大修复，不表示已消除上游服务的全部超时。
+- 验证：图片修复 93 条 + 性能回归 60 条；全量 **123 suites / 3356 checks / 0 failed**。本地新镜像版本/模块/图片 codec 导入与 `/ping` 冒烟通过。图片现场原图经本机 Sonus 网关确已预处理；该次真实调用被上游 10605 排队阻断，未据此宣称上游恢复。
+
+### v1.7.30
+
+**🐛 修复：DSH 两类每轮必失败的错误（现场日志 14×504 + 2×坏参数）**
+
+日志里 17 次失败中 14 次是 `504 First Token Timeout or Upstream Timeout`、2 次是 `invalid JSON arguments`、1 次是客户端 `stream idle timeout after 300000ms`。
+
+1. **首字超时不再「同账号退避重试」**：旧逻辑对 5xx 在**同一账号**上重试 2 次（1s/2s 退避），而首字超时几乎必然再超时 —— 一段 90s 的上游等待乘三次 ≈ 4.5 分钟，正好撞上客户端 300s idle timeout。
+   现在 `_is_first_token_timeout()` 命中（`First Token Timeout` / `Upstream Timeout`）**立即换账号**（换 worker 才有意义），并记一条 WARN 与 `note_risk("timeout")` 便于排查。
+2. **工具参数不再是「坏一点就整轮 502」**：新增 `_repair_args_json()`（严格 → 转义内层裸引号 → 去尾随逗号 → 两者叠加，含 JSON 状态机版本），`parse_leaked_tool_calls()` 与 `_echo_with_bad_args()` 都先尝试修复：
+   - 修好 → 还原成真实工具调用（本轮继续跑），并计入 `RECOVERY_STATS.args_repaired`；
+   - 修不好 → 仍 fail-closed（不伪造调用）。
+   现场那条 `{"command":"echo "hi" && ls"}` 现在能正确还原为 `echo "hi" && ls`。
+
+**行为变更**：#37 的「内层未转义引号」从「必须 raise」改为「修复后还原」，`_test_issue37_fail_closed.py` / `_test_issues_1_4_4.py` 已按新语义更新（真截断、多余文本、非法转义等仍 raise）。
+
+**验证**：新增 `tests/_test_dsh_504_args.py`（22 条：首字超时判定与换号、六种参数修复、还原后语义、真坏仍 fail-closed）；全量 **121 suites / 3203 checks / 0 failed**。
+
+### v1.7.29
+
+**🐛 修复：SOTA 专属积分没被识别（INTL 合计少算 2,000）**
+
+实测 INTL 的 `/api/v2/quota/usage` 里，SOTA 不在顶层某个 `sota*` 字段，而在：
+
+```json
+"dedicatedResourcePackages": [{
+  "total": 2000, "used": 39, "remaining": 1961, "expiresAt": 1794146889433,
+  "displayLabels": [{"dimension": "title",
+                     "valueI18n": {"zh-CN": "SOTA 专属积分"}}]
+}]
+```
+
+之前的归一器没有这个键名 → 面板只报「资源包 1,800」，官方却是 1,800 + 1,961 = **3,761**。
+
+- 新增 `dedicatedResourcePackages` / `dedicatedResourcePackage` / `exclusivePackages` 等别名，归到 **SOTA** 桶；
+- 展示名优先取 `displayLabels[dimension=title].valueI18n["zh-CN"]`（没有就退 `name`）；
+- `available=false` 的包**只展示不计入**合计（过期/停用的活动包不该算余额）；
+- 单测按官方那三条数字钉住：剩余 **3,761** / 总量 **3,800** / 已用 **39**。
+
+**🐛 修复：面板「探测失败: Failed to fetch」**
+
+探测原先逐个候选打上游（每个 20s、最多 22 个），浏览器先超时把连接掐断。
+
+- 单候选超时 8s、默认只试 **4** 个候选；
+- **已知来源排第一**（命中过就 1 次请求返回）；
+- 面板改用 `AbortController` 限时 100s，并把提示分成三种：超时 / 老网关 404 / 请求被中断（附「稍等再点或直接打开 `/credits/probe?limit=3`」）。
+
+**验证**：套件扩到 **54 条**（SOTA 映射、displayLabels 取名、不可用包不计入、探测加速与三种错误提示）；全量 **120 suites / 3189 checks / 0 failed**。
+
+### 上游 v1.7.28
+
+**🐛 修复：INTL 额度合计漏 SOTA / 探测接口 404 / 构成要跑到别处看**
+
+（v1.7.27 先修了合计与账号行内联；这里补齐探测路由与四类小计，一并说明。）
+
+1. **合计只算 套餐内 + 资源包，漏掉 SOTA 专属积分**：官方界面 1,800（资源包）+ 2,000（SOTA）= **3,800**，网关只显示 1,800。
+   现在 `fetch_credits` 用归一后的 `composition` 覆盖 `remain/size/used`（共享池仍单列、按组织去重），与官方口径一致。
+2. **`/credits/probe` 在老版本网关上 404**：路由抽成 `_handle_credits_probe()`，**do_GET 与 do_POST 各挂一处**（GET 走 query 参数，浏览器直接打开也能用）；面板在 404 时提示「升级到 1.7.26+ 并重启」，而不是让用户以为配错了。
+3. **构成不必去「用量洞察」找**：账号行的积分下面直接显示 `套餐内 x · 资源包 y · SOTA z · 共享 w` + 最近到期，悬停可看取数端点；`/credits/summary` 每行新增 `composition_sums` 四类小计。
+
+**验证**：`_test_issue141_credit_composition.py` **42 条**（含 GET/POST 双路由、四类小计、老网关 404 提示、账号行内联渲染）；全量 **120 suites / 3177 checks / 0 failed**。
+
+### v1.7.26
+
+**✨ 额度构成 + 端点自动探测（INTL 读不到用量的问题）**
+
+不同区域的额度接口不是一套：CN 的 `openapi.qoder.com.cn/api/v2/quota/usage` 有数据，INTL 同路径常 404/403。现在网关内置**候选矩阵**（主机 × 路径）自动探测，命中组合记进 `accounts/credits-source.json`，之后优先使用；`fetch_credits` 失败时也会探测并重试（限 6 个候选）。
+
+- 新增 `normalize_quota_payload()`：把任意额度响应归一成**构成**（套餐内 / 资源包 / SOTA 专属 / 共享池），认不出就不显示、不臆造；
+- 新增 `POST /credits/probe`（面板鉴权）：一次返回候选矩阵的 `status` 与命中 `fields`；
+- 面板「用量洞察」新增 **额度构成** 区块：四列 + 剩余 + 最近到期 + **来源端点**，并带「自动探测」按钮；
+- `/credits/summary` 每行新增 `composition` / `source` / `expires_at`。
+
+实测（本机双区账号）：CN 与 INTL 都命中 `/api/v2/quota/usage`，字段 `pack + plan`；无 token 访问 `/credits/probe` 返回 401。
+
+**✨ 会话缓存保温（合并 PR #142，`QD_CACHE_KEEPALIVE`，默认关闭）**
+
+报告者用连续实测定位到：#136 修好会话键轮换后，仍有**与提问边界无关**的 0% 全价行——同一 `win:` 会话、前缀连续，但**闲置 ≥ ~5 分钟**后首发热缓存失效（4m41s 存活 / 5m05s 只剩公共头部 / 16m29s 全零），失效后 36–46s 立刻恢复 99.7%。
+
+- 新增 `qoder_keepalive.py`：成功转发后按最终 `session_id` 记快照（LRU，默认 2 个会话、不落盘），后台线程每 20s 巡检，闲置 ≥ `QD_CACHE_KEEPALIVE_INTERVAL`（默认 240s，小于上游 TTL）且未超 `QD_CACHE_KEEPALIVE_MAX_AGE`（默认 1800s）时重发一次 `max_tokens=1` 的最小请求续期；
+- 保温请求**照常记账**，`key_id=keepalive`，面板可审计（124k ≈ 10.7 积分 vs 全量重写 ≈ 137）；
+- 默认关闭（`QD_CACHE_KEEPALIVE=0`）：不开就不存任何东西，行为与改动前一致。
+
+**验证**：新增 `_test_issue141_credit_composition.py`(31) + PR 自带 `_test_cache_keepalive.py`(31)；`/credits/probe` 走真实服务 e2e（401/200 两条路径 + 双区命中）；全量 **119 suites / 3161 checks / 0 failed**。
+
+**🐳 修复：镜像里缺少 qoder_keepalive.py**
+
+PR #142 新增的模块没加进 `Dockerfile` 的 COPY 列表，CI 的冒烟测试（按 import 推导必需模块）
+当场报 `MISSING: qoder_keepalive.py`，构建失败。已补进镜像，并新增 `tests/_test_dockerfile_modules.py`
+把这件事变成回归：**Dockerfile 必须覆盖所有被 import 的 qoder_* 模块**（顺带校验 COPY 引用的文件都存在）。
+
+**验证**：全量 **120 suites / 3166 checks / 0 failed**。
+
+### v1.7.25
 
 ## v1.7.28（fork 维护版）
 

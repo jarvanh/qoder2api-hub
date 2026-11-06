@@ -19,13 +19,14 @@ OpenAI 兼容接口。上游链路：
     GET  /health
     以及看板全套管理接口 (accounts / usage / tasks / scheduler / settings / logs)
 
-仅使用 Python 标准库（AES/RSA/COSY 签名均为内置纯实现）。
+核心链路仅使用 Python 标准库；可选 Pillow 提供图片预处理（官方镜像内置）。
 
     python qoder_proxy.py                    # bind 127.0.0.1:8790
     python qoder_proxy.py --port 9000
     python qoder_proxy.py --api-key sk-local  # require a bearer token
 """
 import argparse
+import copy
 import atexit
 import hashlib
 from collections import deque, OrderedDict
@@ -54,6 +55,9 @@ import qoder_anthropic
 
 # issue #116：把宿主日志注入 anthropic 模块（它自己只 import 标准库）
 import qoder_catalog
+import qoder_keepalive
+import qoder_images
+import qoder_cache
 import qoder_pricing
 import qoder_settings
 import qoder_session_cache
@@ -65,7 +69,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.7.31"
+VERSION = "1.8.1"  # fork 维护版：上游 v1.8.0 已占用，进位 1.8.1
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1103,6 +1107,17 @@ def _tail_lines(path, max_lines, chunk=256 * 1024):
 
 
 def count_usage_rows(realm=None):
+    """Reuse recent-page totals while the log fingerprint stays unchanged."""
+    scope = realm_scope(realm)
+    stamp = _usage_log_fingerprint()
+    realms = tuple((a.uid, a.realm) for a in (POOL.accounts if POOL else []))
+    key = ("count", scope, CURRENT_REALM, realms, stamp)
+    return _USAGE_REPORT_CACHE.get(
+        key, lambda: _count_usage_rows_uncached(scope), ttl=5,
+        valid=lambda: _usage_log_fingerprint() == stamp)
+
+
+def _count_usage_rows_uncached(realm=None):
     """Cheap row count - substring match instead of a full JSON parse."""
     realm = realm_scope(realm)      # realm=all 走无 needles 分支，与逐行过滤一致
     needles = ()
@@ -1357,6 +1372,18 @@ def credits_summary():
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
+            # issue #141：额度构成（套餐内 / 资源包 / SOTA / 共享池）与取数端点，
+            # 面板据此把「这些数字是怎么来的」摊开。
+            "composition": cred.get("composition") or [],
+            # 面板账号表用：四类小计（共享池单独标注，不参与个人合计）
+            "composition_sums": {
+                k: sum(int(b.get("remain") or 0)
+                       for b in (cred.get("composition") or [])
+                       if b.get("kind") == k)
+                for k in ("plan", "pack", "sota", "shared")
+            },
+            "source": cred.get("source") or "",
+            "expires_at": cred.get("expires_at"),
         })
         total = int(plan_remain) + shared_counted
         by_realm[realm] = by_realm.get(realm, 0) + total
@@ -1621,7 +1648,7 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
 # 30 天窗口不必从文件头扫起（日志实测可长到几十 MB/天）。
 DAILY_MAX_DAYS = 90
 DAILY_GROUPS = ("model", "realm", "key", "account")
-_daily_cache = {}
+_daily_cache = OrderedDict()
 _daily_lock = threading.Lock()
 
 
@@ -1705,17 +1732,15 @@ def usage_daily(days=7, group="model", realm=None, ttl=10):
     with _daily_lock:
         hit = _daily_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
-            # 命中时刷新时间戳 => 淘汰变成 LRU 而不是 FIFO。不刷新的话
-            # min(...) 挑的是「最早创建」的那个，也就是正在被轮询的热点条目。
-            _daily_cache[key] = (now, hit[1])
+            # LRU recency must not extend the data freshness deadline.
+            _daily_cache.move_to_end(key)
             return hit[1]
     data = _usage_daily_uncached(days, group, realm, since)
     with _daily_lock:
-        if len(_daily_cache) > 32:
+        if len(_daily_cache) >= 32 and key not in _daily_cache:
             # 只淘汰**最旧的单个**条目。原先这里是 clear()——清空会把其它
             # 仍在被轮询的 (realm, days, group) 组合一起作废，下一轮全部重算。
-            oldest = min(_daily_cache, key=lambda k: _daily_cache[k][0])
-            _daily_cache.pop(oldest, None)
+            _daily_cache.popitem(last=False)
         _daily_cache[key] = (time.time(), data)
     return data
 
@@ -2339,6 +2364,43 @@ def compute_usage_analytics(range=None, since=None, until=None):
         for m in models_list:
             m["window"] = win_model.get(m["model"]) or finalize(new_stat())
     return result
+
+
+_USAGE_REPORT_CACHE = qoder_cache.JsonResultCache()
+
+
+def _usage_log_fingerprint():
+    """Detect append, truncation, replacement and file-path changes without scanning."""
+    path = os.path.abspath(USAGE_LOG)
+    try:
+        st = os.stat(path)
+        return (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        return (path, None)
+
+
+def cached_usage_report(kind, ttl=10, **params):
+    """Bound dashboard scans; invalidate immediately when the source changes.
+
+    Raw compute_* functions remain available for exact diagnostics and tests.
+    Expiry never slides on hits. Concurrent identical polls share one scan.
+    """
+    builder = {"stats": compute_usage_stats, "analytics": compute_usage_analytics}[kind]
+    fingerprint = _usage_log_fingerprint()
+    # Account names/credit snapshots are part of analytics, not part of JSONL.
+    metadata = []
+    for account in (POOL.accounts if POOL else []):
+        row = [account.uid, account.nickname, account.realm]
+        if kind == "analytics":
+            row.extend([account.domain, getattr(account, "credits", None)])
+        metadata.append(row)
+    meta = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+    day = time.strftime("%Y-%m-%d", time.localtime())
+    key = (kind, tuple(sorted(params.items())), fingerprint, day,
+           os.environ.get("TZ", ""), time.tzname, meta, FULL_PRICE_PROMPT_MIN)
+    return _USAGE_REPORT_CACHE.get(
+        key, lambda: builder(**params), ttl=ttl,
+        valid=lambda: _usage_log_fingerprint() == fingerprint)
 
 
 def free_model_names(realm=None):
@@ -3530,7 +3592,9 @@ def has_fingerprint(text):
     for f in SANITIZE_FEATURES:
         if f in text:
             return True
-    return bool(SANITIZE_BARE_HDR_RE.search(text))
+    # The only remaining match starts with ASCII x-/X-. Cheap C substring scans
+    # avoid the case-insensitive regex over every clean token of long histories.
+    return ("x-" in text or "X-" in text) and bool(SANITIZE_BARE_HDR_RE.search(text))
 
 
 def sanitize_text(text):
@@ -4513,7 +4577,10 @@ def _echo_with_bad_args(text, allowed_names=None):
         try:
             json.loads(args)
         except Exception:
-            bad += 1
+            # 能修好就不算「坏参数」——交给 parse_leaked_tool_calls 修复后还原，
+            # 否则这一轮会被 fail-closed 整轮丢掉（issue: DSH 工具参数 502）。
+            if _repair_args_json(args) is None:
+                bad += 1
     return bad > 0
 
 
@@ -4706,6 +4773,40 @@ def _salvage_echo_item(seg):
         fixed = _fix_echo_args(base)
         if fixed is not None:
             return {"name": name, "arguments": fixed}
+    return None
+
+
+def _repair_args_json(raw):
+    """尽量把模型写坏的 arguments 修成合法 JSON（issue: DSH 工具参数 502）。
+
+    模型高频写法：内层双引号未转义（`"command":"echo "hi" && ls"`）、尾随逗号。
+    依次尝试：严格 -> 转义内层裸引号 -> 去尾随逗号 -> 两者叠加。
+    返回修复后的字符串；都修不好返回 None（调用方继续按失败处理，不伪造调用）。
+    """
+    text = str(raw or "")
+    if not text.strip():
+        return ""
+    cands = [text]
+    try:
+        cands.append(_repair_json_quotes(text))
+    except Exception:
+        pass
+    # 更强的一档：按 JSON 状态机只转义「未转义的内层引号」（_escape_unescaped_quotes，
+    # 与 <tool_call> 解析同源）。模型写 `"command":"echo "hi" && ls"` 时这一步能救回来。
+    try:
+        _esc = _escape_unescaped_quotes(text)
+        if _esc not in cands:
+            cands.append(_esc)
+    except Exception:
+        pass
+    for base in list(cands):
+        cands.append(re.sub(r",\s*([}\]])", r"\1", base))
+    for cand in cands:
+        try:
+            json.loads(cand)
+            return cand
+        except Exception:
+            continue
     return None
 
 
@@ -5053,7 +5154,14 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             try:
                 json.loads(args)
             except Exception:
-                return None, text
+                _fixed = _repair_args_json(args)
+                if _fixed is None:
+                    return None, text
+                args = _fixed
+                try:
+                    RECOVERY_STATS["args_repaired"] =                         RECOVERY_STATS.get("args_repaired", 0) + 1
+                except Exception:
+                    pass
         calls.append({
             "id": _new_id("call_"),
             "type": "function",
@@ -5893,6 +6001,19 @@ def _dsml_tail_hold(text):
     return ""
 
 
+def _chunk_with_content(payload, content):
+    """Copy only the modified first-choice/delta path; retain other metadata."""
+    out = dict(payload)
+    choices = list(payload.get("choices") or [])
+    first = dict(choices[0])
+    delta = dict(first.get("delta") or {})
+    delta["content"] = content
+    first["delta"] = delta
+    choices[0] = first
+    out["choices"] = choices
+    return out
+
+
 def _sse_recover_dsml(frames, allowed_names=None):
     """把流式正文里的 DeepSeek DSML 工具调用还原成结构化 tool_calls（issue #51）。
 
@@ -5965,8 +6086,7 @@ def _sse_recover_dsml(frames, allowed_names=None):
                 tail = hold
                 continue
             if body:
-                payload2 = json.loads(json.dumps(payload))
-                payload2["choices"][0].setdefault("delta", {})["content"] = body
+                payload2 = _chunk_with_content(payload, body)
                 yield ("data: " + json.dumps(payload2, ensure_ascii=False)
                        + "\n\n").encode("utf-8")
             tail = hold
@@ -6307,8 +6427,7 @@ def _sse_recover_tool_tags(frames, allowed_names=None):
                 # 奇数，说明这个标签落在未闭合的代码块里 = 文档示例（教程、提问
                 # 里贴的格式），绝不能转成真实调用 —— 误报会真的执行命令。
                 if ("".join(emitted_text) + body).count("```") % 2 == 1:
-                    payload2 = json.loads(json.dumps(payload))
-                    payload2["choices"][0].setdefault("delta", {})["content"] = body
+                    payload2 = _chunk_with_content(payload, body)
                     emitted_text.append(body)
                     yield ("data: " + json.dumps(payload2, ensure_ascii=False)
                            + "\n\n").encode("utf-8")
@@ -6318,8 +6437,7 @@ def _sse_recover_tool_tags(frames, allowed_names=None):
                 tail = hold
                 continue
             if body:
-                payload2 = json.loads(json.dumps(payload))
-                payload2["choices"][0].setdefault("delta", {})["content"] = body
+                payload2 = _chunk_with_content(payload, body)
                 emitted_text.append(body)
                 yield ("data: " + json.dumps(payload2, ensure_ascii=False)
                        + "\n\n").encode("utf-8")
@@ -6838,7 +6956,7 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
     参数与 business 会话名。
     """
     r = realm or (account.realm if account else CURRENT_REALM)
-    body = json.loads(json.dumps(BASEPROMPT))   # deep copy
+    body = copy.deepcopy(BASEPROMPT)   # isolate nested template without a JSON round trip
     messages = normalize_roles(payload.get("messages") or [])
     messages = sanitize_messages(messages)
     model = payload.get("model") or ""
@@ -6857,6 +6975,18 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
     system_text, flat, images = flatten_messages(
         messages, keep_reasoning=is_deepseek_model(model, model_key),
         structured=use_structured)
+    # 图片在三协议桥接后统一预处理：不删图/不降分辨率，避免每轮重新转大 PNG。
+    # 只处理 inline data URI；远程 URL 不由网关抓取，保留原有网络边界。
+    flat, image_stats = qoder_images.prepare_messages(flat)
+    if image_stats["optimized"] or image_stats["codec_missing"]:
+        log("image preflight: count=%d optimized=%d chars=%d->%d codec_missing=%d"
+            % (image_stats["images"], image_stats["optimized"],
+               image_stats["bytes_before"], image_stats["bytes_after"],
+               image_stats["codec_missing"]), tag="image")
+    if images:
+        images = [_url for _m in flat
+                  for _text, _urls in [_flatten_content_text(_m.get("content"))]
+                  for _url in _urls]
     # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
@@ -7649,6 +7779,23 @@ def _is_billing_limit(code, detail):
     return ("billing daily count exceeded" in low
             or '"code":"110"' in low)
 
+def _is_image_conversion_timeout(detail):
+    """Provider image conversion timeout, distinct from worker first-token timeout."""
+    text = str(detail or "").lower()
+    return bool(re.search(r"image[ _-]+conversion[ _-]+(?:timeout|timed[ _-]+out)", text))
+
+
+def _is_first_token_timeout(detail):
+    """上游「首字超时」类 504（issue：#137 现场 DSH 每轮卡 4-5 分钟后失败）。
+
+    这类错误的特征是上游 worker 迟迟不产出首 token；**同账号立刻重试几乎必然
+    再超时**，只会把客户端拖到 idle timeout。应当直接换账号（换 worker）而不是
+    原地退避重试。
+    """
+    text = str(detail or "").lower()
+    return ("first token timeout" in text or "first_token_timeout" in text
+            or "upstream timeout" in text)
+
 
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
@@ -7826,6 +7973,12 @@ def friendly_upstream_error(code, detail):
     except Exception:
         code_i = 502
     _safe = _neutralize_auth_codes(detail)
+    if _is_image_conversion_timeout(detail):
+        return ("上游图片转换超时 (HTTP %s)：图片转换服务在时限内未完成。"
+                "这不是 Key 失效；网关保留图片，限制自动重试且不冷却/轮换账号。"
+                "可稍后重试；若重复出现，请分批发送图片或检查原图格式。"
+                "上游详情：%s" % (code_i, _safe[:400] or "(无详情)"),
+                "upstream_image_conversion_timeout")
     # issue #87：排队（fast 模式在这里统一给出中文原因，所有入口共用）
     if ("10605" in detail or "isQueued" in detail
             or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
@@ -7945,6 +8098,9 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
+    # 图片转换是 provider 的请求处理阶段，不是账号健康信号。
+    if _is_image_conversion_timeout(detail):
+        return
     # issue #71：排队**不是账号问题**——必须在解绑会话/冷却之前短路，
     # 否则单号池会被打成「no usable account」，面板看起来就是凭证失效。
     _is_queue71 = ("10605" in detail or "isQueued" in detail)
@@ -8318,12 +8474,24 @@ def _envelope_retry_wait(exc, attempt):
     return attempt
 
 
-def should_retry_envelope(exc, emitted_bytes, attempt, model=""):
+def _take_image_retry(usage_ctx):
+    """One shared image-conversion retry across HTTP and SSE for a request."""
+    if not isinstance(usage_ctx, dict):
+        return TRANSIENT_MAX_RETRIES > 0
+    count = int(usage_ctx.get("_image_conversion_retries") or 0)
+    if count >= min(1, TRANSIENT_MAX_RETRIES):
+        return False
+    usage_ctx["_image_conversion_retries"] = count + 1
+    return True
+
+def should_retry_envelope(exc, emitted_bytes, attempt, model="", usage_ctx=None):
     # issue #37 follow-up：坏工具回声/残缺回声是**采样随机**的模型内容问题，
     # 下一轮大概率正常——默认允许同账号至多 BAD_ARGS_MAX_RETRIES 次自动重发；
     # 重复计费顾虑由「保守默认 1 次 + 未吐出字节才重发」双重兜住，
     # QD_BAD_ARGS_MAX_RETRIES=0 恢复旧「永不重发」语义。客户端语义不变：
     # 预算耗尽仍按 fail-closed 把明确失败返回给客户端。
+    # 上游：usage_ctx 让 HTTP/SSE 共享一次图片转换重试预算；fork 保留 model 供
+    # QD_QUEUE_FAST_MODELS 快速排队判定。两者缺一不可。
     """流内错误信封是否值得**重开上游**再试。
 
     关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
@@ -8339,6 +8507,9 @@ def should_retry_envelope(exc, emitted_bytes, attempt, model=""):
         return True
     if emitted_bytes:
         return False
+    if _is_image_conversion_timeout(getattr(exc, "detail", "")):
+        # Only one reopen before output; do not multiply slow conversions by pool size.
+        return attempt < min(1, TRANSIENT_MAX_RETRIES) and _take_image_retry(usage_ctx)
     _q = _envelope_queue_wait(exc)
     if _q > 0:
         # fork：QD_QUEUE_FAST_MODELS 命中的模型不等队列——上游常把 10605 装在
@@ -8379,6 +8550,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
     传入的 resp 由调用方的 with/finally 关闭；本函数只负责关闭重开的新连接。
     """
     reopen_options = {"usage_ctx": usage_ctx} if usage_ctx is not None else {}
+    if usage_ctx is None:
+        usage_ctx = {}
     cur = resp
     try:
         # issue #51 补充：排队可能要多等几轮（仅排队时 should_retry 才允许）
@@ -8389,7 +8562,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 return obj, account
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
-                if not should_retry_envelope(exc, False, attempt, model=model):
+                if not should_retry_envelope(exc, False, attempt, model=model, usage_ctx=usage_ctx):
                     # issue #71：排队耗尽 -> 429 + Retry-After（不是 403）
                     raise _as_rate_limited_for_queue(exc, model)
                 log("in-stream envelope status %s on model '%s' "
@@ -8397,10 +8570,14 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                     % (exc.status, model, min(attempt + 1, _queue_budget()),
                        _queue_budget()), level="WARN", tag="chat")
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
+                if _is_image_conversion_timeout(exc.detail):
+                    reopen_options["usage_ctx"] = usage_ctx
+                    cur.close()  # Release the original team lease before same-account reopen.
                 try:
                     new_resp, account, _ = open_upstream(
                         payload, session_key=session_key, target_realm=realm,
-                        **reopen_options)
+                        **dict(reopen_options, **({"only_account": account}
+                            if _is_image_conversion_timeout(exc.detail) else {})))
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -8763,6 +8940,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         避免网络恢复后全池仍被熔断锁死
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
+    if usage_ctx is None:
+        usage_ctx = {}
     model = str(payload.get("model") or "")
     # issue #128：整段对话复用同一上游会话身份（拿不到就 None = 旧行为）
     _conv = conversation_identity(payload, session_key)
@@ -8796,9 +8975,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # #26：本次实际出口（自动路由后可能与请求开始时不同）—— 调用方据此
         # 在响应头/日志里对用户可见，也让 usage 行与真实出账区一致。
         usage_ctx["realm"] = realm
-    encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
+    # Size only: custom encoding preserves padded Base64 length. Do not allocate
+    # the encoded multi-MB body here: account/session fields are still provisional.
+    _plain = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+    _size = 4 * ((len(_plain) + 2) // 3)
+    del _plain
     # issue #59：超限就地报 413，不发网络请求、不轮询账号（Broken pipe 会打爆账号池）
-    _size = len(encoded.encode("utf-8")) if isinstance(encoded, str) else len(encoded)
     if _size > MAX_UPSTREAM_BODY_BYTES:
         log("outbound payload too large (%d bytes > %d) - refusing to send "
             "(issue #59)" % (_size, MAX_UPSTREAM_BODY_BYTES),
@@ -8869,6 +9051,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                                                    or (_conv or {}).get("id")))
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
+        # Session/user_type may grow after preliminary preflight. Guard the actual
+        # signed wire body as well, before acquiring leases or sending any bytes.
+        if len(encoded) > MAX_UPSTREAM_BODY_BYTES:
+            raise PayloadTooLarge(len(encoded), MAX_UPSTREAM_BODY_BYTES)
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
         # 签名只覆盖 path，换主机不影响签名有效性。
         hosts = gateway_candidates(account.realm)
@@ -8950,6 +9136,24 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
                     break
+                # 图片转换超时与首字超时不同：保留输入，只允许同账号重试一次。
+                # 重试耗尽后在外层直接上抛，不把整个账号池都拖入转换/冷却。
+                if _is_image_conversion_timeout(detail):
+                    if _take_image_retry(usage_ctx):
+                        tries += 1
+                        log("image conversion timeout: one bounded retry, images retained",
+                            level="WARN", tag="image")
+                        time.sleep(1)
+                        continue
+                    break
+                # 首字超时：同账号重试几乎必然再超时（会拖到客户端 idle timeout），
+                # 直接 break 让外层换账号——换 worker 才有意义。
+                if _is_first_token_timeout(detail):
+                    log("upstream first-token timeout on '%s' model '%s' - "
+                        "rotating to another account instead of retrying"
+                        % (account.uid[:8], model), level="WARN", tag="chat")
+                    note_risk("timeout", detail)
+                    break
                 if _is_transient_upstream(exc.code, detail) \
                         and tries < TRANSIENT_MAX_RETRIES:
                     backoff = tries + 1      # 1s, 2s（tries 从 0 计）
@@ -8997,6 +9201,18 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             for note, msg in blame:
                 note(msg)
             account.note_success(model=model)
+            if qoder_keepalive.enabled() and only_account is None:
+                # 缓存保温：登记这条刚成功的真实对话（默认关闭，见
+                # qoder_keepalive 模块说明）。配套 issue：上游隐式前缀缓存
+                # 实测 ~5 分钟闲置过期，闲置后首发全量重写（0% 命中全价）。
+                # 只登记真实客户端流量：only_account 路径是账号测试/诊断探测。
+                try:
+                    qoder_keepalive.observe(
+                        payload, session_id=body_obj.get("session_id"),
+                        account_uid=account.uid, realm=realm,
+                        model=str(payload.get("model") or ""))
+                except Exception:
+                    pass
             if _team_lease:
                 # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
                 return _TeamLeaseResp(resp, account, _team_lease), account, encoded
@@ -9013,6 +9229,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             detail = getattr(exc, "qoder_detail", "") or ""
         # ---- 错误分类（与原有轮换语义一致） ----
         if isinstance(exc, urllib.error.HTTPError):
+            if _is_image_conversion_timeout(detail):
+                log("image conversion timeout exhausted: no account rotation/cooldown",
+                    level="WARN", tag="image")
+                raise exc
             if exc.code == 429:
                 note_risk("rate", detail)
                 account.note_error("HTTP 429 (model throttled)", model=model,
@@ -11362,6 +11582,8 @@ class Handler(BaseHTTPRequestHandler):
                 "env": env_report(),
                 "quality": quality_snapshot(),
                 **inflight_snapshot(),
+                "image_preflight": qoder_images.status(),
+                "analytics_cache": _USAGE_REPORT_CACHE.status(),
             }
             if self._key_ok():
                 info.update({
@@ -11645,6 +11867,15 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+        if path == "/credits/probe":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            _q = parse_qs(urlparse(self.path).query)
+            return self._handle_credits_probe({
+                "uid": (_q.get("uid") or [""])[0],
+                "realm": (_q.get("realm") or [None])[0],
+                "limit": (_q.get("limit") or [None])[0]})
         if path == "/credits/summary":
             # issue #21：只读积分汇总。**刻意不放进 _is_panel_route** ——
             # 同宿主机轮询方用 API key 即可拉取；实现内绝不触发上游查询
@@ -11719,14 +11950,14 @@ class Handler(BaseHTTPRequestHandler):
             # ?range=day|week|month|all|custom&since=&until=（不传 = 历史全量，
             # 输出与改动前逐字节一致；语义见 range_window）
             req_range, req_since, req_until = range_query(query)
-            return self._json(200, compute_usage_analytics(
+            return self._json(200, cached_usage_report("analytics",
                 range=req_range, since=req_since, until=req_until))
         if path == "/usage/stats":
             # 统计概览（新版数据看板）：KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线一次取回
             if not self._authorized():
                 return
             req_range, req_since, req_until = range_query(query)
-            return self._json(200, compute_usage_stats(
+            return self._json(200, cached_usage_report("stats",
                 range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
@@ -12202,6 +12433,42 @@ class Handler(BaseHTTPRequestHandler):
         return self._unknown_path_error(path)
 
     # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _handle_credits_probe(self, payload):
+        # issue #141：额度端点自动探测（主机 × 路径矩阵）。
+        # 用于确认某个区域到底哪个端点有数据（INTL 的 /api/v2/quota/usage
+        # 经常 404/403）。只读：不改账号，只写探测结果缓存。
+        if not self._panel_ok():
+            return self._error(401, "panel password required",
+                               "invalid_request_error")
+        uid = str((payload or {}).get("uid") or "").strip()
+        realm = (payload or {}).get("realm") or None
+        limit = (payload or {}).get("limit")
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        accs = []
+        if uid and POOL:
+            a = POOL.get(uid)
+            if a is not None:
+                accs = [a]
+        elif POOL:
+            accs = [a for a in POOL.accounts
+                    if (not realm or a.realm == realm)][:3]
+        if not accs:
+            return self._error(404, "no account to probe",
+                               "invalid_request_error")
+        results = []
+        for a in accs:
+            try:
+                res = a.probe_credits_endpoints(ACCOUNTS_DIR, limit=limit)
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)[:160], "rows": []}
+            results.append({"uid": a.uid, "nickname": a.nickname,
+                            "realm": a.realm, **res})
+        return self._json(200, {"ok": any(r.get("ok") for r in results),
+                                "results": results})
+
     def _handle_diag_queue(self, payload):
         # issue #139：上游排队（10605）诊断——一次最小探测，把业务码、
         # retryAfterSeconds、queueCount 与机器身份来源一起回显。
@@ -13327,13 +13594,16 @@ class Handler(BaseHTTPRequestHandler):
                                     iter_inner_sse(cur, holder=holder),
                                     allowed_names=_tool_names_from_payload(chat_req)),
                                 self._sse_write)
-                            # 先探一针（在 _count_src 之前取，**不计入消费数**）：
-                            # stream_responses_events 首帧 response.created 不读内层数据，
-                            # 不先推进一格，错误信封会落在 200 已建流之后。探针取首行时
-                            # 抛 UpstreamStatus 还没写过任何字节 → consumed 仍为 0，
-                            # 首帧 418 信封重试（#64）语义保持；错误在后续行才抛时，
-                            # 计数从那行开始累，重开判定与旧实现一致。
+                            # 先探一针：stream_responses_events 首帧 response.created 不读
+                            # 内层数据，不先推进一格，错误信封会落在 200 已建流之后。
+                            # 探针取首行时若抛 UpstreamStatus → 还没写过任何字节，
+                            # consumed 仍为 0，首帧 418 信封重试（#64）语义保持。
+                            # 探针若**成功取到真实数据帧**，必须计入消费数：否则
+                            # 「先吐一段正文再出错」会被误判成 n==0 而重开重放
+                            # （与上游 _count_src 全包时的行为保持一致）。
                             _first = next(iter(_raw), None)
+                            if _first is not None:
+                                consumed["n"] += 1
                             inner = _count_src(_raw)
                             if _first is not None:
                                 inner = itertools.chain([_first], inner)
@@ -13360,8 +13630,8 @@ class Handler(BaseHTTPRequestHandler):
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             # 控制帧（response.created 等）先于数据，不能算
                             # “已输出”；以上游数据行计数判断能否重开。
-                            if should_retry_envelope(exc, False, attempts, model=model) \
-                                    and consumed.get("n", 0) == 0:
+                            if consumed.get("n", 0) == 0 and should_retry_envelope(
+                                    exc, False, attempts, model=model, usage_ctx=usage_ctx):
                                 attempts += 1
                                 log("responses in-stream envelope status %s "
                                     "(try %d/%d), reopening upstream"
@@ -13370,6 +13640,8 @@ class Handler(BaseHTTPRequestHandler):
                                        _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
+                                if _is_image_conversion_timeout(exc.detail):
+                                    cur.close()  # Release team concurrency before reopening.
                                 try:
                                     # 必须用转换后的 chat 请求体重开：原始
                                     # Responses 体的会话在 input 字段里，而
@@ -13377,7 +13649,9 @@ class Handler(BaseHTTPRequestHandler):
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
                                         target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                        usage_ctx=usage_ctx,
+                                        **({"only_account": account} if
+                                           _is_image_conversion_timeout(exc.detail) else {}))
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -13677,6 +13951,11 @@ class Handler(BaseHTTPRequestHandler):
             log("local web tools %s (panel)" % ("enabled" if enabled else "disabled"),
                 tag="webtools")
             return self._json(200, {"ok": True, "web_tools": web_tools_enabled()})
+        if path == "/credits/probe":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_credits_probe(payload)
         if path == "/settings/save":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
@@ -13735,7 +14014,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
                 "/v1/messages", "/v1/messages/count_tokens",
                 # issue #123：签到诊断（只读，面板鉴权）
-                "/diag/checkin", "/diag/queue"):
+                "/diag/checkin", "/diag/queue", "/credits/probe"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -13938,7 +14217,8 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
-                            if should_retry_envelope(exc, emitted, attempts, model=model):
+                            if should_retry_envelope(exc, emitted, attempts,
+                                                     model=model, usage_ctx=usage_ctx):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
                                     "model '%s' (try %d/%d), reopening upstream"
@@ -13947,11 +14227,15 @@ class Handler(BaseHTTPRequestHandler):
                                        _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
+                                if _is_image_conversion_timeout(exc.detail):
+                                    cur.close()  # Release team concurrency before reopening.
                                 try:
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,
                                         target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                        usage_ctx=usage_ctx,
+                                        **({"only_account": account} if
+                                           _is_image_conversion_timeout(exc.detail) else {}))
                                 except Exception as rex:
                                     log("chat reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -14105,6 +14389,47 @@ class Handler(BaseHTTPRequestHandler):
 
 def acc_realm(account):
     return account.realm if account else CURRENT_REALM
+
+
+def _keepalive_send(entry):
+    """保温一次：同 payload、同账号、同 session_id，stream=False + max_tokens=1。
+
+    由 qoder_keepalive 后台线程在会话闲置超过 QD_CACHE_KEEPALIVE_INTERVAL
+    后调用（默认 240s，小于上游 ~5min TTL）。session_key 传登记时的最终
+    session_id，open_upstream 会把它当作窗口键原样回填 —— 与原请求同一个
+    会话身份；前缀逐字节相同 → 命中上游缓存并续期，消耗 ≈ 一次缓存读。
+    记账 key_id=keepalive，面板可见可审计。失败抛异常由 tick 淘汰该会话。
+    """
+    acc = POOL.get(entry["account_uid"]) if POOL else None
+    if acc is None:
+        raise LookupError("keepalive: account %s unavailable"
+                          % (entry["account_uid"] or "")[:8])
+    payload = dict(entry["payload"])
+    payload["stream"] = False
+    payload["max_tokens"] = 1
+    usage_ctx = {}
+    resp, used, _enc = open_upstream(payload, session_key=entry["session_id"],
+                                     target_realm=entry["realm"] or None,
+                                     only_account=acc, usage_ctx=usage_ctx)
+    try:
+        obj = aggregate_stream(resp, entry["model"], holder={"usage": None})
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    usage = obj.get("usage") or {}
+    if usage:
+        try:
+            record_usage(entry["model"], usage, stream=False,
+                         account=(used.uid if used else None)
+                         or entry["account_uid"],
+                         key_id="keepalive",
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
+        except Exception:
+            pass
+    return usage
 
 
 def main():
@@ -14452,6 +14777,14 @@ def main():
     _warm = threading.Thread(target=_warm_models, name="qd-models-warm",
                              daemon=True)
     _warm.start()
+    # 缓存保温线程（可选，默认关闭）：会话闲置超过上游缓存 TTL 前用同
+    # payload 发一个 max_tokens=1 的最小请求续期，避免闲置后首发全量重写。
+    if qoder_keepalive.enabled():
+        qoder_keepalive.configure(_keepalive_send)
+        qoder_keepalive.start_loop()
+        log("cache keepalive on: interval=%ss max_age=%ss max_convs=%s"
+            % (qoder_keepalive.interval(), qoder_keepalive.max_age(),
+               qoder_keepalive.max_convs()), tag="keepalive")
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()

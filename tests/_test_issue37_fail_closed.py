@@ -186,7 +186,6 @@ check("#37 抛出的异常 detail 仍是固定串（不把实际参数带出去�
 # ---------------------------------------------------------------------------
 BAD_FORMS = [
     ("内层真实 LF", '{"body": "line1\nline2"}'),
-    ("未转义引号", '{"path": "a"b.py"}'),
     ("内层截断（缺右花括号）", '{"path": "a.py"'),
     ("尾部多余文本", '{"a": 1} trailing'),
     ("非法反斜杠转义", '{"a": \\q}'),
@@ -204,6 +203,14 @@ for _label, _args in BAD_FORMS:
               _r["raised"], {"finish": _r["finish"], "marker": _r["marker"],
                              "tool_calls": _r["tool_calls"]})
 
+
+# issue：DSH 现场（工具参数内层引号未转义）现在改为**修复后还原**，
+# 不再整轮 502 —— 修复不可行时才 fail-closed（下方 BAD_FORMS 其余形态）。
+_quote_text = bad_echo('{"path": "a"b.py"}')
+_quote_run = run_stream(_quote_text, None)
+check("#37 未转义引号：修复后还原成真实调用（不再 raise）",
+      not _quote_run["raised"] and _quote_run["tool_calls"] == 1,
+      {"raised": _quote_run["raised"], "tc": _quote_run["tool_calls"]})
 for _label, _args in BAD_FORMS:
     _runs = [_bad_runs[(_label, s)] for s in CHUNKINGS]
     check("#37 抛出前无一帧正常收尾（stop/tool_calls）：%s" % _label,

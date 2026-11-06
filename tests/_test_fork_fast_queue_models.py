@@ -146,7 +146,8 @@ try:
     check("已吐字节（emitted）绝不重试——计费安全优先",
           P.should_retry_envelope(_e_df, True, 0, model="DeepSeek-Flash") is False)
     check("三个流内调用点均传 model 上下文",
-          "should_retry_envelope(exc, False, attempt, model=model)" in _src)
+          _src.count("model=model") >= 3
+          and _src.count("usage_ctx=usage_ctx") >= 3)
     check("信封层 fast 拒绝打 WARN 日志（可观测）",
           "envelope queue on model" in _src and "fast reject per" in _src)
 
@@ -187,7 +188,8 @@ try:
     check("非流式 aggregate 调用方补齐 except RateLimited（防掉 502）",
           _src16.count("except RateLimited as exc:") >= 8,
           _src16.count("except RateLimited as exc:"))
-    check("版本号递增 1.7.28", 'VERSION = "1.7.28"' in _src16)
+    check("版本号随 fork 递增（不复用上游 tag）",
+          'VERSION = "1.8.1"' in _src16)
 finally:
     _restore()
 

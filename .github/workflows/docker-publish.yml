@@ -69,7 +69,7 @@ jobs:
           # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
           docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
           # 2) 关键模块可导入
-          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic; print('imports ok')"
+          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic, qoder_cache, qoder_images; assert qoder_images.status()['codec_available']; print('imports and image codec ok')"
           # 3) 进程能启动并响应探活
           docker run -d --name smoke -p 18790:8790 "$IMG"
           ok=0

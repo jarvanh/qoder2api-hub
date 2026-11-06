@@ -25,3 +25,4 @@ umid/
 .env
 .venv/
 _tmp_*
+.tmp_*

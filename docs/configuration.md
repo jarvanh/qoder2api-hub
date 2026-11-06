@@ -148,6 +148,21 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_AFFINITY_DEBUG` | `0` | 打印会话亲和的调试日志 |
 | `QD_INTL_GATEWAY` | `https://api3.qoder.sh` | 国际版推理主机。连接失败时依次切换到 `api2` / `api1` |
 
+### 会话缓存保温（可选）
+
+上游对 prompt 前缀的缓存有闲置过期行为（实测 ~5 分钟、命中续期，见配套 issue）。会话闲置超过该窗口后，下一发请求全量重写：面板表现 0% 命中、全价积分。保温线程会在会话闲置到阈值时，用内存里登记的上一请求 payload 原样重发一次 `stream=false, max_tokens=1` 的最小请求——前缀逐字节相同即命中缓存并续期，成本 ≈ 一次缓存读（124k ≈ 10.7 credits），远低于全量重写（≈137）。
+
+默认关闭。开启前请先了解两点：① 保温请求是真实的上游调用，持续闲置会持续消耗小额积分；② 上游对「同会话高频重复请求」的风控容忍度未知，建议从小间隔起步，观察 `/health` 的 `risk` 遥测（queue / rate / rejected）再调整。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `QD_CACHE_KEEPALIVE` | `0` | 总开关，`1` 开启（不开不存任何数据，行为与改动前一致） |
+| `QD_CACHE_KEEPALIVE_INTERVAL` | `240` | 会话闲置多少秒后保温一次，须小于上游 TTL（~5 分钟） |
+| `QD_CACHE_KEEPALIVE_MAX_AGE` | `1800` | 会话闲置超过该秒数后不再保温（LRU 淘汰） |
+| `QD_CACHE_KEEPALIVE_MAX_CONVS` | `2` | 内存里最多登记几个会话的 payload，超出 LRU 淘汰 |
+
+保温请求照常记账，`key_id=keepalive`，面板「最近请求」里可见、可审计；只存 payload 本身，不落盘。
+
 ### 上游容错
 
 | 变量 | 默认值 | 说明 |
@@ -256,6 +271,31 @@ export QD_STRUCTURED_TOOL_HISTORY_REALMS="cn,intl"
 ```
 
 启动脚本里那一行是**注释状态**的示例 —— 是否打开由你决定，网关不替你改默认值。
+
+## 性能与看板缓存（v1.8.0）
+
+统计概览与详细统计使用 10 秒固定 TTL 的有界结果缓存；日志发生追加、截断或替换时立即失效，相同冷查询并发合并。最近请求的行数计数按文件指纹复用，推理不走此缓存。`/health.analytics_cache` 暴露命中/计算/合并等待数量，不包含凭据。
+
+日用量缓存不再因持续轮询延长过期时间。基准与适用边界见 [v1.8.0 性能说明](performance-v1.8.0.md)。
+
+## 图片预处理与转换超时（`QD_IMAGE_TRANSCODE`）
+
+`Image conversion timeout` 表示 provider 的图片转换阶段超时，与模型首字超时、网关 Key 失效不同。网关不会把图片删成文字来伪装成功。
+
+- Chat / Responses / Anthropic 桥接后，在统一出站构造中处理内联图片。
+- `QD_IMAGE_TRANSCODE=auto`（默认）：大于等于 256 KiB 的 PNG/BMP/TIFF 优先归一；不缩分辨率，不移除任何图片。非透明图片可改为 quality=95、4:4:4 JPEG，且必须比原图至少小 20% 才替换；透明图保留无损 PNG。需要逐像素输入时设 `QD_IMAGE_TRANSCODE=off`。
+- 小图、JPEG、动画、带 EXIF/ICC/色彩或 DPI 元数据的图、16 位图、解码失败的图片原样保留；远程 URL 不下载、不改写。
+- `/health` 的 `image_preflight.codec_available` 可确认当前运行解释器是否具备编解码组件；`enabled` 表示预处理是否开启。
+- 归一结果只放内存 LRU（最多 32 条、32 MiB），相同图片跨轮与重试使用相同字节，不落盘，不把 base64/URL/凭据写进日志。
+- 官方 Docker 镜像包含 Pillow；本机部署可在**运行网关的同一 Python 解释器**安装：
+
+```bash
+python -m pip install "Pillow>=11.3,<14"
+```
+
+未安装 Pillow 时核心代理仍正常运行，图片原样透传；有大图时日志以 `codec_missing` 提醒。安装后重启网关。
+
+转换超时仅在尚未输出时允许一次自动重试（受现有重试开关限制）；耗尽后保留 HTTP 504，返回 `upstream_image_conversion_timeout`，保留上游 request_id，不冷却账号、不解绑会话、不对全池重复转换。该修复减少转换压力与重试放大，不承诺消除上游服务本身的间歇超时。
 
 ## 工具协议残片的收尾策略（`QD_TOOL_ECHO_MODE`）
 

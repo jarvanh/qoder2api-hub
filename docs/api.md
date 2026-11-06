@@ -22,6 +22,31 @@
 - 指定区域：`X-Realm: cn|intl` 请求头，或 `?realm=` 查询参数
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
 
+## 额度构成与端点自动探测
+
+不同区域的额度接口不是一套：CN 走 `openapi.qoder.com.cn/api/v2/quota/usage`；INTL 上这个路径常常 404/403，需要用别的端点。网关内置**候选矩阵**（主机 × 路径），首次取额度失败时自动探测并把命中的组合记到 `accounts/credits-source.json`，之后优先使用。
+
+```bash
+curl -s -X POST http://127.0.0.1:8790/credits/probe \\
+  -H 'Content-Type: application/json' -H "X-Panel-Token: $TOKEN" \\
+  -d '{"limit": 3}'
+```
+
+返回每个候选的 `status` 与命中的 `fields`；命中的那个会被记住。面板「用量洞察 → 额度构成」也有「自动探测」按钮。
+
+### 构成口径
+
+面板把额度拆成四类（按上游返回的容器名归一，认不出就不显示、不臆造）：
+
+| 列 | 来源字段 |
+|---|---|
+| 套餐内 | `userQuota` / `planQuota` / `subscriptionQuota` |
+| 资源包 | `addOnQuota` / `resources` / `packages[]` |
+| SOTA | `sotaCredits` / `sota` / `sotaQuota` |
+| 共享池 | `orgResourcePackage` / `sharedQuota` / `teamQuota`（组织级，汇总去重） |
+
+每类都带 `remain` / `used` / `size`，有 `expiresAt` 就显示「最近到期」。
+
 ## 排队诊断（`POST /diag/queue`，面板鉴权）
 
 上游对**模型**做并发排队（`10605` / `isQueued`）时，网关会按 `retryAfterSeconds` 等待重试，预算耗尽后返回 429 + `Retry-After`。这类错误与 Key/账号凭证无关，但客户端常常归类成「鉴权失败」（#137 之后文案已去敏并附英文原因）。
