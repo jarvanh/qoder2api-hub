@@ -69,7 +69,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.8.1"  # fork 维护版：上游 v1.8.0 已占用，进位 1.8.1
+VERSION = "1.8.2"  # fork 维护版：上游 v1.8.0 已占用，进位 1.8.1
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -7685,8 +7685,22 @@ def inflight_end():
 
 
 def inflight_snapshot():
+    # 并发上限：团队/企业号各自有 QD_TEAM_MAX_CONCURRENCY 闸门（默认 1），
+    # 普通号不受该闸限制。取所有团队号上限之和作为「有上限的那部分」容量；
+    # 若一个团队号都没有，返回 None（不编造上限）。
+    try:
+        team_cap = sum(_team_max_concurrency() for _a in (POOL.accounts if POOL else [])
+                       if _is_team_account(_a))
+    except Exception:
+        team_cap = None
     with _INFLIGHT_LOCK:
-        return {"inflight": _INFLIGHT["cur"], "inflight_peak": _INFLIGHT["peak"]}
+        return {
+            "inflight": _INFLIGHT["cur"],
+            "inflight_peak": _INFLIGHT["peak"],
+            "max_concurrency": team_cap if team_cap else None,
+            "max_per_team_account": _team_max_concurrency() if team_cap else None,
+            "max_note": "仅团队/企业号有并发闸，普通号不限" if team_cap else "无团队号并发闸",
+        }
 
 
 def note_risk(kind, detail=""):
