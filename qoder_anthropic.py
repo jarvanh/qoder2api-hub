@@ -63,12 +63,17 @@ def _new_id(prefix):
     return prefix + uuid.uuid4().hex[:24]
 
 
-def thinking_mode():
+def thinking_mode(override=None):
     """QD_ANTHROPIC_THINKING：off（默认，不发 thinking block）/ empty（发空签名）。
 
-    设计文档 §5：我们生成不了 Anthropic 要求的 signature，默认降级为「不暴露思考」。
+    设计文档 §5 及 issue #146：我们生成不了 Anthropic 要求的 signature，默认降级为「不暴露思考」。
+    可按请求 key_entry / 面板全局设置覆盖。
     伪造签名（raw）**不提供**。
     """
+    if override:
+        cand = str(override).strip().lower()
+        if cand in ("empty", "off"):
+            return cand
     raw = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
     return raw if raw in ("empty",) else "off"
 
@@ -523,7 +528,7 @@ def _stop_reason(finish_reason):
     return _STOP_REASON.get(str(finish_reason or "stop"), "end_turn")
 
 
-def chat_to_messages(chat_obj, model=None):
+def chat_to_messages(chat_obj, model=None, thinking_mode_override=None):
     """chat.completion -> Anthropic message（非流式出站，§3.2）。"""
     chat_obj = chat_obj if isinstance(chat_obj, dict) else {}
     choice = (chat_obj.get("choices") or [{}])[0]
@@ -537,7 +542,7 @@ def chat_to_messages(chat_obj, model=None):
                        if isinstance(p, dict))
     if isinstance(text, str) and text:
         content.append({"type": "text", "text": text})
-    if thinking_mode() == "empty" and msg.get("reasoning_content"):
+    if thinking_mode(thinking_mode_override) == "empty" and msg.get("reasoning_content"):
         content.append({"type": "thinking",
                         "thinking": str(msg["reasoning_content"]),
                         "signature": ""})
@@ -576,7 +581,7 @@ def chat_to_messages(chat_obj, model=None):
     }
 
 
-def stream_anthropic_events(inner_lines, model="", holder=None):
+def stream_anthropic_events(inner_lines, model="", holder=None, thinking_mode_override=None):
     """把**已清洗**的 chat chunk 行翻译成 Anthropic SSE 事件（§4.3）。
 
     inner_lines 的契约：`data: {chat.chunk}` 行（bytes 或 str），**必须来自
@@ -598,7 +603,7 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
     dropped_tools = []      # 流结束仍无 name 的块（丢弃并记日志）
     open_blocks = []
     finish = "stop"
-    mode = thinking_mode()
+    mode = thinking_mode(thinking_mode_override)
 
     def ev(etype, obj):
         body = dict(obj)

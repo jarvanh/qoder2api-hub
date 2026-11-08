@@ -77,7 +77,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 
 | 差异 | 说明 |
 |---|---|
-| 没有 thinking block | Anthropic 规范要求 thinking block 带服务端签名，网关无法生成，因此默认不输出。客户端能看到正文和工具调用，看不到思考过程 |
+| 没有 thinking block | Anthropic 规范要求 thinking block 带服务端签名，网关无法生成，因此默认不输出。可在无签名校验的下游链路开启 `empty` 模式输出空签名 thinking block（详见 `configuration.md`，支持按 Key 或全局开启） |
 | 历史中的 thinking block 会被丢弃 | 网关无法校验它的签名，所以不会转发给上游 |
 | 流式请求出错不会重试 | `message_start` 已经发出后不能重新开始，网关会发送 `event: error` 结束这次请求。非流式请求仍然正常重试 |
 | `count_tokens` 是本地估算 | 不会请求上游 |

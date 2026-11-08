@@ -204,7 +204,21 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `QD_ANTHROPIC_MSG_SYSTEM` | `inline` | `messages` 里的 system 消息如何处理：`inline` 原位改为 user 消息（保持缓存前缀稳定）；`merge` 合并到顶层 system（旧行为）；`drop` 丢弃 |
-| `QD_ANTHROPIC_THINKING` | `off` | 设为 `empty` 时输出带空 `signature` 的 thinking block（实验性） |
+| `QD_ANTHROPIC_THINKING` | `off` | 设为 `empty` 时输出带空 `signature` 的 thinking block（见下方安全判定标准）；支持在面板设置或按 API Key 单独覆盖 |
+
+#### QD_ANTHROPIC_THINKING 安全启用判定标准
+
+能否安全启用 `empty` 取决于**下游链路是否存在签名校验方**：
+- **直连 Anthropic 官方 API / 会校验 signature 的网关**：不可用，空签名会被直接拒绝。
+- **第三方 OpenAI 兼容反代（本项目的常见部署形态，如网关 → Qoder 上游 Qwen/Kimi/DeepSeek）**：**可以安全启用**。原因：
+  1. 上游返回的是 OpenAI 格式的 `reasoning_content`，无 signature 概念；
+  2. 网关入站处理消息时丢弃历史 thinking block（`elif bt == "thinking": continue`），客户端回传的空签名不会流入上游；
+  3. 中转层（如 NewAPI）仅转发 chunk 字节流，不校验 signature。
+- **粒度覆盖优先级**：
+  1. **按 API Key 覆盖**：在 API Key 配置中设置 `"anthropic_thinking": "empty" | "off"`；
+  2. **面板全局设置**：在设置页面或 API 中切换 `anthropic_thinking`；
+  3. **进程级环境变量**：`QD_ANTHROPIC_THINKING=empty`（作为默认兜底）；
+  4. 缺省默认为 `off`。
 
 ### 账号与设备身份
 
