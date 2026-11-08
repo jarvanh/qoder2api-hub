@@ -79,12 +79,15 @@ frames = [
     chunk({"tool_calls": [{"index": 0, "type": "function",
                            "function": {"arguments": '{"a":1}'}}]}, "tool_calls"),
 ]
-out = run(frames)
-check("没有任何带 name 的 tool_calls 漏出",
-      not [t for t in tcs(out) if (t.get("function") or {}).get("name")])
-finals = [ch.get("finish_reason") for c in out for ch in c.get("choices") or []
-          if ch.get("finish_reason")]
-check("finish_reason 降级为 stop", finals and finals[-1] == "stop", finals)
+out = []
+error = None
+try:
+    for raw in P.recover_leaked_tool_calls(iter(frames)):
+        out.append(raw)
+except P.EmptyToolEcho as exc:
+    error = exc
+check("无名调用不得伪装为正常 stop", isinstance(error, P.EmptyToolEcho))
+check("无名调用错误标明 missing_tool_name", "missing_tool_name" in str(getattr(error, "detail", "")))
 
 print("[#124] name 后到：合并成一帧再发（不重复、不粘连）")
 frames = [

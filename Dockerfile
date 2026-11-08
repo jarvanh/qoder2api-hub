@@ -46,7 +46,7 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_scheduler.py qoder_settings.py qoder_sign.py qoder_tasks.py \
      qoder_anthropic.py qoder_agents.py qoder_updater.py \
      qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_session_cache.py \
-     qoder_keepalive.py qoder_images.py qoder_cache.py \
+     qoder_keepalive.py qoder_images.py qoder_cache.py qoder_admin.py qoder_routing.py qoder_logpaths.py \
      dashboard.html baseprompt.json ./
 
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
@@ -64,10 +64,10 @@ COPY _test_qoder.py _diag_gateway.py _diag_campaign.py _verify_models.py \
      _refresh_catalog.py _install_umid.py ./
 
 # Create data directories
-RUN mkdir -p /app/accounts /app/usage
+RUN mkdir -p /app/accounts /app/usage /app/logs/usage
 
 # Volume persistence for credentials and usage logs
-VOLUME ["/app/accounts", "/app/usage"]
+VOLUME ["/app/accounts", "/app/usage", "/app/logs"]
 
 EXPOSE 8790
 

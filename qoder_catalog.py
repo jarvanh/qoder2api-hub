@@ -3,7 +3,7 @@
 数据来源（完全跟官方走）：本机官方客户端模型目录缓存解密快照
   国际版  ~/.qoder/.models/<uid>/catalog-v6   （QMC v1: HKDF-SHA256(uid)+AES-256-GCM）
   国内版  ~/.qoder-cn/.models/<uid>/catalog-v6
-取 chat 场景、**逐字段原样保留**（含 promotion 峰谷价、context_config 多窗口、
+取 chat 与 app-only 对话条目、**逐字段原样保留**（含 promotion 峰谷价、context_config 多窗口、
 thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 
 快照存放：运行时优先读取同目录的 qoder_catalog_intl.json / qoder_catalog_cn.json
@@ -881,6 +881,54 @@ _INTL_JSON = r'''
         "token_count": 400000
       }
     }
+  },
+  {
+    "key": "lmodel",
+    "status": "idle",
+    "format": "openai",
+    "source": "system",
+    "enable": true,
+    "icon": "QoderQoduckFill",
+    "display_name": "QoDuck",
+    "is_vl": true,
+    "is_reasoning": true,
+    "is_default": false,
+    "is_new": true,
+    "price_factor": 0.0,
+    "original_price_factor": 0.5,
+    "max_input_tokens": 180000,
+    "is_sensitive": true,
+    "tags": [
+      "free"
+    ],
+    "is_free": true,
+    "is_lite_plan": true,
+    "is_editable": true,
+    "context_config": {
+      "1M": {
+        "token_count": 1000000
+      },
+      "200K": {
+        "token_count": 200000,
+        "is_default": true
+      },
+      "400K": {
+        "token_count": 400000
+      }
+    },
+    "thinking_config": {
+      "disabled": {},
+      "enabled": {
+        "efforts": {
+          "xhigh": {},
+          "high": {
+            "is_default": true
+          },
+          "low": {}
+        },
+        "is_default": true
+      }
+    }
   }
 ]
 '''
@@ -1492,6 +1540,54 @@ _CN_JSON = r'''
         "is_default": true
       }
     }
+  },
+  {
+    "key": "lmodel",
+    "status": "idle",
+    "format": "openai",
+    "source": "system",
+    "enable": true,
+    "icon": "QoderQoduckFill",
+    "display_name": "QoDuck",
+    "is_vl": true,
+    "is_reasoning": true,
+    "is_default": false,
+    "is_new": true,
+    "price_factor": 0.0,
+    "original_price_factor": 0.5,
+    "max_input_tokens": 180000,
+    "is_sensitive": true,
+    "tags": [
+      "free"
+    ],
+    "is_free": true,
+    "is_lite_plan": true,
+    "is_editable": true,
+    "context_config": {
+      "1M": {
+        "token_count": 1000000
+      },
+      "200K": {
+        "token_count": 200000,
+        "is_default": true
+      },
+      "400K": {
+        "token_count": 400000
+      }
+    },
+    "thinking_config": {
+      "disabled": {},
+      "enabled": {
+        "efforts": {
+          "xhigh": {},
+          "high": {
+            "is_default": true
+          },
+          "low": {}
+        },
+        "is_default": true
+      }
+    }
   }
 ]
 '''
@@ -1515,6 +1611,31 @@ _SNAPSHOT_FILENAMES = {"intl": "qoder_catalog_intl.json",
                        "cn": "qoder_catalog_cn.json"}
 _SNAPSHOT_SOURCES = {}          # filename -> SNAPSHOT_SOURCE_*
 _SNAPSHOT_DEGRADE_REASONS = {}  # filename -> SNAPSHOT_DEGRADE_*
+
+
+def dialogue_models(payload):
+    """Official conversational catalog: chat first, app-only additions second.
+
+    Qoder may launch a conversational model in its desktop app scene before
+    chat. Never union inline/assistant/quest/BYOK scenes or overwrite chat
+    permissions/prices with app metadata. Return copies, preserve all fields.
+    """
+    if not isinstance(payload, dict):
+        return []
+    rows, seen = [], set()
+    for scene in ("chat", "app"):
+        candidates = payload.get(scene)
+        if not isinstance(candidates, list):
+            continue
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key")
+            if not isinstance(key, str) or not key.strip() or key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(entry))
+    return rows
 
 
 def _load_snapshot(filename, embedded):

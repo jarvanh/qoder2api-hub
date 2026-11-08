@@ -145,7 +145,7 @@ st, names, txt, _ = run(PREFIX21)
 check("纯 marker -> EmptyToolEcho/marker_only",
       st == "EmptyToolEcho" and names == [], (st, names))
 
-print("\n[138-8] 结构化历史：默认不改变行为，可显式放开 intl")
+print("\n[138-8] 结构化历史：默认支持 intl，可显式回退 cn")
 _msgs = [
     {"role": "assistant", "content": "",
      "tool_calls": [{"id": "t1", "type": "function",
@@ -158,10 +158,10 @@ check("默认：cn + dfmodel 启用",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="cn",
                                        messages=_msgs) is True)
-check("默认：intl 不启用（保持旧行为）",
+check("默认：intl 启用，避免复述历史信封",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="intl",
-                                       messages=_msgs) is False)
+                                       messages=_msgs) is True)
 os.environ["QD_STRUCTURED_TOOL_HISTORY_REALMS"] = "cn,intl"
 check("开关放开：intl + dfmodel 启用",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
@@ -178,7 +178,12 @@ os.environ.pop("QD_STRUCTURED_TOOL_HISTORY_REALMS", None)
 check("移除开关后回到默认",
       P.structured_tool_history_enabled(model="DeepSeek-Flash",
                                        model_key="dfmodel", realm="intl",
+                                       messages=_msgs) is True)
+os.environ["QD_STRUCTURED_TOOL_HISTORY_REALMS"] = "cn"
+check("显式 cn 仍可回退国际区旧行为",
+      P.structured_tool_history_enabled(model="GLM-5.3", realm="intl",
                                        messages=_msgs) is False)
+os.environ.pop("QD_STRUCTURED_TOOL_HISTORY_REALMS", None)
 
 print("\n[138-9] 既有三种协议形态不受影响")
 _array = ('\n\n' + MARKER + '\n'

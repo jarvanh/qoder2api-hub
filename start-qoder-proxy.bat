@@ -16,8 +16,11 @@ if "%PORT%"=="" set "PORT=8790"
 set "HERE=%~dp0"
 set "SCRIPT=%HERE%qoder_proxy.py"
 set "PIDFILE=%HERE%qoder-proxy.pid"
-set "LOGFILE=%HERE%qoder-proxy.log"
-set "ERRFILE=%HERE%qoder-proxy.err.log"
+if not defined QD_LOG_DIR set "QD_LOG_DIR=%HERE%logs"
+if not exist "%QD_LOG_DIR%" mkdir "%QD_LOG_DIR%"
+set "LOGFILE=%QD_LOG_DIR%\gateway.log"
+set "ERRFILE=%QD_LOG_DIR%\gateway.err.log"
+set "QD_LOG_REDIRECTED=1"
 
 rem issue #137 follow-up: enable structured tool history on INTL as well.
 rem Without it the gateway rewrites every tool call into assistant text

@@ -20,7 +20,7 @@ check("识别 code 504 的整段详情",
       P._is_first_token_timeout('{"code":"504","message":"First Token Timeout"}') is True)
 check("普通错误不误判", P._is_first_token_timeout("boom") is False)
 check("空值不误判", P._is_first_token_timeout(None) is False)
-_i = _src.index("if _is_first_token_timeout(detail):")
+_i = _src.index("if _is_first_token_timeout(detail):", _src.index("def open_upstream("))
 _seg = _src[_i:_i + 500]
 check("命中后 break（交给外层换号）", "break" in _seg)
 check("命中后不再走同账号退避重试",

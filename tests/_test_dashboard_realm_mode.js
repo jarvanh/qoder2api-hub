@@ -125,7 +125,8 @@ check('缺 realm（旧行）→ 「—」且不猜区域', /—/.test(rbadge('')
 check('表头有「区域」列且排在档位之后（与审计两列相邻）', /档位<\/th><th style="text-align:center;width:72px">区域<\/th>/.test(html));
 check('最近请求表：表头列数 == 行内单元格列数（加了区域列后仍然对齐）', (() => {
   const lines = html.split('\n');
-  const hIdx = lines.findIndex(l => l.includes('<th>时间</th>'));
+  const recentStart = lines.findIndex(l => l.includes('function updateUI('));
+  const hIdx = lines.findIndex((l,i) => i>recentStart && l.includes('<th>时间</th>') && l.includes('区域'));
   const eIdx = lines.findIndex((l, i) => i > hIdx && l.includes('</tbody></table>'));
   const blk = lines.slice(hIdx, eIdx + 1).join('\n');
   const th = (blk.match(/<th[ >]/g) || []).length, td = (blk.match(/\+ '<td/g) || []).length;

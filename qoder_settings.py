@@ -217,6 +217,24 @@ def set_tool_echo_mode(accounts_dir, mode):
     save(accounts_dir, data)
     return tool_echo_mode(accounts_dir)
 
+def _clean_account_selectors(value, allow_empty=False):
+    """Keep selectors deterministic; malformed restrictions must not fail open."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("account selectors must be lists")
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("account selectors must contain strings")
+        item = item.strip()
+        if (item or allow_empty) and item not in out:
+            out.append(item)
+    return out
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -237,6 +255,12 @@ def _clean_key_entry(entry):
         # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
         # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
         "models": _clean_model_patterns(entry.get("models")),
+        # Empty selectors retain legacy unrestricted keys. A named group that
+        # no longer exists remains configured, so scope resolution denies all.
+        "account_ids": _clean_account_selectors(entry.get("account_ids")),
+        "account_groups": _clean_account_selectors(
+            entry.get("account_groups") if "account_groups" in entry
+            else ([entry["group"]] if "group" in entry else []), allow_empty=True),
         # issue #69：Key 备注（纯展示，不参与鉴权；同样必须显式保留）。
         "note": str(entry.get("note") or "").strip()[:120],
     }

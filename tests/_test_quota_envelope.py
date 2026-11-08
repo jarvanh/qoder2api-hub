@@ -112,7 +112,7 @@ check("#108 多号池下 112 同样冷却 1800s", 1790 <= wait_of(_M) <= 1810, w
 
 # ---------------------------------------------------------------- 客户端文案
 _msg, _kind = P.friendly_upstream_error(403, D112)
-check("#108 客户端文案点明额度耗尽", "额度耗尽" in _msg and _kind == "quota_exhausted",
+check("#108 客户端文案区分额度/套餐拒绝与总余额", "不等于账号总余额为零" in _msg and _kind == "quota_exhausted",
       (_kind, _msg[:60]))
 check("#108 排队文案不被额度文案抢走",
       P.friendly_upstream_error(403, D10605)[1] == "upstream_queued",

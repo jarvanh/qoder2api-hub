@@ -83,7 +83,7 @@ _out3, _err3 = _run([
     _frame({"tool_calls": [_tc(args='{"a": 1')]}),
     _frame({}, "tool_calls"),
 ])
-check("#112 有 finish_reason 时不越权改写语义（交给 #37 路径）", _err3 is None,
+check("#112 即使上游显式结束，无名或截断调用也明确失败", isinstance(_err3, P.EmptyToolEcho),
       type(_err3).__name__ if _err3 else None)
 
 # ------------------------------------- 路径 2：#16 超限放行绕过 #72（marker-only 空壳）

@@ -70,7 +70,7 @@ curl http://127.0.0.1:8790/v1/chat/completions \
   -d '{"model": "Qwen3.8-Flash", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配置」页一键写入配置，写入前会自动备份，随时可还原。详见[客户端接入](docs/clients.md)。
+看板「智能体配置」覆盖 **31 个热门客户端 / Harness**，其中 **13 类支持自动配置与还原**：Claude Code、Codex CLI、OpenCode、DSH、Crush、Aider、Continue、Pi、Factory Droid、GitHub Copilot CLI、OpenHands CLI、Kilo CLI、Mistral Vibe。其他客户端按实际能力提供安装检测和手动接入指引；API 示例和客户端模板只使用 `YOUR_API_KEY`。详见[客户端接入](docs/clients.md)。
 
 ## 文档
 

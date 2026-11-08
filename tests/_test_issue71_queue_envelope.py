@@ -57,12 +57,16 @@ check("#71 日志用 min(attempt, budget)/budget 显示（不再出现 4/3）",
 
 # ---------------------------------------------------------------- 跨区
 _old_ready = P._realm_ready_total
+_old_pool = P.POOL
+import types
+P.POOL = types.SimpleNamespace(count_ready=lambda realm, model=None: 2 if realm == "intl" else 0)
 P._realm_ready_total = lambda realm, model=None: 2 if realm == "intl" else 0
 try:
     _alt = P._alt_realm_ready("cn", "DeepSeek-Flash")
     _alt2 = P._alt_realm_ready("intl", "DeepSeek-Flash")
 finally:
     P._realm_ready_total = _old_ready
+    P.POOL = _old_pool
 check("#71 cn 排队时能找到 intl 作为跨区目标", _alt == "intl", _alt)
 check("#71 另一区无就绪账号时不跨区", _alt2 == "", _alt2)
 check("#71 两条流式路径都有跨区 failover",

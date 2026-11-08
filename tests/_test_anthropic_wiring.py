@@ -176,8 +176,13 @@ def _run_new_entry(frames, allowed):
             P.iter_inner_sse(_Resp(frames), holder=holder),
             allowed_names=allowed),
         lambda b: None)
-    return "".join(f.decode("utf-8")
-                   for f in AN.stream_anthropic_events(inner, "m", holder))
+    out = []
+    try:
+        for frame in AN.stream_anthropic_events(inner, "m", holder):
+            out.append(frame.decode("utf-8"))
+    except P.EmptyToolEcho as exc:
+        out.append(AN.anthropic_error_frame(exc.detail).decode("utf-8"))
+    return "".join(out)
 
 
 _M = P.LEAK_MARKER
@@ -198,8 +203,9 @@ def _split_frames(text, cuts=2):
 
 
 _out9 = _run_new_entry(_split_frames(_TRUNC9), {"terminal"})
-check("泄漏回归 · issue#9（截断的 marker+JSON 回声）-> 事件流里无标记",
-      _M not in _out9 and "工具结果" not in _out9)
+check("泄漏回归 · 截断回声不能静默结束：发 error，且无标记与成功收尾",
+      _M not in _out9 and "工具结果" not in _out9
+      and "event: error" in _out9 and "event: message_stop" not in _out9)
 _out11 = _run_new_entry(_split_frames(_TR11), {"terminal"})
 check("泄漏回归 · issue#11（[工具结果] 回声块）-> 事件流里无标记",
       "[工具结果" not in _out11 and _M not in _out11)

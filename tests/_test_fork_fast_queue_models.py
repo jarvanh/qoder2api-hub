@@ -188,8 +188,9 @@ try:
     check("非流式 aggregate 调用方补齐 except RateLimited（防掉 502）",
           _src16.count("except RateLimited as exc:") >= 8,
           _src16.count("except RateLimited as exc:"))
-    check("版本号随 fork 递增（不复用上游 tag）",
-          'VERSION = "1.8.1"' in _src16)
+    check("版本号随上游对齐递增（fork 与上游同号显式标注）",
+          'VERSION = "1.9.2"' in _src16
+          and "fork 维护版" in _src16)
 finally:
     _restore()
 

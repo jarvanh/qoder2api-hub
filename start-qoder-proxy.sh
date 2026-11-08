@@ -20,6 +20,9 @@ PORT="${1:-8790}"
 SRC="${BASH_SOURCE[0]:-$0}"
 HERE="$(cd -- "$(dirname -- "$SRC")" && pwd)"
 SCRIPT="$HERE/qoder_proxy.py"
+export QD_LOG_DIR="${QD_LOG_DIR:-$HERE/logs}"
+mkdir -p "$QD_LOG_DIR" || exit 1
+# Direct exec keeps signals intact; Python tees console streams to logs/.
 
 if [ ! -f "$SCRIPT" ]; then
     echo "[ERROR] qoder_proxy.py not found next to this script."

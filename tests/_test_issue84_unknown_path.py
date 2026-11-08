@@ -12,8 +12,8 @@ declare_suite(__file__, ["qoder_proxy.py", "docs/clients.md"])
 _src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 
 check("#84 有 _unknown_path_error 助手", "def _unknown_path_error(self, path):" in _src)
-check("#84 三处兜底 404 都改走它",
-      _src.count("return self._unknown_path_error(path)") == 3,
+check("#84 原三处与新增两处管理兜底 404 共用路径诊断",
+      _src.count("return self._unknown_path_error(path)") == 5,
       _src.count("return self._unknown_path_error(path)"))
 check("#84 重复前缀给 base URL 提示",
       "base URL 里已经带了 /v1" in _src)

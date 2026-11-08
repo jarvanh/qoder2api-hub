@@ -115,7 +115,10 @@ def _bucket_from(src, kind, name):
     if remain is None:
         remain = _num_or_none(src.get("balance"))
     used = _num_or_none(src.get("used"))
-    size = _num_or_none(src.get("total"))
+    # 共享池 cap 是成员使用上限（-1 表示不限量），优先于 total。
+    size = _num_or_none(src.get("cap")) if kind == "shared" else None
+    if size is None:
+        size = _num_or_none(src.get("total"))
     if size is None:
         size = _num_or_none(src.get("cap"))
     if size is None:
@@ -145,7 +148,9 @@ def _bucket_from(src, kind, name):
            "remain": int(remain or 0), "used": int(used or 0),
            "size": int(size or 0)}
     if src.get("available") is not None:
-        out["available"] = bool(src.get("available"))
+        out["available"] = _truthy(src.get("available"))
+    if kind == "shared" and out["size"] < 0:
+        out["unlimited"] = True
     for key in ("expiresAt", "expireAt", "expires_at", "expiredAt",
                 "validUntil", "dueAt"):
         if src.get(key) is not None:
@@ -1432,8 +1437,8 @@ def usage_log_path():
     """
     if USAGE_LOG_OVERRIDE:
         return str(USAGE_LOG_OVERRIDE)
-    d = os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "usage")
+    import qoder_logpaths
+    d = qoder_logpaths.resolve_usage_dir(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(d, "usage.jsonl")
 
 
@@ -1703,6 +1708,7 @@ class Account(object):
         self.nickname = str(data.get("nickname") or "")
         # issue #69：账号备注（纯展示，不参与任何判定）
         self.note = str(data.get("note") or "")
+        self.group = str(data.get("group") or "").strip()
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
@@ -1812,6 +1818,7 @@ class Account(object):
         return {
             "uid": self.uid,
             "nickname": self.nickname,
+            "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
             "platform": self.platform,
@@ -1896,6 +1903,7 @@ class Account(object):
         return {
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
+            "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
             "platform": self.platform,
@@ -3417,6 +3425,10 @@ class Account(object):
         """把归一化的「构成」落成 credits 结构（issue #141）。"""
         comp = list(norm.get("composition") or [])
         shared = next((b for b in comp if b.get("kind") == "shared"), None)
+        shared_remain = int(shared.get("remain") or 0) if (
+            shared and shared.get("available", True)
+            and not shared.get("unlimited")) else 0
+        previous = effective_remain(self.credits)
         packages = []
         for b in comp:
             if b.get("kind") == "shared":
@@ -3432,6 +3444,7 @@ class Account(object):
             packages.append(item)
         self.credits = {
             "remain": int(norm.get("remain") or 0),
+            "remain_effective": int(norm.get("remain") or 0) + shared_remain,
             "used": int(norm.get("used") or 0),
             "size": int(norm.get("size") or 0),
             "exceeded": bool(norm.get("exceeded")),
@@ -3445,6 +3458,13 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        current = self.credits["remain_effective"]
+        try:
+            if previous is not None and int(previous) != current:
+                self.last_credits_delta = current - int(previous)
+                self.last_credits_delta_at = time.time()
+        except (TypeError, ValueError, OverflowError):
+            pass  # 旧快照的坏数值不能阻止本次有效查询。
         self.last_quota_anomaly = None
         self.credits_degraded = None
         self.revive_balance_cooldown()
@@ -3466,7 +3486,8 @@ class Account(object):
         except Exception:
             return None
         norm = normalize_quota_payload(body, self.realm)
-        if not norm or not norm.get("size"):
+        # size 不含共享池：仅共享额度时为 0；个人全 0 退化体仍不采纳。
+        if not norm or (not norm.get("size") and "shared" not in norm["fields"]):
             return None
         norm["source"] = host + path
         return self._credits_from_composition(norm)
@@ -3595,8 +3616,14 @@ class Account(object):
         # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
         both_missing = (not isinstance(q.get("userQuota"), dict)
                         and not isinstance(q.get("addOnQuota"), dict))
+        if both_missing and _comp:
+            # 组织成员可只返回 orgResourcePackage，缺个人额度不代表查询失败。
+            _norm["source"] = url
+            return self._credits_from_composition(_norm)
+        has_shared = any(b.get("kind") == "shared" for b in _comp)
         degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
-                                      and remain == 0 and size == 0)
+                                      and remain == 0 and size == 0
+                                      and not has_shared)
         if degenerate:
             return self._note_quota_anomaly(
                 q, "both quota objects missing" if both_missing
@@ -4186,11 +4213,12 @@ class AccountPool(object):
                     self.accounts.append(account)
             return self.accounts
 
-    def list_public(self, realm=None):
+    def list_public(self, realm=None, group=None):
         with self._lock:
             accs = self.accounts if (not realm or realm == "all") else \
                 [a for a in self.accounts if a.realm == realm]
-            return [a.public() for a in accs]
+            return [a.public() for a in accs
+                    if group is None or a.group == str(group).strip()]
 
     def get(self, uid):
         with self._lock:
@@ -4367,22 +4395,56 @@ class AccountPool(object):
         return self.quota_refresher
 
     # -- 选择与健康 --------------------------------------------------------
-    def count_ready(self, realm=None, model=None):
+    def scope_uids(self, account_ids=None, account_groups=None, realm=None):
+        """Resolve selectors: IDs OR groups, intersected with realm.
+
+        Empty/missing selectors mean unrestricted (None); a configured selector
+        with no matching accounts returns an empty set, never an unrestricted pool.
+        The caller must recompute this scope for every request after group edits.
+        """
+        def values(raw):
+            if raw is None:
+                return set()
+            if isinstance(raw, str):
+                raw = [raw]
+            if not isinstance(raw, (list, tuple, set, frozenset)):
+                raise ValueError("account selectors must be lists")
+            if any(not isinstance(value, str) for value in raw):
+                raise ValueError("account selectors must contain strings")
+            return {value.strip() for value in raw}
+
+        ids, groups = values(account_ids), values(account_groups)
+        if not ids and not groups:
+            return None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            return {a.uid for a in self.accounts
+                    if (not realm or realm == "all" or a.realm == realm)
+                    and (a.uid in ids or a.group in groups)}
+
+    def count_ready(self, realm=None, model=None, allowed_uids=None):
+        with self._lock:
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
         return sum(1 for a in snapshot if a.enabled and a.access_token and
                    a.ready(model=model))
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         allowed_uids=None):
         exclude = exclude or set()
+        allowed = None if allowed_uids is None else frozenset(allowed_uids)
         if session_key:
             bound_uid = self.affinity.get(session_key)
-            if bound_uid and bound_uid not in exclude:
+            if bound_uid:
                 account = self.get(bound_uid)
-                if account and account.realm == realm and account.ready(model=model):
+                if (bound_uid not in exclude and
+                        (allowed is None or bound_uid in allowed) and account and
+                        (not realm or account.realm == realm) and
+                        account.ready(model=model)):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            allowed_uids=allowed)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
@@ -4429,11 +4491,13 @@ class AccountPool(object):
                     state.pop(uid, None)
         return winner
 
-    def _pick_expiring_first(self, realm=None, exclude=None, model=None):
+    def _pick_expiring_first(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """窗口内（临期）的可用账号里做加权轮询；没有候选 -> None（由 pick 回落）。"""
         exclude = exclude or set()
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
         cands = [a for a in snapshot
                  if a.uid not in exclude and a.ready(model=model)
                  and a.in_expiring_window()]
@@ -4441,7 +4505,7 @@ class AccountPool(object):
             return None
         return self._weighted_pick(cands)
 
-    def _rotate_pick(self, realm=None, exclude=None, model=None):
+    def _rotate_pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
 
         第一轮先跳过降权窗口内的账号（degraded()），第二轮不跳过——降权号仍然
@@ -4450,7 +4514,9 @@ class AccountPool(object):
         """
         exclude = exclude or set()
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
             start = self._cursor
         total = len(snapshot)
         if total == 0:
@@ -4470,21 +4536,24 @@ class AccountPool(object):
                     return account
         return None
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """选号：临期积分优先（平滑加权），否则回落普通轮转。
 
         `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
         _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
         """
         account = self._pick_expiring_first(realm=realm, exclude=exclude,
-                                            model=model)
+                                            model=model, allowed_uids=allowed_uids)
         if account is not None:
             return account
-        return self._rotate_pick(realm=realm, exclude=exclude, model=model)
+        return self._rotate_pick(realm=realm, exclude=exclude, model=model,
+                                 allowed_uids=allowed_uids)
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, allowed_uids=None):
         with self._lock:
-            candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            candidates = [a for a in self.accounts
+                          if (not realm or a.realm == realm)
+                          and (allowed_uids is None or a.uid in allowed_uids)]
             for account in candidates:
                 if account.access_token:
                     return account
@@ -4511,14 +4580,14 @@ class AccountPool(object):
                 account.save(self.dir)
 
     # -- 导入 / 导出 -------------------------------------------------------
-    def preview_import_rows(self, rows, realm=None, overwrite=False):
+    def preview_import_rows(self, rows, realm=None, overwrite=False, group=None):
         """报告 import_rows() 会做什么，不触碰账号池（Dry-Run）。"""
         preview = {"added": [], "updated": [], "skipped": [], "invalid": []}
         known = {a.uid for a in self.accounts}
         seen = set()
         for index, row in enumerate(rows):
             try:
-                kwargs = normalise_import_row(row, realm=realm)
+                kwargs = normalise_import_row(row, realm=realm, group=group)
             except Exception as exc:
                 preview["invalid"].append({"index": index + 1, "reason": str(exc)})
                 continue
@@ -4535,7 +4604,7 @@ class AccountPool(object):
             seen.add(uid)
         return preview
 
-    def import_rows(self, rows, realm=None, overwrite=False):
+    def import_rows(self, rows, realm=None, overwrite=False, group=None):
         """从导出/外部文档批量导入账号。
 
         返回报告：added / updated / skipped / invalid。
@@ -4545,7 +4614,7 @@ class AccountPool(object):
         seen = set()
         for index, row in enumerate(rows):
             try:
-                kwargs = normalise_import_row(row, realm=realm)
+                kwargs = normalise_import_row(row, realm=realm, group=group)
             except Exception as exc:
                 invalid.append({"index": index + 1, "reason": str(exc)})
                 continue
@@ -5099,7 +5168,12 @@ def _coerce_account_rows(blob):
     return out, ""
 
 
-def normalise_import_row(row, realm=None):
+def normalize_import_account(row, realm=None, group=None):
+    """Compatibility spelling for import callers."""
+    return normalise_import_row(row, realm=realm, group=group)
+
+
+def normalise_import_row(row, realm=None, group=None):
     """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。
 
     运行期字段（cooldownUntil/lastError/credits/lastCheckin/plan）不随导入采信：
@@ -5136,6 +5210,7 @@ def normalise_import_row(row, realm=None):
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
+        "group": str(group if group is not None else pick("group") or "").strip(),
         "domain": str(pick("domain") or cfg["domain"]),
         "realm": detected,
         "platform": str(pick("platform") or "CLI"),

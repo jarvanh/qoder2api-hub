@@ -51,7 +51,9 @@ check("账号相关 KPI（账号池/积分余额）搬到账号页",
       'id="acctCards"' in _acct and 'id="acctCards"' not in _gw)
 check("网关页仍保留出口卡与调度条",
       'id="cardGatewayCtrl"' in _gw and 'id="schedulerBar"' in _gw)
-check("网关页仍保留模型库表", 'id="modelsTable"' in _gw)
+check("模型库迁移到独立模型页且不在总览重复",
+      'id="pageModels"' in _dash and 'id="modelsTable"' not in _gw
+      and 'id="sectionModels"' in _dash)
 
 print("[accounts] 搜索与细节")
 check("账号页有搜索框", 'id="acctSearch"' in _acct)

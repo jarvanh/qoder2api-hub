@@ -12,10 +12,13 @@ declare_suite(__file__, ["qoder_proxy.py"])
 _real_ready = P._realm_ready_total
 _real_detect = P.detect_model_realm
 _real_current = P.CURRENT_REALM
+_real_pool = P.POOL
 
 
 def _stub_ready(fn, detect="cn", current="cn"):
     P._realm_ready_total = fn
+    import types
+    P.POOL = types.SimpleNamespace(count_ready=fn)
     P.detect_model_realm = lambda m: detect
     P.CURRENT_REALM = current
 
@@ -33,8 +36,8 @@ try:
 
     # intl 独占模型：解析出 intl，另一区应是 cn
     _stub_ready(lambda realm, model=None: 2, detect="intl")
-    check("#83 intl 独占模型 + realm=None -> cn",
-          P._alt_realm_ready(None, "Ultimate") == "cn",
+    check("#83 intl 独占模型不得跨区到 cn",
+          P._alt_realm_ready(None, "Ultimate") == "",
           P._alt_realm_ready(None, "Ultimate"))
 
     # 另一区没有就绪账号 -> 返回空（不切）
@@ -50,6 +53,7 @@ finally:
     P._realm_ready_total = _real_ready
     P.detect_model_realm = _real_detect
     P.CURRENT_REALM = _real_current
+    P.POOL = _real_pool
 
 # ---------------------------------------------------------- 源码守卫：只切一次
 _src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()

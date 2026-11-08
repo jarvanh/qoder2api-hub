@@ -48,17 +48,6 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: 构建并推送
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       # 冒烟：验证「镜像真的能跑」——构建成功不等于镜像完整。
       # v1.3.2/v1.3.3 曾漏 COPY 一个模块：构建全绿，容器一启动就 ModuleNotFoundError。
       - name: 冒烟测试（本地单架构构建 + 关键模块存在性 + 探活）
@@ -69,7 +58,7 @@ jobs:
           # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
           docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
           # 2) 关键模块可导入
-          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic, qoder_cache, qoder_images; assert qoder_images.status()['codec_available']; print('imports and image codec ok')"
+          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic, qoder_cache, qoder_images, qoder_agents, qoder_routing, qoder_admin, qoder_logpaths; assert len(qoder_agents.CLIENTS) >= 31; assert qoder_agents.template('aider', 'http://127.0.0.1:8790')['files']; assert qoder_images.status()['codec_available']; print('imports and image codec ok')"
           # 3) 进程能启动并响应探活
           docker run -d --name smoke -p 18790:8790 "$IMG"
           ok=0
@@ -80,3 +69,14 @@ jobs:
           if [ "$ok" != "1" ]; then echo "::error::容器未在 60s 内响应 /ping"; docker logs smoke; exit 1; fi
           echo "冒烟通过"; docker logs smoke | tail -5
           docker rm -f smoke
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

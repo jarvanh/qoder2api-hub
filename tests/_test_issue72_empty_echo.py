@@ -61,15 +61,14 @@ check("#72 吞掉后 marker 不会透传给用户",
       "请求调用工具" not in _text, _text[:80])
 
 # ---------------------------------------------------------------- 非流式 + 出口
-# 截断数组（marker + 半截 JSON）维持 issue #9 的「丢弃 + 正常结束」语义，
-# 只有**纯 marker 退化**才 fail-closed（#72 报告的就是这一种）。
+# 截断数组与纯 marker 都表示工具调用丢失，不能按正常成功结束。
 _TRUNC = P.LEAK_MARKER + ' [{"name": "shell", "arguments": "{\\"cmd\\": \\"ls'
 _raised3 = None
 try:
     list(P.recover_leaked_tool_calls(iter(_frames(_TRUNC)), {"shell"}))
 except Exception as exc:
     _raised3 = exc
-check("#72 截断数组仍按 #9 丢弃（不 fail-closed）", _raised3 is None,
+check("#72 截断数组也必须 fail-closed", isinstance(_raised3, P.EmptyToolEcho),
       type(_raised3).__name__ if _raised3 else None)
 
 _src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()

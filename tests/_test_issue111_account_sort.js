@@ -62,7 +62,7 @@ check('昵称缺失时退回 UID 排序',
 
 api.sortAccounts('credits');
 const creditRows = [
-  A('r1', 'r1', { credits: { remain: 100, used: 0, size: 700 } }),
+  A('r1', 'r1', { credits: { remain: 100, used: 600, size: 700 } }),
   A('r2', 'r2', { credits: { remain: 684, used: 16, size: 700 } }),
   A('r3', 'r3', { creditsDegraded: { reason: 'envelopes HTTP 403 code 112' } }),
   A('r4', 'r4', { credits: { remain: 0, used: 200, size: 200 } }),

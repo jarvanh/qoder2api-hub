@@ -75,6 +75,20 @@ def thinking_mode():
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
+def _parse_tool_arguments(args):
+    """解析参数 JSON，额外解开一层对象/数组编码；语法错误交给调用方处理。"""
+    inp = json.loads(args)
+    if isinstance(inp, str):
+        try:
+            decoded = json.loads(inp)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if isinstance(decoded, (dict, list)):
+                inp = decoded
+    return inp
+
+
 def _text_of_blocks(blocks):
     """Anthropic content blocks -> 纯文本（text 块拼接；其余块忽略）。"""
     if isinstance(blocks, str):
@@ -383,6 +397,15 @@ def messages_to_chat(payload, catalog_meta=None, supported=None):
                     images.append(uri)
             elif bt == "tool_use":
                 args = b.get("input")
+                if isinstance(args, str):
+                    # 修复旧历史里多编码一层的对象，避免继续示范字符串参数。
+                    try:
+                        decoded = _parse_tool_arguments(args)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        if isinstance(decoded, (dict, list)):
+                            args = decoded
                 if not isinstance(args, str):
                     args = json.dumps(args if args is not None else {},
                                       ensure_ascii=False)
@@ -525,10 +548,10 @@ def chat_to_messages(chat_obj, model=None):
         fn = fn if isinstance(fn, dict) else {}
         args = fn.get("arguments")
         try:
-            inp = json.loads(args) if isinstance(args, str) and args.strip() else {}
+            inp = _parse_tool_arguments(args) if isinstance(args, str) and args.strip() else {}
         except Exception:
             inp = {}
-        if not isinstance(inp, (dict, list)):
+        if not isinstance(inp, dict):
             inp = {"value": inp}
         _tool_name = str(fn.get("name") or "")
         if not _tool_name:
@@ -560,7 +583,7 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
     iter_inner_sse -> recover_leaked_tool_calls 之后**（本模块不做吞掉/回读）。
       · 以 ":" 开头的心跳注释行**原样透传**；
       · `[DONE]` 丢弃（Anthropic 客户端不认）；
-      · arguments 是**增量字符串**，逐片 input_json_delta，不要逐片 json.loads。
+      · 对象 arguments 逐片输出；其它形态缓冲到块尾，规范化成对象后再输出。
     """
     msg_id = _new_id("msg_")
     next_index = 0
@@ -571,7 +594,7 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
     # 一旦发出就不能再补 name（Anthropic 协议不允许改已发出的块）——下游会拿到
     # 空 name 并把整轮判成 malformed。所以先缓冲：name 非空才发 start，期间到达的
     # arguments 先攒着，start 之后按序补发。
-    pending_tools = {}      # ci -> {ai, id, name, args}
+    pending_tools = {}      # ci -> {ai, id, name, args, args_object}
     dropped_tools = []      # 流结束仍无 name 的块（丢弃并记日志）
     open_blocks = []
     finish = "stop"
@@ -660,7 +683,7 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
                     pending_tools[ci] = {"ai": ai,
                                          "id": str(tc.get("id") or ""),
                                          "name": str(fn.get("name") or ""),
-                                         "args": []}
+                                         "args": [], "args_object": None}
                 slot = pending_tools[ci]
                 if not slot["name"]:
                     slot["name"] = str(fn.get("name") or "")
@@ -668,6 +691,10 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
                     slot["id"] = str(tc.get("id") or "")
                 if args:
                     slot["args"].append(args)
+                    # 只看首个非空白字符：正常对象继续即时透传，其余形态在
+                    # 输出任何参数前缓冲，避免客户端把字符串 input 写进历史。
+                    if slot["args_object"] is None and args.lstrip():
+                        slot["args_object"] = args.lstrip().startswith("{")
                 # name 已知 -> 需要时才开块，然后把队列里的分片按序发完；
                 # name 未知 -> 继续攒（绝不发空 name 的 start）。
                 if slot["name"]:
@@ -680,19 +707,36 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
                                 "id": slot["id"] or _new_id("toolu_"),
                                 "name": slot["name"],
                                 "input": {}}})
-                    _queued = slot["args"]
-                    slot["args"] = []
-                    for piece in _queued:
-                        yield ev("content_block_delta", {
-                            "index": slot["ai"],
-                            "delta": {"type": "input_json_delta",
-                                      "partial_json": piece}})
+                    if slot["args_object"]:
+                        _queued = slot["args"]
+                        slot["args"] = []
+                        for piece in _queued:
+                            yield ev("content_block_delta", {
+                                "index": slot["ai"],
+                                "delta": {"type": "input_json_delta",
+                                          "partial_json": piece}})
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
     # issue #116：仍有块没等到 name —— 不发 start（发了就是空 name），整块丢弃并
     # 降级 stop_reason，避免下游一直等一个永远不会到来的工具结果。
     for _ci, _slot in list(pending_tools.items()):
         if _slot["ai"] in open_blocks:
+            if _slot["args"]:
+                _queued = _slot["args"]
+                try:
+                    inp = _parse_tool_arguments("".join(_queued))
+                except (TypeError, ValueError):
+                    # 截断/非法 JSON 沿用现有处理，不编造工具参数。
+                    pass
+                else:
+                    if not isinstance(inp, dict):
+                        inp = {"value": inp}
+                    _queued = [json.dumps(inp, ensure_ascii=False)]
+                for piece in _queued:
+                    yield ev("content_block_delta", {
+                        "index": _slot["ai"],
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": piece}})
             continue
         dropped_tools.append(_slot)
         log("anthropic stream: dropped tool_use block without name "

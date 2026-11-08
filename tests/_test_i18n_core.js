@@ -204,6 +204,8 @@ check('兜底与 rAF 都触发也只排空一次，同批多个根合并成一�
   return w.join(',') === 'A,C';
 })());
 
+check('多行动态预览逐行翻译', (function(){const e=fresh();e.load({messages:{'已保存方案':'Saved plan','首选':'Primary'},patterns:{'命中：{0}':'Matched: {0}'}});return e.t('已保存方案\n命中：首选')==='Saved plan\nMatched: Primary';})());
+
 console.log('[core] L3 走查 —— 观察器报上来的多数是叶子节点')
 /* walk() 的 TreeWalker 用 SHOW_ELEMENT，只会 yield root 的**后代**。文本被 JS
  * 改掉时，观察器给的 target 往往就是那个只有文本子节点的 button/span —— 于是
@@ -304,6 +306,12 @@ const LABEL = {'深色': 'Dark', '网关调用量': 'Egress volume', '运行日�
   var ok = true;
   try { e.walk(null); e.walk(txt('深色')); } catch(err){ ok = false; }
   check('walk 接到 null 或文本根也不抛（降级路径）', ok);
+})();
+
+(function(){
+  const leaf=el('span',{kids:[txt('深色')]});const e=mkEngine({messages:LABEL});
+  e.walk(leaf);leaf.childNodes[0].nodeValue='运行日志';e.walk(leaf);
+  check('复用文本节点收到新中文后仍翻译',leaf.childNodes[0].nodeValue==='Logs');
 })();
 
 console.log('SUITE: ' + path.basename(__filename) + ' md5=' + SUITE_MD5);

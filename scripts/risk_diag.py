@@ -159,7 +159,8 @@ def main(argv):
 
     print("\n[5] 最近日志信号（若开启文件日志）")
     log_hits = 0
-    for path in glob.glob(os.path.join(ROOT, "*.log")):
+    log_root = os.environ.get("QD_LOG_DIR") or os.path.join(ROOT, "logs")
+    for path in glob.glob(os.path.join(log_root, "*.log")):
         try:
             with open(path, encoding="utf-8", errors="ignore") as fh:
                 for line in fh.readlines()[-4000:]:

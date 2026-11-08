@@ -223,8 +223,8 @@ if(api){
   api.initPageNav(byId['pageGateway']);
   const sidebar = byId['pageGateway'].querySelector('.page-sidebar');
   const nav = byId['pageGateway'].querySelector('.page-nav');
-  check('initPageNav(pageGateway) → 生成了 .page-sidebar 与 .page-nav',
-    !!sidebar && !!nav);
+  check('官方同款总览保持完整画布，不插入旧章节侧栏',
+    !sidebar && !nav && !byId['pageGateway'].classList.contains('page-nav-on'));
   if(nav){
     const items = nav.querySelectorAll('.page-nav-item');
     check('导航项数 == 静态解析的 section 数（' + gwSections.length + '）', items.length === gwSections.length);

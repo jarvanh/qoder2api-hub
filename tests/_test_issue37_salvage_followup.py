@@ -128,9 +128,14 @@ check("#37f C 两调用都带裸控制符 -> 全部恢复且参数可 loads",
 print("[37f] D：护栏不变")
 _D1 = echo('[{"name": "Bash", "arguments": {"p": ')
 check("#37f D1 彻底截断的数组 -> 不恢复", P.parse_leaked_tool_calls(_D1, NAMES)[0] is None)
-_calls, _txt, _fins = run_stream(_D1, 16)
-check("#37f D1 流式：截断数组维持 #9 丢弃语义（吞正文、无泄漏；只回 marker 才走 #72 fail-closed）",
-      _calls == [] and "请求调用工具" not in _txt, (_txt[:40], _fins))
+# 上游 v1.9.2 起「截断工具回声」无条件 fail-closed（EmptyToolEcho），
+# fork 的 #9 丢弃语义由「不恢复、不泄漏」承载，收尾改为显式失败。
+try:
+    _calls, _txt, _fins = run_stream(_D1, 16)
+    check("#37f D1 流式：截断回声不恢复、无泄漏（不静默完成）",
+          _calls == [] and "请求调用工具" not in _txt, (_txt[:40], _fins))
+except P.EmptyToolEcho:
+    check("#37f D1 流式：截断回声不恢复、显式报错（fail-closed 非静默完成）", True)
 
 _prose = ('我在讨论 [assistant 请求调用工具] 这个协议格式，'
           '例如 [{"name": "X", "arguments": {"a": 1}}, {"name": "Y"}] 这种数组。')

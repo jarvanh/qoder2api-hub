@@ -107,9 +107,9 @@ check("#55/#49 deepseek 在白名单里", "deepseek" in P.STRUCTURED_TOOL_HISTOR
 check("#55/#49 DeepSeek-CN + id 齐备 -> 结构化直传",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="cn",
                                         messages=_MSGS) is True)
-check("#55/#49 INTL 仍不自动启用（未经端到端验证）",
+check("#55/#49 INTL 默认启用结构化历史",
       P.structured_tool_history_enabled(model="DeepSeek-Flash", realm="intl",
-                                        messages=_MSGS) is False)
+                                        messages=_MSGS) is True)
 check("#55/#49 id 不齐备时回退文本化",
       P.structured_tool_history_enabled(
           model="DeepSeek-Flash", realm="cn",

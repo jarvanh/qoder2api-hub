@@ -180,7 +180,7 @@ print("[5.5] per-realm catalogs follow the official client (must DIFFER)")
 intl_keys = [m["key"] for m in C.STATIC_INTL_MODELS]
 cn_keys = [m["key"] for m in C.STATIC_CN_MODELS]
 check("intl catalog not empty (>=17)", len(intl_keys) >= 17, len(intl_keys))
-check("cn catalog not empty (14)", len(cn_keys) == 14, len(cn_keys))
+check("cn catalog includes verified QoDuck (15)", len(cn_keys) == 15, len(cn_keys))
 check("two realms' catalogs differ", intl_keys != cn_keys)
 check("intl-only: smodel present, absent from cn",
       "smodel" in intl_keys and "smodel" not in cn_keys)
@@ -190,22 +190,22 @@ check("cn-only: gm51model present, absent from intl",
       "gm51model" in cn_keys and "gm51model" not in intl_keys)
 intl_en = {m["key"] for m in C.STATIC_INTL_MODELS if m.get("enable")}
 cn_en = {m["key"] for m in C.STATIC_CN_MODELS if m.get("enable")}
-check("intl enabled flags = {qmodel_38max, qfmodel} (official plan state)",
-      intl_en == {"qmodel_38max", "qfmodel"}, sorted(intl_en))
-check("cn all 14 enabled", len(cn_en) == 14, sorted(cn_en))
+check("intl enabled flags include QoDuck launch state",
+      intl_en == {"qmodel_38max", "qfmodel", "lmodel"}, sorted(intl_en))
+check("cn all 15 enabled", len(cn_en) == 15, sorted(cn_en))
 # 全量列出（不按 enable 过滤）
 merged_i = P.merge_catalog([], realm="intl")
 merged_c = P.merge_catalog([], realm="cn")
-check("merge keeps FULL intl list (17, no enable filtering)", len(merged_i) == 17,
+check("merge keeps FULL intl list (18, no enable filtering)", len(merged_i) == 18,
       len(merged_i))
-check("merge keeps FULL cn list (14)", len(merged_c) == 14, len(merged_c))
+check("merge keeps FULL cn list (15)", len(merged_c) == 15, len(merged_c))
 # 清单以官方动态/本机目录为准（桌面版此刻显示什么就显示什么）
 dyn_keys = [("cmodel", {"key": "cmodel", "display_name": "Cantus"})]  # 反例占位
 primary15 = [(m["key"], dict(m)) for m in C.STATIC_INTL_MODELS
              if m["key"] not in ("cmodel", "smodel")]   # 模拟动态返回的 15 条
 merged_dyn = P.merge_catalog(primary15, realm="intl")
-check("merge follows primary set (dynamic 15 wins, static-only excluded)",
-      len(merged_dyn) == 15 and
+check("merge follows primary set (dynamic wins, static-only excluded)",
+      len(merged_dyn) == len(primary15) and
       {k for k, _ in merged_dyn} == {m["key"] for m in C.STATIC_INTL_MODELS}
       - {"cmodel", "smodel"}, len(merged_dyn))
 
@@ -2871,40 +2871,40 @@ check("判据：未声明 tools / 空 names -> False",
 check("判据：完整但未声明工具名的数组 -> False（保持 fail-open 透传）",
       P._leaked_partial_droppable(_LEAK27, {"other"}) is False)
 
-_frames_trunc = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
-    {"terminal"})]
-_text_trunc = "".join(_f["choices"][0]["delta"].get("content") or ""
-                      for _f in _frames_trunc)
-check("流式：截断回声被吞（正文既无 marker、也无 terminal 明文）",
-      _text_trunc == ""
-      and P.LEAK_MARKER not in json.dumps(_frames_trunc, ensure_ascii=False),
-      _text_trunc)
-check("流式：吞掉后 finish_reason 仍为 stop（Lead 裁定）",
-      _frames_trunc[-1]["choices"][0]["finish_reason"] == "stop",
-      _frames_trunc)
+# 回声截断即工具调用丢失；三个出口均须明确失败，不能成功 stop。
+def _collect_truncated_error(source):
+    frames, error = [], None
+    try:
+        for frame in source:
+            frames.append(frame)
+    except P.EmptyToolEcho as exc:
+        error = exc
+    return frames, error
 
-_obj_trunc = P.aggregate_stream(
-    _Resp27([_env27(_TRUNC27[:12]), _env27(_TRUNC27[12:]), _env27("", "stop")]),
-    "m27", None, allowed_names={"terminal"})
-_msg_trunc = _obj_trunc["choices"][0]["message"]
-check("非流式：截断回声 -> content 清空、无 tool_calls、finish=stop",
-      _msg_trunc.get("content") == "" and not _msg_trunc.get("tool_calls")
-      and _obj_trunc["choices"][0]["finish_reason"] == "stop", _obj_trunc)
-
-_ev_trunc = [f.decode() for f in P.stream_responses_events(
+_frames_trunc, _err_trunc = _collect_truncated_error(P.recover_leaked_tool_calls(
     iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
-    "m27", {"usage": None, "custom_names": set(),
-            "allowed_names": {"terminal"}})]
-_joined_trunc = "".join(_ev_trunc)
-_parsed_trunc_lk = [json.loads(_ln[6:]) for _fr in _ev_trunc
-                       for _ln in _fr.splitlines() if _ln.startswith("data: ")]
-_text_delta_trunc = "".join(e.get("delta") or "" for e in _parsed_trunc_lk
-                            if isinstance(e, dict)
-                            and e.get("type") == "response.output_text.delta")
-check("Responses 流式：截断回声不出现在正文增量里（不再用短词匹配整个事件流）",
-      _text_delta_trunc == "" and P.LEAK_MARKER not in _joined_trunc,
-      (_text_delta_trunc[:120], _joined_trunc[:120]))
+    {"terminal"}))
+check("流式：截断回声不泄漏，并抛出 EmptyToolEcho",
+      isinstance(_err_trunc, P.EmptyToolEcho)
+      and P.LEAK_MARKER.encode() not in b"".join(_frames_trunc))
+check("流式：截断回声不能发送成功 finish_reason",
+      all(not c.get("finish_reason")
+          for f in _frames_trunc for c in json.loads(f[6:]).get("choices", [])))
+_err_aggregate = None
+try:
+    P.aggregate_stream(
+        _Resp27([_env27(_TRUNC27[:12]), _env27(_TRUNC27[12:]), _env27("", "stop")]),
+        "m27", None, allowed_names={"terminal"})
+except P.EmptyToolEcho as exc:
+    _err_aggregate = exc
+check("非流式：截断回声必须明确失败", isinstance(_err_aggregate, P.EmptyToolEcho))
+_ev_trunc, _err_responses = _collect_truncated_error(P.stream_responses_events(
+    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
+    "m27", {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}}))
+check("Responses：截断回声必须明确失败，不能 response.completed",
+      isinstance(_err_responses, P.EmptyToolEcho)
+      and b"response.completed" not in b"".join(_ev_trunc)
+      and P.LEAK_MARKER.encode() not in b"".join(_ev_trunc))
 
 _frames_falsify = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_M27), _raw27("\n这是一段解释文字。"), _raw27("", "stop")]),
@@ -3000,11 +3000,11 @@ check("开关：auto + CN + DeepSeek -> 结构化（#49 后续：端到端验证
       P.structured_tool_history_enabled(model="deepseek-flash",
                                         model_key="deepseek-flash",
                                         realm="cn", messages=_SMSGS32) is True)
-check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
+check("开关：auto + INTL 白名单模型 -> 结构化",
       P.structured_tool_history_enabled(model="qwen3.8-flash",
                                         model_key="qwen3.8-flash",
                                         realm="intl", messages=_SMSGS32)
-      is False)
+      is True)
 os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
 check("开关：on 强制（DeepSeek / INTL 也走结构化，供补验证）",
       P.structured_tool_history_enabled(model="deepseek-flash",
@@ -3106,28 +3106,36 @@ def _txt16(out):
     return "".join(f["choices"][0]["delta"].get("content") or "" for f in out)
 
 
-_r16a = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_A16[:10]), _raw27(_A16[10:]), _raw27("", "stop")]), _N16)]
-check("A 参照（marker 开头 + 截断）-> 仍吞（回归）",
-      P.LEAK_MARKER not in _txt16(_r16a))
-_r16b1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_B116), _raw27("", "stop")]), _N16)]
-check("B1 散文 + marker 同帧 -> 吞回声块、散文保留",
-      P.LEAK_MARKER not in _txt16(_r16b1)
+def _partial16(chunks):
+    frames, error = _collect_truncated_error(
+        P.recover_leaked_tool_calls(iter(chunks), _N16))
+    return [json.loads(f[6:]) for f in frames], error
+
+
+_r16a, _r16a_error = _partial16(
+    [_raw27(_A16[:10]), _raw27(_A16[10:]), _raw27("", "stop")])
+check("A 参照（marker 开头 + 截断）-> 明确失败且不泄漏",
+      isinstance(_r16a_error, P.EmptyToolEcho)
+      and P.LEAK_MARKER not in _txt16(_r16a))
+_r16b1, _r16b1_error = _partial16([_raw27(_B116), _raw27("", "stop")])
+check("B1 散文 + marker 同帧 -> 明确失败、回声不泄漏、散文保留",
+      isinstance(_r16b1_error, P.EmptyToolEcho)
+      and P.LEAK_MARKER not in _txt16(_r16b1)
       and "我先看看目录结构。" in _txt16(_r16b1))
-_r16b2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27("我先看看目录结构。\n\n"), _raw27(_A16), _raw27("", "stop")]),
-    _N16)]
-check("B2 散文与 marker 分帧 -> 同样吞（回归）",
-      P.LEAK_MARKER not in _txt16(_r16b2)
+_r16b2, _r16b2_error = _partial16(
+    [_raw27("我先看看目录结构。\n\n"), _raw27(_A16), _raw27("", "stop")])
+check("B2 散文与 marker 分帧 -> 同样明确失败",
+      isinstance(_r16b2_error, P.EmptyToolEcho)
+      and P.LEAK_MARKER not in _txt16(_r16b2)
       and "我先看看目录结构。" in _txt16(_r16b2))
-_r16b3 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_B316[:12]), _raw27(_B316[12:]), _raw27("", "stop")]), _N16)]
-check("B3 截断落在未写完的 \\uXXXX 转义 -> 吞",
-      P.LEAK_MARKER not in _txt16(_r16b3))
-_r16c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_C16), _raw27("", "stop")]), _N16)]
-check("C [工具结果] 回声（回归）-> 吞", "[工具结果" not in _txt16(_r16c))
+_r16b3, _r16b3_error = _partial16(
+    [_raw27(_B316[:12]), _raw27(_B316[12:]), _raw27("", "stop")])
+check("B3 截断落在未写完的 \\uXXXX 转义 -> 明确失败",
+      isinstance(_r16b3_error, P.EmptyToolEcho)
+      and P.LEAK_MARKER not in _txt16(_r16b3))
+_r16c, _r16c_error = _partial16([_raw27(_C16), _raw27("", "stop")])
+check("C 工具结果回声吞后无正文/调用，明确失败而非空成功",
+      "[工具结果" not in _txt16(_r16c) and isinstance(_r16c_error, P.EmptyToolEcho))
 check("B3 判据单元：未完成 / 彻底非法转义都视为可继续扩展",
       P._json_array_prefix_ok('[{"a": "x\\u63a') is True
       and P._json_array_prefix_ok('[{"a": "x\\uZZZZ') is True
@@ -3151,17 +3159,21 @@ check("散文 + 完整合法数组 -> 仍走恢复路径（tool_calls），散�
       and _txt16(_r16e4).startswith("散文"))
 check("窗口常量：_MARKER_HOLD_WINDOW = 最长标记 - 1（17）",
       P._MARKER_HOLD_WINDOW == len(P.LEAK_MARKER) - 1 == 17)
-_obj16 = P.aggregate_stream(
-    _Resp27([_env27(_B116[:12]), _env27(_B116[12:]), _env27("", "stop")]),
-    "m27", None, allowed_names=_N16)
-check("非流式：散文 + marker 回声块 -> 只吞块、散文保留",
-      _obj16["choices"][0]["message"].get("content") == "我先看看目录结构。\n\n")
-_ev16 = [f.decode() for f in P.stream_responses_events(
+_err_obj16 = None
+try:
+    P.aggregate_stream(
+        _Resp27([_env27(_B116[:12]), _env27(_B116[12:]), _env27("", "stop")]),
+        "m27", None, allowed_names=_N16)
+except P.EmptyToolEcho as exc:
+    _err_obj16 = exc
+check("非流式：散文 + 截断调用必须明确失败", isinstance(_err_obj16, P.EmptyToolEcho))
+_ev16, _err_ev16 = _collect_truncated_error(P.stream_responses_events(
     iter([_raw27(_B116[:12]), _raw27(_B116[12:]), _raw27("", "stop")]), "m27",
-    {"usage": None, "custom_names": set(), "allowed_names": _N16})]
-check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保留",
-      P.LEAK_MARKER not in "".join(_ev16)
-      and "我先看看目录结构。" in "".join(_ev16))
+    {"usage": None, "custom_names": set(), "allowed_names": _N16}))
+check("Responses：散文保留，截断调用明确失败且不回显 marker",
+      isinstance(_err_ev16, P.EmptyToolEcho)
+      and P.LEAK_MARKER.encode() not in b"".join(_ev16)
+      and "我先看看目录结构。".encode() in b"".join(_ev16))
 
 print()
 print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
@@ -3456,41 +3468,32 @@ check("#11 hold-back：标记未打完要压住，证伪（散文）立即放行
       and P._echo_hold_candidate(_TR31 + "]") is True)
 
 # --- 31.2 #11 三条链路端到端（复用 [27] 段的帧辅助） ---
-_fr31_drop = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]),
-    _NAMES31)]
-_text31_drop = "".join(_f["choices"][0]["delta"].get("content") or ""
-                       for _f in _fr31_drop)
-check("#11 流式：开闭对回声被吞（正文空、无标记泄漏、finish_reason 仍 stop）",
-      _text31_drop == ""
-      and _TR31 not in json.dumps(_fr31_drop, ensure_ascii=False)
-      and _fr31_drop[-1]["choices"][0]["finish_reason"] == "stop",
-      _text31_drop)
+_fr31_raw, _fr31_error = _collect_truncated_error(P.recover_leaked_tool_calls(
+    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]), _NAMES31))
+check("#11 流式：回声被吞后无实际调用，明确失败", isinstance(_fr31_error, P.EmptyToolEcho)
+      and _TR31.encode() not in b"".join(_fr31_raw))
 _trunc31 = _TR31 + "]\n" + '{"output": "partial'
-_fr31_tr = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]),
-    _NAMES31)]
-_text31_tr = "".join(_f["choices"][0]["delta"].get("content") or ""
-                     for _f in _fr31_tr)
-check("#11 流式：截断回声被吞（正文空）", _text31_tr == "", _text31_tr)
+_fr31_raw2, _fr31_error2 = _collect_truncated_error(P.recover_leaked_tool_calls(
+    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]), _NAMES31))
+check("#11 流式：截断结果回声不能伪成功", isinstance(_fr31_error2, P.EmptyToolEcho))
 _fr31_keep = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
     iter([_raw27(_TR31 + "] 这是一段解释文字。"), _raw27("", "stop")]), _NAMES31)]
 _text31_keep = "".join(_f["choices"][0]["delta"].get("content") or ""
                        for _f in _fr31_keep)
 check("#11 流式：散文形态原样透传（fail-open 不吞字）",
       _TR31 in _text31_keep and "解释文字" in _text31_keep, _text31_keep)
-_obj31 = P.aggregate_stream(
-    _Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
-    "m31", None, allowed_names=_NAMES31)
-_msg31 = _obj31["choices"][0]["message"]
-check("#11 非流式：content 清空、无 tool_calls、finish=stop（与 #9 同语义）",
-      _msg31.get("content") == "" and not _msg31.get("tool_calls")
-      and _obj31["choices"][0]["finish_reason"] == "stop", _msg31)
-_ev31 = "".join(f.decode() for f in P.stream_responses_events(
-    iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]),
+_aggregate31_error = None
+try:
+    P.aggregate_stream(_Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
+                       "m31", None, allowed_names=_NAMES31)
+except P.EmptyToolEcho as exc:
+    _aggregate31_error = exc
+check("#11 非流式：纯结果回声吞后必须失败", isinstance(_aggregate31_error, P.EmptyToolEcho))
+_ev31_raw, _ev31_error = _collect_truncated_error(P.stream_responses_events(
+    P.recover_leaked_tool_calls(iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]), _NAMES31),
     "m31", {"usage": None, "custom_names": set(), "allowed_names": _NAMES31}))
-check("#11 Responses 流式：事件里既无开标记也无闭标记",
-      _TR31 not in _ev31 and _TC31 not in _ev31)
+check("#11 Responses：无正常完成，且回声不泄漏", isinstance(_ev31_error, P.EmptyToolEcho)
+      and b"response.completed" not in b"".join(_ev31_raw) and _TR31.encode() not in b"".join(_ev31_raw))
 
 # --- 31.3 标记常量契约：写入侧引用常量 + 写出字节逐字节不变 ---
 _src31 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -3636,10 +3639,10 @@ finally:
     else:
         os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
 
-check("开关三态·auto：默认放行 CN+白名单（Qwen/GLM/gm4/DeepSeek/Kimi 真；INTL 假）",
+check("开关三态·auto：默认放行 CN/INTL+白名单（Qwen/GLM/gm4/DeepSeek/Kimi 真）",
       _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
       and _auto_cn_ds is True and _auto_cn_kimi is True
-      and _auto_intl_qwen is False,
+      and _auto_intl_qwen is True,
       (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
 check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",
       _on_cn_ds is True and _on_intl_ds is True and _off_cn_qwen is False,
@@ -3754,9 +3757,16 @@ _B316 = _M16 + "\n" + \
 _C16 = "[工具结果]" + "\n" + '{"output": "ok"}' + "\n" + "[工具结果结束]"
 
 
+class _Frames16(list):
+    pass
+
+
 def _frames16(chunks):
-    return [json.loads(f[6:]) for f in
-            P.recover_leaked_tool_calls(iter(chunks), _NAMES33)]
+    frames, error = _collect_truncated_error(
+        P.recover_leaked_tool_calls(iter(chunks), _NAMES33))
+    result = _Frames16(json.loads(f[6:]) for f in frames)
+    result.error = error
+    return result
 
 
 def _text16(frames):
@@ -3764,29 +3774,31 @@ def _text16(frames):
 
 
 def _fin16(frames):
+    if isinstance(frames.error, P.EmptyToolEcho):
+        return "error"
     return frames[-1]["choices"][0].get("finish_reason")
 
 
 _frA16 = _frames16([_f33(_A16[:20]), _f33(_A16[20:]), _f33("", "stop")])
-check("#16·A（原样样本：marker+截断 JSON 切两刀）→ 内容不含标记、收尾帧 finish_reason=stop",
-      _M16 not in _text16(_frA16) and _fin16(_frA16) == "stop", _text16(_frA16))
+check("#16·A（原样样本：marker+截断 JSON 切两刀）→ 内容不含标记、收尾帧 明确失败",
+      _M16 not in _text16(_frA16) and _fin16(_frA16) == "error", _text16(_frA16))
 _frB116 = _frames16([_f33(_B116), _f33("", "stop")])
-check("#16·B1（原样样本：散文+marker 同帧）→ 散文保留、标记不泄漏、finish=stop",
+check("#16·B1（原样样本：散文+marker 同帧）→ 散文保留、标记不泄漏、明确失败",
       "我先看看目录结构。" in _text16(_frB116)
-      and _M16 not in _text16(_frB116) and _fin16(_frB116) == "stop",
+      and _M16 not in _text16(_frB116) and _fin16(_frB116) == "error",
       _text16(_frB116))
 _frB216 = _frames16([_f33(x) for x in _B216] + [_f33("", "stop")])
-check("#16·B2（原样样本：散文与 marker 分帧）→ 散文保留、标记不泄漏、finish=stop",
+check("#16·B2（原样样本：散文与 marker 分帧）→ 散文保留、标记不泄漏、明确失败",
       "我先看看目录结构。" in _text16(_frB216)
-      and _M16 not in _text16(_frB216) and _fin16(_frB216) == "stop",
+      and _M16 not in _text16(_frB216) and _fin16(_frB216) == "error",
       _text16(_frB216))
 _frB316 = _frames16([_f33(_B316[:20]), _f33(_B316[20:]), _f33("", "stop")])
-check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记、finish=stop",
-      _M16 not in _text16(_frB316) and _fin16(_frB316) == "stop",
+check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记、明确失败",
+      _M16 not in _text16(_frB316) and _fin16(_frB316) == "error",
       _text16(_frB316))
 _frC16 = _frames16([_f33(_C16[:8]), _f33(_C16[8:]), _f33("", "stop")])
-check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、finish=stop（#11 回归保护）",
-      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "stop",
+check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、明确失败（#11 空成功回归保护）",
+      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "error",
       _text16(_frC16))
 
 # --- hold 上限：长文本以 [ 开头且久不闭合必须放行（不得无限缓冲） ---
@@ -3807,7 +3819,9 @@ print("[34] task-37 细致复查：长链/反转/其它截断点/窗口与上限
 def _run34(chunks, names=None):
     """返回 (客户端文本, tool_calls 帧数, 末帧 finish_reason)。"""
     _txt, _tcs, _fin = [], 0, None
-    for _f in P.recover_leaked_tool_calls(iter(chunks), names or _NAMES33):
+    frames, error = _collect_truncated_error(
+        P.recover_leaked_tool_calls(iter(chunks), names or _NAMES33))
+    for _f in frames:
         try:
             _o = json.loads(_f.decode("utf-8")[6:] if isinstance(_f, bytes) else _f[6:])
         except Exception:
@@ -3819,7 +3833,7 @@ def _run34(chunks, names=None):
             _tcs += 1
         if _o["choices"][0].get("finish_reason"):
             _fin = _o["choices"][0]["finish_reason"]
-    return "".join(_txt), _tcs, _fin
+    return "".join(_txt), _tcs, "error" if error else _fin
 
 
 _CALLS34 = json.dumps([{"name": "terminal",
@@ -3856,8 +3870,8 @@ for _tag, _payload in (
     _cut = len(_payload) // 2
     _t, _tc, _fn = _run34([_f33(_payload[:_cut]), _f33(_payload[_cut:]),
                            _f33("", "stop")])
-    check("#37·截断点（%s）→ 整段被吞、无标记泄漏、finish=stop" % _tag,
-          _t == "" and _tc == 0 and _fn == "stop", _t[:60])
+    check("#37·截断点（%s）→ 明确失败、无标记泄漏" % _tag,
+          _t == "" and _tc == 0 and _fn == "error", _t[:60])
 
 _HOLDWIN34 = getattr(P, "_MARKER_HOLD_WINDOW", 17)
 for _cut in (_HOLDWIN34 - 1, _HOLDWIN34, _HOLDWIN34 + 1):
