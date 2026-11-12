@@ -97,7 +97,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 ### Claude Code 连续工具调用
 
-白名单模型（Qwen / GLM / DeepSeek）默认在 `cn` 和 `intl` 两个出口保留结构化工具历史，
+白名单模型（Qwen / GLM / DeepSeek / Kimi）默认在 `cn` 和 `intl` 两个出口保留结构化工具历史，
 不再把 `assistant.tool_calls` 和 `role:tool` 改写为正文信封，减少模型复述工具协议后提前结束的问题。
 缺少工具 ID 的历史仍会回退；`QD_STRUCTURED_TOOL_HISTORY=off` 可关闭，
 `QD_STRUCTURED_TOOL_HISTORY_REALMS=cn` 可恢复仅国内区启用的范围。

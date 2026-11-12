@@ -43,7 +43,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 - 每个 Key 有名称，可以单独启用 / 停用 / 删除，删除后立即失效
 - 每个 Key 可以绑定出口：
   - **国际版**：走 `api3.qoder.sh`，连不上时依次切换到 `api2` / `api1`
-  - **国内版**：走 `gateway.qoder.com.cn`
+  - **国内版**：按选中账号的实际入口走公网 `gateway.qoder.com.cn` 或企业实例专属网关；Key 绑定区域不覆盖账号的 VPC 选择
   - **不绑定**：跟随看板顶部的全局出口
 - 请求的模型和 Key 绑定的出口不匹配时，直接返回 400，给出说明
 
@@ -147,6 +147,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_AFFINITY_MAX_MSGS` | `0` | 对话超过 N 条消息后不再固定账号，`0` 表示不限制 |
 | `QD_AFFINITY_DEBUG` | `0` | 打印会话亲和的调试日志 |
 | `QD_INTL_GATEWAY` | `https://api3.qoder.sh` | 国际版推理主机。连接失败时依次切换到 `api2` / `api1` |
+| `QD_CN_VPC_ENDPOINT` | — | 国内版默认 VPC 实例名或专属域（如 `TARGET` / `TARGET.vpc.qoder.com.cn`）。账号显式实例 / 显式公网、凭证域推断优先于该默认；未设且无其它来源时走公网。按账号推导 openapi / gateway / website，VPC 不回退公网。仅 CN 生效，见[企业 VPC 专属域](accounts.md#企业-vpc-专属域cn) |
 
 ### 会话缓存保温（可选）
 
@@ -192,7 +193,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `QD_STRUCTURED_TOOL_HISTORY` | `auto` | 工具调用历史以结构化形式发给上游。`auto` 仅在国内版的 Qwen / GLM / DeepSeek 上启用；也可设为 `on` / `off` |
+| `QD_STRUCTURED_TOOL_HISTORY` | `auto` | 工具调用历史以结构化形式发给上游。`auto` 在 CN / INTL 的 Qwen / GLM / DeepSeek / Kimi 上启用；也可设为 `on` / `off` |
 | `QD_TOOL_RESULT_KEEP` | `2000` | 截短历史工具结果时，头尾各保留的字符数；`0` / `off` 表示不截短 |
 | `QD_TOOL_RESULT_SCOPE` | `tail` | 截短范围：`tail` 只保留最后 N 条完整、`all` 全部截短、`turn` 是旧行为（会破坏前缀缓存） |
 | `QD_TOOL_RESULT_KEEP_TAIL` | `1` | `tail` 模式下保留完整的最后几条 |
@@ -275,16 +276,18 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 | 变量 | 取值 | 说明 |
 |---|---|---|
-| `QD_STRUCTURED_TOOL_HISTORY` | `auto`（默认）/ `on` / `off` | `auto` = 仅 CN 用结构化 |
+| `QD_STRUCTURED_TOOL_HISTORY` | `auto`（默认）/ `on` / `off` | `auto` = CN / INTL 的白名单模型（Qwen / GLM / DeepSeek / Kimi）用结构化 |
 | `QD_STRUCTURED_TOOL_HISTORY_REALMS` | 例如 `cn,intl` | 覆盖 `auto` 生效的区域集合 |
 
-INTL 默认仍走文本化（当年超时未取到验证结果）。如果你的 intl 账号在长会话里反复出现上面那两类 502，可以显式打开：
+CN / INTL 默认均启用上述白名单；需要缩小范围时设置 `QD_STRUCTURED_TOOL_HISTORY_REALMS=cn`，关闭原生历史时设置 `QD_STRUCTURED_TOOL_HISTORY=off`。工具 ID 不齐备仍回退文本化。
 
-```bash
-export QD_STRUCTURED_TOOL_HISTORY_REALMS="cn,intl"
-```
+### Kimi 工具参数 JSON（#153）
 
-启动脚本里那一行是**注释状态**的示例 —— 是否打开由你决定，网关不替你改默认值。
+Kimi 的展示名（如 `Kimi-K3.1-Pro`）和内部 key（`kmodel` / `kmodel_latest`）采用同一模型判断。默认保留 `assistant.tool_calls` 与 `role:tool`，避免长工具链反复展示双层 JSON 文本信封，诱导模型照抄。assistant 工具消息的 `content` 保持空字符串而非 `null`。
+
+存在工具声明且 `tool_choice` 不是 `none` 时，在现有系统提示末尾追加固定的工具协议约束：原生调用通道、参数 JSON 对象、正确转义、遵守原 schema、完整闭合、长写入按工具能力拆分。该段提示不随步数变化，不覆盖客户端提示，不修改 schema、推理强度或采样参数；普通回答不强制调用工具。
+
+这属于生成端预防，不保证上游永远输出合法 JSON。回读与参数校验仍保留：错误参数不会通过猜测补齐后执行，也不会因该错误自动重发收费请求。现有历史中已包含的文本信封不会被猜测转换；建议升级后新开对话验证长链。离线回归覆盖请求构造与协议出口，实际模型生成改善需真实环境观察。
 
 ## 性能与看板缓存（v1.8.0）
 

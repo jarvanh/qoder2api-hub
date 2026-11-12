@@ -62,7 +62,8 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 4（同上）", n_direct_p == 4, n_direct_p)
+# VPC 模型发现使用隔离 opener，公网分支保留 urlopen。
+check("qoder_proxy.py 直连 urlopen 基线 == 3（模型发现另经账号级 opener 选择）", n_direct_p == 3, n_direct_p)
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))

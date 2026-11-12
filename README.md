@@ -97,6 +97,10 @@ curl http://127.0.0.1:8790/v1/chat/completions \
 
 同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
 
+## 赞助商
+
+> 目前还没有赞助商。想出现在这里，联系 **zhang8586201314@gmail.com**
+
 ---
 
 ## 致谢

@@ -114,6 +114,8 @@ check("cn + kimi（fork 加白保留）→ True",
       _enabled("cn", model="Kimi-K2", key="kimi") is True)
 check("cn + 未验证 provider → False",
       _enabled("cn", model="MiniMax-M3.1-Flash", key="mmodel") is False)
+check("cn + 未知 provider → False",
+      _enabled("cn", model="unknown-fixture", key="unknown-fixture") is False)
 check("cn + tool id 不齐 → False（fail-safe）", _enabled("cn", ids_ok=False) is False)
 
 print("\n[issue79] 三态开关")

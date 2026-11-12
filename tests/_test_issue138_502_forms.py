@@ -170,6 +170,9 @@ check("开关放开：intl + dfmodel 启用",
 check("开关放开后非白名单仍排除（minimax）",
       P.structured_tool_history_enabled(model="MiniMax-M2", model_key="minimax",
                                        realm="intl", messages=_msgs) is False)
+check("#153 Kimi 在 intl 也采用原生历史",
+      P.structured_tool_history_enabled(model="kimi-k2", model_key="kimi",
+                                       realm="intl", messages=_msgs) is True)
 check("开关放开后 id 不齐仍回退（fail-safe）",
       P.structured_tool_history_enabled(
           model="DeepSeek-Flash", model_key="dfmodel", realm="intl",

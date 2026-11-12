@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as d:
   exported=R.read_chat_models(path)
  check('snapshot refresh shares exact extraction rule',exported==rows)
  fake=types.SimpleNamespace(headers=lambda *a,**k:{})
- with mock.patch.object(P,'POOL',types.SimpleNamespace(pick=lambda **k:object())),mock.patch.object(P.SESSIONS,'get',return_value=fake),mock.patch.object(P,'gateway_candidates',return_value=['https://example.invalid']),mock.patch.object(P,'validate_public_http_url',side_effect=lambda x:x),mock.patch.object(P.urllib.request,'urlopen',return_value=io.BytesIO(plain)):
+ with mock.patch.object(P,'POOL',types.SimpleNamespace(pick=lambda **k:A.Account({"uid":"catalog-fixture","realm":"cn","vpcEndpoint":"","accessToken":"fixture"}))),mock.patch.object(P.SESSIONS,'get',return_value=fake),mock.patch.object(P,'gateway_candidates',return_value=['https://example.invalid']),mock.patch.object(P,'validate_public_http_url',side_effect=lambda x:x),mock.patch.object(P.urllib.request,'urlopen',return_value=io.BytesIO(plain)):
   live=P.read_dynamic_models('cn')
  check('online discovery includes app-only QoDuck',[m for m,_ in live]==['shared','lmodel'])
  check('live metadata retains false and zero values',live[0][1]['enable'] is False and live[1][1]['price_factor']==0)

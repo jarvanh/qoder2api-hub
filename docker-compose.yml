@@ -27,6 +27,10 @@ services:
       # - API_KEY=your_api_key_here
       # ↑ 留空：容器以 --lan 启动，首次自动生成随机 Key 写入 ./accounts/settings.json
       #   并打印在日志（docker compose logs qoder-proxy | grep -i "api key"）
+      # 默认企业 VPC（仅 CN）：实例名或 TARGET.vpc.qoder.com.cn；可不设置。
+      # 账号入口可在看板独立选择：继承 / 指定实例 / 显式公网（空串覆盖默认）。
+      # 账号覆盖、凭证域推断优先于此默认；国际版仍使用公网。
+      # - QD_CN_VPC_ENDPOINT=TARGET
       - TZ=Asia/Shanghai
     volumes:
       # 持久化挂载账号凭证与用量流水
