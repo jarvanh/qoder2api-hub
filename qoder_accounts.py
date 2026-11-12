@@ -23,6 +23,7 @@ import re
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -35,6 +36,35 @@ from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
 from qoder_sign import COSY_MACHINE_OS
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    """Atomically write `text` with `mode` fixed at tmp-file creation time.
+
+    Credential files must never be world-readable, not even for the brief
+    window between write and chmod. mkstemp() creates a unique 0600 file;
+    rename() then publishes the complete file atomically. Unique names also
+    stop concurrent writers from truncating each other's partial JSON.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".",
+                               suffix=".tmp")
+    try:
+        os.chmod(tmp, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -802,21 +832,14 @@ def _identity_cache_expired_entry_exists(realm, now):
 
 
 def _write_identity_cache_doc(doc):
-    """原子写缓存文档（临时文件 + os.replace、权限 0600）；失败静默返回 False。"""
+    """原子写缓存文档（临时文件 0600 创建 + os.replace）；失败静默返回 False。"""
     path = machine_identity_cache_path()
-    tmp = path + ".tmp"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, ensure_ascii=False, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        os.makedirs(os.path.dirname(path), exist_ok=True, mode=0o700)
+        _atomic_write_text(
+            path, json.dumps(doc, ensure_ascii=False, indent=2), mode=0o600)
         return True
     except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
         return False
 
 
@@ -1978,7 +2001,11 @@ class Account(object):
 
     def save(self, directory):
         base = Path(directory).resolve()
-        base.mkdir(parents=True, exist_ok=True)
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
         if is_reserved_account_uid(safe_uid):
             # 双重防线：即使上游没拦住，落盘这一步也不许覆盖系统文件。
@@ -1991,9 +2018,10 @@ class Account(object):
         # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
         # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
         with _SAVE_LOCK:
-            tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, path)
+            _atomic_write_text(
+                path,
+                json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+                mode=0o600)
         self.path = str(path)
         return self.path
 

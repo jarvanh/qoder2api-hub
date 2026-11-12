@@ -14,11 +14,17 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 from pathlib import Path
 
-DEFAULT_PANEL_PASSWORD = "admin"
+# A well-known default ("admin") is no longer accepted: on a fresh install the
+# first start mints a random password, persists its digest and writes the
+# cleartext once to a 0600 file so the operator can retrieve it.
+PANEL_PASSWORD_ENV = "QD_PANEL_PASSWORD"
+PANEL_PASSWORD_FILE_ENV = "QD_PANEL_PASSWORD_FILE"
+PANEL_PASSWORD_FILE = "panel_password.txt"
 PBKDF2_ROUNDS = 120_000
 SESSION_TTL = 7 * 24 * 3600
 
@@ -33,6 +39,35 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     return hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), rounds
     ).hex()
+
+
+def _atomic_write_text(path, text, mode=0o600):
+    """Write `text` atomically with `mode` from the moment the tmp file exists.
+
+    mkstemp() creates a unique file with 0600 from the first byte, so concurrent
+    writers (panel + CLI + tasks) never share a tmp path and a credential is
+    never readable by other users during the write window. rename() publishes
+    the complete file atomically.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".",
+                               suffix=".tmp")
+    try:
+        os.chmod(tmp, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load(accounts_dir):
@@ -51,36 +86,64 @@ def load(accounts_dir):
 
 
 def save(accounts_dir, data):
-    """Atomic write so a crash cannot leave a half-written settings file."""
+    """Atomic 0600 write so a crash cannot leave a half-written settings file."""
     with _lock:
         base = Path(accounts_dir).resolve()
-        base.mkdir(parents=True, exist_ok=True)
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
         path = base / "settings.json"
         tmp = base / "settings.json.tmp"
         if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
             raise ValueError("path escapes base directory")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2),
+                           mode=0o600)
         return str(path)
 
 
+def panel_password_file(accounts_dir):
+    """Path of the one-time cleartext password file (env-overridable)."""
+    override = (os.environ.get(PANEL_PASSWORD_FILE_ENV) or "").strip()
+    if override:
+        return override
+    return os.path.join(accounts_dir, PANEL_PASSWORD_FILE)
+
+
+def _remove_panel_password_file(accounts_dir):
+    """Drop a stale generated-password file after an explicit password change."""
+    try:
+        os.remove(panel_password_file(accounts_dir))
+    except OSError:
+        pass
+
+
+def _write_panel_password_file(accounts_dir, password):
+    path = Path(panel_password_file(accounts_dir))
+    try:
+        _atomic_write_text(path, password + "\n", mode=0o600)
+        return str(path)
+    except OSError:
+        return ""
+
+
 def panel_password_is_default(accounts_dir):
-    data = load(accounts_dir)
-    if not data.get("panel_password_hash"):
-        return True
-    return data.get("panel_password_default") is True
+    """True when no panel password has ever been configured.
+
+    The legacy `panel_password_default` marker is deliberately ignored: a
+    settings file from an old install must not re-enable the "admin" backdoor.
+    """
+    return not str(load(accounts_dir).get("panel_password_hash") or "")
 
 
 def verify_panel_password(accounts_dir, password):
-    """True when `password` opens the web panel."""
+    """True when `password` opens the web panel (no implicit default)."""
     password = password or ""
     data = load(accounts_dir)
-    stored = data.get("panel_password_hash")
+    stored = str(data.get("panel_password_hash") or "")
     if not stored:
-        return password == DEFAULT_PANEL_PASSWORD
-    if data.get("panel_password_default") is True:
-        return password == DEFAULT_PANEL_PASSWORD
+        return False
     salt = data.get("panel_password_salt")
     if not salt:
         return False
@@ -92,21 +155,65 @@ def verify_panel_password(accounts_dir, password):
     return hmac.compare_digest(given, stored)
 
 
+def generate_panel_password():
+    """A strong random password for first start / explicit reset."""
+    return secrets.token_urlsafe(18)
+
+
 def set_panel_password(accounts_dir, password):
+    """Set an explicit password; always stored as a salted PBKDF2 digest."""
+    password = str(password or "")
+    if not password:
+        raise ValueError("panel password must not be empty")
     with _lock:
+        # Never overwrite an unreadable settings.json with the empty dict
+        # load() falls back to: that would erase API keys and limits too.
+        if not _settings_is_rewritable(accounts_dir):
+            raise OSError("settings.json unreadable; refusing to overwrite it")
         data = load(accounts_dir)
-        if password == DEFAULT_PANEL_PASSWORD:
-            data.pop("panel_password_salt", None)
-            data.pop("panel_password_rounds", None)
-            data["panel_password_hash"] = ""
-            data["panel_password_default"] = True
-        else:
-            salt = secrets.token_hex(16)
-            data["panel_password_salt"] = salt
-            data["panel_password_rounds"] = PBKDF2_ROUNDS
-            data["panel_password_hash"] = _digest(password, salt)
-            data["panel_password_default"] = False
+        salt = secrets.token_hex(16)
+        data["panel_password_salt"] = salt
+        data["panel_password_rounds"] = PBKDF2_ROUNDS
+        data["panel_password_hash"] = _digest(password, salt)
+        data.pop("panel_password_default", None)
         save(accounts_dir, data)
+        _remove_panel_password_file(accounts_dir)
+
+
+def ensure_panel_password(accounts_dir):
+    """Make sure a usable panel password exists before the server listens.
+
+    Returns (password, created, source):
+      * password - cleartext only when generated by this call or taken from the
+        environment; None when an existing digest is reused;
+      * created  - True only when this call minted a new random password;
+      * source   - "env" | "created" | "stored".
+
+    `QD_PANEL_PASSWORD` overrides the stored value (useful for containers).
+    Otherwise a fresh install gets a random password written once to a 0600
+    file (`QD_PANEL_PASSWORD_FILE`, default accounts/panel_password.txt).
+    """
+    with _lock:
+        env_password = os.environ.get(PANEL_PASSWORD_ENV) or ""
+        if env_password:
+            if not verify_panel_password(accounts_dir, env_password):
+                set_panel_password(accounts_dir, env_password)
+            return env_password, False, "env"
+        if not panel_password_is_default(accounts_dir):
+            return None, False, "stored"
+        password = generate_panel_password()
+        set_panel_password(accounts_dir, password)
+        _write_panel_password_file(accounts_dir, password)
+        return password, True, "created"
+
+
+def reset_panel_password(accounts_dir):
+    """Explicit reset: mint a new random password (old one stops working)."""
+    with _lock:
+        password = generate_panel_password()
+        set_panel_password(accounts_dir, password)
+        path = _write_panel_password_file(accounts_dir, password)
+        return password, path
 
 
 def api_key_override(accounts_dir):

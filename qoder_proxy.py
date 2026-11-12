@@ -34,6 +34,10 @@ import re
 import json
 import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
+# Hardening for a public/LAN listener: ThreadingHTTPServer otherwise accepts an
+# unbounded number of sockets and lets a silent client hold a thread forever.
+MAX_CONNECTIONS = max(1, int(os.environ.get("QD_MAX_CONNECTIONS") or "64"))
+REQUEST_TIMEOUT = float(os.environ.get("QD_SOCKET_TIMEOUT") or "300")
 import ipaddress
 import socket
 import ssl
@@ -72,7 +76,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.4"  # fork 维护版：并入上游 v1.9.3–v1.9.4，与上游版本对齐递增
+VERSION = "1.9.5"  # fork 维护版：并入上游 v1.9.3–v1.9.4，与上游版本对齐递增；1.9.5 为安全加固版
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -11218,8 +11222,61 @@ def _responses_failed_frame(holder, code, message):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a concurrent-connection ceiling.
+
+    One thread per accepted socket is fine on loopback, but on a LAN/public
+    listener an unbounded thread count is a trivial DoS. When all slots are
+    taken the connection is answered with 503 and closed immediately instead
+    of queueing another thread.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, RequestHandlerClass,
+                 bind_and_activate=True, max_connections=None):
+        self.max_connections = max(1, int(max_connections or MAX_CONNECTIONS))
+        self._connection_slots = threading.BoundedSemaphore(
+            self.max_connections)
+        super(BoundedThreadingHTTPServer, self).__init__(
+            server_address, RequestHandlerClass,
+            bind_and_activate=bind_and_activate)
+
+    def process_request(self, request, client_address):
+        if not self._connection_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super(BoundedThreadingHTTPServer, self).process_request(
+                request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super(BoundedThreadingHTTPServer, self).process_request_thread(
+                request, client_address)
+        finally:
+            try:
+                self._connection_slots.release()
+            except ValueError:
+                pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Read/write deadline per socket: a client that opens a connection and
+    # sends nothing (slowloris) is dropped after this many seconds.
+    timeout = REQUEST_TIMEOUT
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
@@ -12514,6 +12571,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             length = 0
         if length > max_bytes:
+            # The oversized body was never read; keeping the connection would
+            # make its bytes look like the next request. Close after the 413.
+            self.close_connection = True
             raise BodyTooLarge(length)
         if length < 0:
             raise BadJSON()
@@ -12741,9 +12801,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "new password must be at least 4 characters",
                                    "invalid_request_error")
             qoder_settings.set_panel_password(ACCOUNTS_DIR, new)
-            if new != qoder_settings.DEFAULT_PANEL_PASSWORD:
-                # 换密码使其它浏览器会话全部失效
-                PANEL.revoke_all()
+            # 换密码使其它浏览器会话全部失效（旧实现只在“非默认口令”时
+            # 撤销；默认口令已删除，任何显式改密都应踢掉旧会话）。
+            PANEL.revoke_all()
             token = PANEL.create()
             return self._json(200, {"ok": True, "token": token})
         return self._unknown_path_error(path)
@@ -14959,8 +15019,11 @@ def main():
                     help="where the per-account credential files live "
                          "(default: ./accounts)")
     ap.add_argument("--panel-password", default=None,
-                    help="set the web panel password on startup (default: "
-                         "admin)")
+                    help="set the web panel password on startup (a random "
+                         "password is generated on first start)")
+    ap.add_argument("--reset-panel-password", action="store_true",
+                    help="generate a new random panel password at startup "
+                         "and save it to the 0600 password file")
     ap.add_argument("--pid-file", default=None,
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
@@ -15078,14 +15141,34 @@ def main():
     if args.panel_password:
         qoder_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
         log("panel      : password set from --panel-password")
-    elif qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
-        log("panel      : password is still the default 'admin' - change it "
-            "in the panel")
-        if args.host == "0.0.0.0":
-            log("SECURITY   : LAN mode + default panel password 'admin' - "
-                "anyone on this network can log in and read your API key. "
-                "Change it in the panel, or restart with --panel-password.",
+    elif args.reset_panel_password:
+        _new_pwd, _pwd_path = qoder_settings.reset_panel_password(ACCOUNTS_DIR)
+        log("panel      : password reset by --reset-panel-password")
+        log("panel      : new password: %s" % _new_pwd)
+        if _pwd_path:
+            log("panel      : password also saved to %s (mode 0600)"
+                % _pwd_path)
+        else:
+            log("panel      : could not write the password file; the value "
+                "above is the only copy", level="WARN")
+    else:
+        try:
+            _pwd, _created, _source = qoder_settings.ensure_panel_password(
+                ACCOUNTS_DIR)
+        except Exception as exc:
+            log("panel      : could not prepare a panel password: %s" % exc,
                 level="WARN")
+            _pwd = _created = None
+            _source = ""
+        if _source == "env":
+            log("panel      : password set from %s"
+                % qoder_settings.PANEL_PASSWORD_ENV)
+        elif _created:
+            _pwd_path = qoder_settings.panel_password_file(ACCOUNTS_DIR)
+            log("panel      : first start - generated a random panel password: "
+                "%s" % _pwd, level="WARN")
+            log("panel      : the same password was written to %s (mode 0600)"
+                % _pwd_path)
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
@@ -15233,7 +15316,7 @@ def main():
     server = None
     for _attempt in range(3):
         try:
-            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            server = BoundedThreadingHTTPServer((args.host, args.port), Handler)
             break
         except OSError as exc:
             _kind2 = classify_existing_instance(_probe_health(1.0))
