@@ -2,10 +2,17 @@ name: Build Docker image
 
 # 打 v* tag（例如 v1.2.3）时自动构建并推送镜像到 GHCR，也可以在 Actions 页手动触发。
 # 不需要配置任何 secret，用默认的 GITHUB_TOKEN 即可。
+#
+# 为什么同时监听 release.published：
+#   本仓库多次出现 tag push 事件未投递（GitHub API 中 event=push 的运行数为 0），
+#   导致只打 tag 不出镜像。发布 GitHub Release 会稳定触发 release 事件，
+#   作为 tag push 丢失时的兜底；workflow_dispatch 保留人工强制入口。
 on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
