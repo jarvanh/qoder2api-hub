@@ -106,6 +106,12 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 （Anthropic 流式为 `event: error`，非流式为 HTTP 502），不会伪装成成功的 `end_turn`。
 这类参数不完整的调用不会被猜测执行；代码围栏中的格式示例仍作为普通正文返回。
 
+### 容器停止与 SIGTERM（#156）
+
+镜像默认以 Python 作为 PID 1，进程现显式处理 SIGTERM：退出监听循环并关闭 socket，随后运行 PID 文件等退出清理。不要在主线程的信号处理器中调用 `HTTPServer.shutdown()`，它会等待同线程的 `serve_forever()` 返回而死锁。
+
+`docker stop` 不再依赖宽限期结束后的 SIGKILL；发布流水线用真实默认容器验证停止耗时和退出码（必须为 0，而不是 137）。退出会中断仍在执行的请求，不承诺等待所有上游推理完成。Compose 的 `init: true` 可作为用户侧额外选项，但修复不依赖它，直接 `docker run` 同样适用。
+
 ### 容器启动自检
 
 有几类问题会让网关「莫名失效」，在容器里尤其常见。网关每次启动都会检查，发现问题就在日志里打印 WARN，结果也可以在 `/health` 的 `env` 字段中查看：

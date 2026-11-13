@@ -74,8 +74,18 @@ jobs:
             sleep 2
           done
           if [ "$ok" != "1" ]; then echo "::error::容器未在 60s 内响应 /ping"; docker logs smoke; exit 1; fi
-          echo "冒烟通过"; docker logs smoke | tail -5
-          docker rm -f smoke
+          echo "探活通过"; docker logs smoke | tail -5
+          # PID 1 must catch SIGTERM: forced SIGKILL or a full grace wait is a failure.
+          started=$SECONDS
+          docker stop --time 6 smoke
+          elapsed=$((SECONDS-started))
+          code=$(docker inspect --format '{{.State.ExitCode}}' smoke)
+          if [ "$code" != "0" ] || [ "$elapsed" -ge 5 ]; then
+            echo "::error::SIGTERM shutdown failed: exit=$code elapsed=${elapsed}s"
+            docker logs smoke; exit 1
+          fi
+          echo "PID 1 SIGTERM shutdown passed: ${elapsed}s"
+          docker rm smoke
 
       - name: 构建并推送
         uses: docker/build-push-action@v6

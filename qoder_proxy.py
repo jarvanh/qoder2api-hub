@@ -40,6 +40,7 @@ MAX_CONNECTIONS = max(1, int(os.environ.get("QD_MAX_CONNECTIONS") or "64"))
 REQUEST_TIMEOUT = float(os.environ.get("QD_SOCKET_TIMEOUT") or "300")
 import ipaddress
 import socket
+import signal
 import ssl
 import sys
 import threading
@@ -76,7 +77,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.9"  # fork 维护版：并入上游 v1.9.6–v1.9.8，与上游版本对齐递增；1.9.5 安全加固、1.9.9 并入 VPC 与 kimi tools 修复
+VERSION = "1.9.10"  # fork 维护版：并入上游 v1.9.6–v1.9.9，与上游版本对齐递增；1.9.5 安全加固、1.9.9 并入 VPC 与 kimi tools 修复、1.9.10 并入 PID1 SIGTERM 与工具 index 隔离
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -414,6 +415,40 @@ class _ExclusiveHTTPServer(ThreadingHTTPServer):
                 self._connection_slots.release()
             except ValueError:
                 pass
+
+
+def serve_http_server(server):
+    """Handle PID 1 SIGTERM without calling shutdown on the serving thread.
+
+    SystemExit unwinds serve_forever into server_close and normal atexit cleanup.
+    HTTPServer.shutdown() must not be used in this handler: it waits for the same
+    thread's serve_forever loop and deadlocks. Repeated TERM during close is ignored.
+    """
+    previous = None
+    installed = False
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise SystemExit(0)
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGTERM, terminate)
+            installed = True
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log("bye")
+    finally:
+        stopping = True
+        try:
+            server.server_close()
+        finally:
+            if installed:
+                signal.signal(signal.SIGTERM, previous)
 
 
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -5757,6 +5792,62 @@ def _frame_without_content(payload):
     return out
 
 
+def _sse_normalize_tool_call_indices(frames):
+    states = {}
+    for raw in frames:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        data = strip_data_prefix(text)
+        try:
+            payload = json.loads(data) if data and data != "[DONE]" else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+            yield raw
+            continue
+        changed = False
+        for choice_position, choice in enumerate(payload["choices"]):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+            if not isinstance(calls, list):
+                continue
+            choice_index = choice.get("index")
+            if not isinstance(choice_index, int) or isinstance(choice_index, bool):
+                choice_index = choice_position
+            state = states.setdefault(choice_index, {"ids": {}, "active": {}, "slots": {}})
+            for call_position, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                wire_index = call.get("index")
+                if not isinstance(wire_index, int) or isinstance(wire_index, bool) or wire_index < 0:
+                    wire_index = call_position
+                call_id = call.get("id")
+                call_id = call_id if isinstance(call_id, str) and call_id.strip() else ""
+                slot = state["ids"].get(call_id) if call_id else None
+                if slot is None:
+                    slot = state["active"].get(wire_index)
+                    if slot is not None and call_id and slot["id"] and slot["id"] != call_id:
+                        slot = None
+                if slot is None:
+                    normalized_index = wire_index
+                    if normalized_index in state["slots"]:
+                        normalized_index = max(state["slots"], default=-1) + 1
+                    slot = {"index": normalized_index, "id": call_id}
+                    state["slots"][normalized_index] = slot
+                if call_id:
+                    slot["id"] = call_id
+                    state["ids"][call_id] = slot
+                state["active"][wire_index] = slot
+                if call.get("index") != slot["index"] or isinstance(call.get("index"), bool):
+                    call["index"] = slot["index"]
+                    changed = True
+        if changed:
+            yield ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+        else:
+            yield raw
+
+
 def _sse_fill_tool_call_ids(frames):
     """流式出口保证：tool_call 增量的 id 必须非空（issue #47）。
 
@@ -6757,6 +6848,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None, audit=None):
     各阶段都是生成器，顺序即数据流方向；用具名中间变量而非层层嵌套 ——
     出口是包装器这一事实要能被静态断言钉住（见 _test_stream_tool_ids 第 7 节）。
     """
+    frames = _sse_normalize_tool_call_indices(frames)
     leaked = _recover_leaked_tool_calls_inner(frames, allowed_names)
     dsml = _sse_recover_dsml(leaked, allowed_names)
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
@@ -9989,7 +10081,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     first_chunk_at = None
     created = None
 
-    for line in iter_inner_sse(resp, holder=holder):
+    for line in _sse_normalize_tool_call_indices(iter_inner_sse(resp, holder=holder)):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             continue
@@ -15511,15 +15603,7 @@ def main():
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("bye")
-    finally:
-        try:
-            server.server_close()
-        except Exception:
-            pass
+    serve_http_server(server)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,12 @@ for reuse in (0, 1):
 
 server = P._ExclusiveHTTPServer(("127.0.0.1", 0), P.Handler)
 port = server.server_port
-check("server is actually listening", server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1)
+client = socket.create_connection(("127.0.0.1", port), timeout=2)
+accepted, _ = server.socket.accept()
+client.close()
+accepted.settimeout(2)
+check("server is actually listening", accepted.recv(1) == b"")
+accepted.close()
 if P.IS_WINDOWS:
     check("kernel exclusive option enabled", server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE) == 1)
     intruder = socket.socket()
