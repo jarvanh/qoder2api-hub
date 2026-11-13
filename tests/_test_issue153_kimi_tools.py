@@ -291,8 +291,13 @@ with ExitStack() as stack:
         raised = exc
     check("非流式聚合非法 JSON 仍抛 InvalidToolArguments", raised is not None)
     check("错误信息不包含原始参数", raised is not None and "TARGET-private" not in str(raised))
-    check("非法参数禁止任何次数自动重试", all(P.should_retry_envelope(P.InvalidToolArguments(), sent, attempt) is False
-          for sent, attempt in [(0, 0), (0, 1), (1024, 0), (0, 99)]))
+    # fork 语义（issue #37 follow-up）：坏参数回声默认允许同账号重发
+    # BAD_ARGS_MAX_RETRIES 次，但已吐出字节或预算耗尽后必须 fail-closed。
+    # 上游本套件按「永不重发」断言，与 fork 设计冲突，这里按 fork 预算校验。
+    check("非法参数按 fork 预算重发：未吐字节且未超预算才允许",
+          P.should_retry_envelope(P.InvalidToolArguments(), 0, 0) is (P.BAD_ARGS_MAX_RETRIES > 0)
+          and P.should_retry_envelope(P.InvalidToolArguments(), 0, P.BAD_ARGS_MAX_RETRIES) is False
+          and P.should_retry_envelope(P.InvalidToolArguments(), 1024, 0) is False)
     # 原生 tool_calls 的坏参数同样不得有成功收尾（参数增量允许流式先发）。
     native_bad = [sse(frame({"tool_calls": [{"index": 0, "id": "call_fixture_bad", "type": "function",
                     "function": {"name": "Write", "arguments": dirty}}]})),

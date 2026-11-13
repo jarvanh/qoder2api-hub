@@ -188,8 +188,10 @@ try:
     check("非流式 aggregate 调用方补齐 except RateLimited（防掉 502）",
           _src16.count("except RateLimited as exc:") >= 8,
           _src16.count("except RateLimited as exc:"))
+    _vm = __import__("re").search(r'VERSION = "(\d+)\.(\d+)\.(\d+)"', _src16)
     check("版本号随上游对齐递增（fork 与上游同号显式标注）",
-          'VERSION = "1.9.5"' in _src16
+          _vm is not None
+          and tuple(int(x) for x in _vm.groups()) >= (1, 9, 5)
           and "fork 维护版" in _src16)
 finally:
     _restore()
