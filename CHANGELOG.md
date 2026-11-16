@@ -1,5 +1,13 @@
 # 更新日志
 
+## v1.9.11 — 503 终局补 Retry-After（下游编排契约）
+
+- 所有 503 响应在没有显式 retry_after 时补 `Retry-After`（默认 8 秒，`QD_TRANSIENT_RETRY_AFTER` 可调，0 = 关闭）。
+- 动机：上游瞬时故障耗尽后返回裸 503 时，OmniRoute 会把该模型判为节点故障 → 模型锁 → 直接把错误抛给客户端，
+  既不等待重试也不降级。带 RA 后按「等待后可重试」处理，符合「瞬态抖动尽量留在高优先级渠道」的路由目标。
+- 行为不变：429/402/401/400 语义、显式 retry_after（排队、限流）优先级、503 响应体结构。
+- 实测（4 账号镜像实例 + mock 故障注入）：持续 503 下响应头出现 `Retry-After: 8`；503×2→200 仍由网关内部阶梯自行吸收。
+
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
 ## 版本号规则

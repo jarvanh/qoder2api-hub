@@ -34,6 +34,10 @@ import re
 import json
 import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
+# 503 终局的默认 Retry-After（秒）：上游瞬时故障耗尽后告诉下游「多久后值得再来」。
+# 0 = 关闭（回退旧行为：503 不带 RA）。默认 8s ≈ trae2api 的 busy 语义：
+# 足够短，OmniRoute 等得起；又不至于让客户端在几秒内反复打穿整个账号池。
+TRANSIENT_RETRY_AFTER = max(0, int(os.environ.get("QD_TRANSIENT_RETRY_AFTER", "8")))
 # Hardening for a public/LAN listener: ThreadingHTTPServer otherwise accepts an
 # unbounded number of sockets and lets a silent client hold a thread forever.
 MAX_CONNECTIONS = max(1, int(os.environ.get("QD_MAX_CONNECTIONS") or "64"))
@@ -77,7 +81,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.10"  # fork 维护版：并入上游 v1.9.6–v1.9.9，与上游版本对齐递增；1.9.5 安全加固、1.9.9 并入 VPC 与 kimi tools 修复、1.9.10 并入 PID1 SIGTERM 与工具 index 隔离
+VERSION = "1.9.11"  # fork 维护版：并入上游 v1.9.6–v1.9.9；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -8451,6 +8455,16 @@ def _to_int_status(status):
         return 502
 
 
+def _status_is_503(code):
+    """code 是否 503（int / str 均可）。QD_TRANSIENT_RETRY_AFTER=0 时恒 False（关闭补丁）。"""
+    if TRANSIENT_RETRY_AFTER <= 0:
+        return False
+    try:
+        return int(code) == 503
+    except (TypeError, ValueError):
+        return False
+
+
 # issue #108：上游对「额度耗尽」/「每日计费上限」也回 403，与「凭证被拒」同码不同因：
 # 重试和 60s 冷却都不会变好，账号还会被反复挑中（每次白等 60-105s）。
 _QUOTA_112_COOLDOWN = 1800
@@ -11636,6 +11650,11 @@ class Handler(BaseHTTPRequestHandler):
         extra = {}
         if retry_after:
             extra["Retry-After"] = int(retry_after)
+        elif _status_is_503(code):
+            # 503 必须带 Retry-After（HTTP 语义 + OmniRoute 契约，2026-11-16）：
+            # 没有 RA 时 OmniRoute 会把 503 判成节点故障 -> 模型锁 -> 直接抛错，
+            # 既不等待重试也不降级。带 RA 后走「等待后重试同渠道」路径。
+            extra["Retry-After"] = TRANSIENT_RETRY_AFTER
         if fallback_hint:
             try:
                 _hint_ok = int(code) == 503
