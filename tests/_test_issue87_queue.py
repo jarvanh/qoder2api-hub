@@ -24,8 +24,8 @@ check("#87 UpstreamQueued 映射为 503（暂时不可用，可重试）", _exc.
 check("#87 携带 Retry-After 秒数", _exc.retry_after == 30)
 _msg, _et = P.friendly_upstream_error(503, '{"code":"10605","isQueued":true}')
 check("#87 fast 模式给中文原因", "排队" in _msg and _et == "upstream_queued")
-check("#87 文案说明不是 Key/账号/网络问题",
-      "不是你的 Key" in _msg, _msg[:60])
+check("#158 排队原因保留未知，不排除账号/出口因素",
+      "原因未确认" in _msg and "不是你的 Key" not in _msg, _msg[:120])
 
 # ---------------------------------------------------------------- visible 等待
 print("[87] visible_queue_acquire")

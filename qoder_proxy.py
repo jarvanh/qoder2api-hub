@@ -81,7 +81,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.11"  # fork 维护版：并入上游 v1.9.6–v1.9.9；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
+VERSION = "1.9.11"  # fork 维护版：并入上游 v1.9.6–v1.9.10；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -7301,7 +7301,7 @@ def _quota_hint(detail):
     """上游 detail -> 人话解释（issue #123 后续）。只认已实测过的码。"""
     d = str(detail or "")
     if "10605" in d or "isQueued" in d:
-        return ("上游排队中（10605 / RESOURCE_LIMIT）：等 retryAfterSeconds 后会放行，")
+        return ("上游排队中（10605 / RESOURCE_LIMIT）：建议按 retryAfterSeconds 退避，不保证放行；原因未确认。")
     if "112" in d and ("pricingUrl" in d or "code" in d):
         return "上游模型额度/套餐拒绝（112）：不代表总余额为零，核对实际账号、区域和模型权限"
     if "Billing daily count exceeded" in d or "110" in d:
@@ -7876,7 +7876,6 @@ QUEUE_FAST_MODEL_GLOBS = tuple(
     for s in QUEUE_FAST_MODELS_RAW.replace(";", ",").split(",")
     if s.strip() and any(c in s for c in "*?"))
 
-
 def _is_fast_queue_model(model="", model_key=""):
     """该模型（公开名或 modelKey，大小写不敏感）是否命中 QD_QUEUE_FAST_MODELS。"""
     if not QUEUE_FAST_MODELS and not QUEUE_FAST_MODEL_GLOBS:
@@ -7895,6 +7894,113 @@ def _is_fast_queue_model(model="", model_key=""):
     return False
 
 
+# #158: response-scoped observations, never a provider-risk verdict. Raw error
+# text, account IDs, endpoints and model names are not retained in the snapshot.
+_QUEUE_OBSERVATIONS = OrderedDict()
+_QUEUE_OBSERVATION_LOCK = threading.Lock()
+_QUEUE_OBSERVATION_TTL = 86400
+_QUEUE_OBSERVATION_GAP = 900
+_QUEUE_OBSERVATION_LIMIT = 256
+
+
+def queue_fields(detail):
+    """Read bounded nested JSON (some providers encode message as JSON text)."""
+    pending = [detail]
+    found = {}
+    for _ in range(16):
+        if not pending:
+            break
+        value = pending.pop(0)
+        if isinstance(value, str):
+            if len(value) > 8192:
+                continue
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if isinstance(value, str):
+                pending.append(value)
+                continue
+        if not isinstance(value, dict):
+            continue
+        for key in ("code", "isQueued", "queueType", "queueCount",
+                    "retryAfterSeconds", "serviceAvailable"):
+            if key in value:
+                found[key] = value[key]
+        for key in ("body", "message", "error", "data"):
+            if isinstance(value.get(key), (dict, str)):
+                pending.append(value[key])
+    if str(found.get("code")) != "10605" and found.get("isQueued") is not True:
+        return None
+    kind = found.get("queueType")
+    kind = kind if isinstance(kind, str) and re.fullmatch(r"p[0-9]", kind) else "unknown"
+    result = {"queue_type": kind, "service_available": None,
+              "retry_after": None, "queue_count": None, "reason": "unknown"}
+    if type(found.get("serviceAvailable")) is bool:
+        result["service_available"] = found["serviceAvailable"]
+    for key, source in (("retry_after", "retryAfterSeconds"), ("queue_count", "queueCount")):
+        value = found.get(source)
+        if type(value) is int and 0 <= value <= 86400:
+            result[key] = value
+    return result
+
+
+def _queue_observation_prune(now):
+    for key, value in list(_QUEUE_OBSERVATIONS.items()):
+        if now - value["last"] > _QUEUE_OBSERVATION_TTL:
+            del _QUEUE_OBSERVATIONS[key]
+
+
+def note_queue_observation(scope, detail=None, success=False):
+    if not isinstance(scope, str) or not scope:
+        return
+    fields = queue_fields(detail) if not success else None
+    if not fields and not success:
+        return
+    now = time.monotonic()
+    with _QUEUE_OBSERVATION_LOCK:
+        _queue_observation_prune(now)
+        if success:
+            _QUEUE_OBSERVATIONS.pop(scope, None)
+            return
+        item = _QUEUE_OBSERVATIONS.get(scope)
+        if item is None or now - item["last"] > _QUEUE_OBSERVATION_GAP:
+            item = {"first": now, "count": 0}
+        item.update(last=now, count=item["count"] + 1, fields=fields)
+        _QUEUE_OBSERVATIONS[scope] = item
+        _QUEUE_OBSERVATIONS.move_to_end(scope)
+        while len(_QUEUE_OBSERVATIONS) > _QUEUE_OBSERVATION_LIMIT:
+            _QUEUE_OBSERVATIONS.popitem(last=False)
+
+
+def queue_observation_snapshot():
+    now = time.monotonic()
+    with _QUEUE_OBSERVATION_LOCK:
+        _queue_observation_prune(now)
+        items = list(_QUEUE_OBSERVATIONS.values())
+        active = [v for v in items if now - v["last"] <= _QUEUE_OBSERVATION_GAP]
+        persistent = [v for v in active if v["count"] >= 3 and v["last"] - v["first"] >= 900]
+        types = {}
+        for item in active:
+            kind = item["fields"]["queue_type"]
+            types[kind] = types.get(kind, 0) + 1
+        return {"reason": "unknown", "persistent": bool(persistent),
+                "active_scopes": len(active), "persistent_scopes": len(persistent),
+                "observations": sum(v["count"] for v in active), "queue_types": types,
+                "max_observed_span_seconds": int(max((v["last"] - v["first"] for v in active), default=0)),
+                "retention_seconds": _QUEUE_OBSERVATION_TTL,
+                "process_only": True, "max_gap_seconds": _QUEUE_OBSERVATION_GAP,
+                "scope_limit": _QUEUE_OBSERVATION_LIMIT,
+                "hint": "持续排队不等于已确认风控；p4 与 serviceAvailable 不能单独证明原因，需官方客户端对照或上游确认。"}
+
+
+def _queue_scope(account, model, endpoint=None):
+    if endpoint is None:
+        endpoint = qoder_accounts.account_realm_config(account).get("gateway", "")
+    value = (str(getattr(account, "uid", "")), str(endpoint), str(model))
+    return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
+
 def queue_mode(model="", model_key=""):
     """当前排队策略（visible / fast / wait）。
 
@@ -7909,7 +8015,7 @@ def queue_mode(model="", model_key=""):
 
 QUEUE_MSG_WAIT_ZH = "上游模型排队中（10605 / RESOURCE_LIMIT）：已等待 %d 秒，仍在队列中"
 QUEUE_MSG_FAIL_ZH = ("上游模型排队超时（已等待 %d 秒，上限 %d 秒）：请稍后重试，"
-                     "或换一个模型/区域。这不是你的 Key、账号或网络问题。")
+                     "请按建议退避；持续排队原因未确认，不应无限重试或据此判定账号正常/风控。")
 
 
 def visible_queue_acquire(seed_exc, reopen, emit, budget_secs=None, started=None):
@@ -8381,7 +8487,7 @@ def friendly_upstream_error(code, detail):
     if ("10605" in detail or "isQueued" in detail
             or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
         return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
-                "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
+                "请按建议退避；持续排队原因未确认，不能仅凭队列号排除账号或出口因素。"
                 "上游详情：%s" % (_safe[:160] or "(无详情)")
                 + _QUEUED_CLIENT_HINT, "upstream_queued")
     # issue #108：额度耗尽也走 403，但重试无效——让客户端看懂该充值/换号
@@ -8409,7 +8515,7 @@ def friendly_upstream_error(code, detail):
     # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
-                "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
+                "仍未放行；持续排队原因未确认，不能仅凭队列号判定容量或风控。"
                 "上游详情：%s" % (_safe[:200] or "(无详情)")
                 + _QUEUED_CLIENT_HINT, "upstream_queued")
     if "pricingUrl" in detail:
@@ -9584,7 +9690,16 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 # issue #38：上游排队 -> 等放行后重试同一账号（不把排队 JSON
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
+                note_queue_observation(_queue_scope(account, model_key, raw_url), detail)
+                if usage_ctx.get("_queue_probe_once"):
+                    usage_ctx["_queue_probe_account"] = account
                 qwait = _queue_wait_seconds(detail)
+                if usage_ctx.get("_queue_probe_once"):
+                    _team_release(account, _team_lease)
+                    _team_lease = None
+                    if qwait > 0:
+                        raise UpstreamQueued(qwait, detail)
+                    raise UpstreamStatus(exc.code, detail)
                 _can_wait = (qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS
                              and qwait <= QUEUE_WAIT_MAX_SECS
                              and (time.time() - queue_start) + qwait
@@ -9655,6 +9770,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     continue
                 break
             except Exception as exc:
+                if usage_ctx.get("_queue_probe_once"):
+                    _team_release(account, _team_lease)
+                    _team_lease = None
+                    raise
                 last_exc = exc
                 detail = ""
                 # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
@@ -9701,6 +9820,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         model=str(payload.get("model") or ""))
                 except Exception:
                     pass
+            try:
+                resp._qd_queue_scope = _queue_scope(account, model_key, raw_url)
+            except (AttributeError, TypeError):
+                pass
             if _team_lease:
                 # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
                 return _TeamLeaseResp(resp, account, _team_lease), account, encoded
@@ -10040,6 +10163,7 @@ def iter_inner_sse(resp, holder=None):
       - body == "[DONE]"       -> 结束迭代
       - 内层 chunk 里的 usage 记入 holder
     """
+    scope = getattr(resp, "_qd_queue_scope", None)
     for raw in resp:
         if isinstance(raw, bytes):
             try:
@@ -10060,8 +10184,10 @@ def iter_inner_sse(resp, holder=None):
         status = outer.get("statusCodeValue")
         body = outer.get("body")
         if status not in (None, 200, "200"):
+            note_queue_observation(scope, body)
+            limit = 8192 if holder and holder.get("_queue_probe_once") else 400
             raise UpstreamStatus(status, body if isinstance(body, str)
-                                 else json.dumps(outer, ensure_ascii=False)[:400])
+                                 else json.dumps(outer, ensure_ascii=False)[:limit])
         if not isinstance(body, str):
             continue
         if body == "[DONE]":
@@ -10073,6 +10199,16 @@ def iter_inner_sse(resp, holder=None):
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
+            note_queue_observation(scope, inner.get("error"))
+            if holder is not None and holder.get("_queue_probe_once") and inner.get("error"):
+                raise UpstreamStatus(502, json.dumps(inner["error"], ensure_ascii=False)[:8192])
+            choices = inner.get("choices")
+            if not inner.get("error") and isinstance(choices, list) and any(
+                    isinstance(ch, dict) and ch.get("finish_reason") in ("stop", "tool_calls", "function_call", "length")
+                    for ch in choices):
+                note_queue_observation(scope, success=True)
+                if holder is not None:
+                    holder["_upstream_finished"] = True
             if holder is not None and inner.get("usage") \
                     and not holder.get("usage"):
                 holder["usage"] = inner["usage"]
@@ -12099,6 +12235,7 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
                 "risk": risk_snapshot(),
+                "queue_observation": queue_observation_snapshot(),
                 "env": env_report(),
                 "quality": quality_snapshot(),
                 **inflight_snapshot(),
@@ -13206,11 +13343,17 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_diag_queue(self, payload):
         # issue #139：上游排队（10605）诊断——一次最小探测，把业务码、
         # retryAfterSeconds、queueCount 与机器身份来源一起回显。
-        # 目的：让用户能自己区分「上游模型排队」与「账号/身份被针对」。
+        # 排队字段只作观测，不据此断言容量、账号或身份被针对。
         model = str((payload or {}).get("model") or "").strip() or "auto"
         realm = (payload or {}).get("realm") or self._request_realm()
         uid = str((payload or {}).get("uid") or "").strip()
-        acc = POOL.get(uid) if uid else None
+        acc = POOL.get(uid) if uid and POOL else None
+        if uid and acc is None:
+            return self._error(404, "no such account")
+        if realm is not None and realm not in ("cn", "intl"):
+            return self._error(400, "invalid realm")
+        if acc is not None and realm is not None and acc.realm != realm:
+            return self._error(400, "account realm does not match requested realm")
         probe = {
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
@@ -13220,23 +13363,36 @@ class Handler(BaseHTTPRequestHandler):
         out = {"ok": True, "model": model, "realm": realm,
                "account": (acc.uid[:8] if acc else None),
                "code": None, "kind": "", "retry_after": None,
-               "queue_count": None, "detail": "", "hint": ""}
+               "queue_count": None, "queue_type": "unknown",
+               "service_available": None, "reason": "unknown",
+               "detail": "", "hint": ""}
         t0 = time.time()
+        probe_ctx = {"_queue_probe_once": True}
         try:
             resp, used, _ = open_upstream(
                 probe, target_realm=realm,
-                only_account=acc if acc else None)
+                only_account=acc if acc else None,
+                usage_ctx=probe_ctx)
+            out["account"] = used.uid[:8] if used else out["account"]
+            out["realm"] = used.realm if used else realm
+            acc = used or acc
             try:
-                resp.read(2048)
-            except Exception:
-                pass
-            resp.close()
+                holder = {"_queue_probe_once": True}
+                aggregate_stream(resp, model, holder=holder)  # HTTP 200 is not success
+                if not holder.get("_upstream_finished"):
+                    raise UpstreamStatus(502, "upstream ended without a completed response")
+            finally:
+                resp.close()
             out["code"] = 200
             out["kind"] = "ok"
             out["account"] = used.uid[:8] if used else out["account"]
         except UpstreamStatus as exc:
+            acc = probe_ctx.get("_queue_probe_account") or acc
+            if acc is not None:
+                out["account"], out["realm"] = acc.uid[:8], acc.realm
             detail = str(getattr(exc, "detail", "") or "")
             out["code"] = exc.status
+            out["kind"] = "error"
             out["detail"] = detail[:400]
             out["hint"] = _quota_hint(detail)
             if "10605" in detail or "isQueued" in detail:
@@ -13263,12 +13419,16 @@ class Handler(BaseHTTPRequestHandler):
             out["identity_source"] = "native" if _native else "derived"
         except Exception:
             out["identity_source"] = "unknown"
+        out["queue_observation"] = queue_observation_snapshot()
         if out["kind"] == "queued":
+            fields = queue_fields(detail) or {}
+            out.update(fields)
+            out["detail"] = ""  # never expose arbitrary provider body in queue telemetry
             _cnt = out.get("queue_count")
-            out["advice"] = ("上游模型排队中（10605）。这与 Key/账号凭证无关："
-                             "官方客户端同一时刻也可能排队，只是它不提示。"
-                             "可换模型或换区域重试；也可设 QD_QUEUE_WAIT_MODE=fast "
-                             "让请求立即返回 429 而不是等待。")
+            out["advice"] = ("上游排队原因未确认；p4 与 serviceAvailable:true 不足以确认风控或容量。"
+                             "请按 retryAfterSeconds 退避并避免无限重试，使用官方客户端做同账号同时间对照，"
+                             "必要时向上游支持确认。QD_QUEUE_WAIT_MODE=fast 仅改变本地等待策略，"
+                             "初始排队快速返回 503，不会解除限制。")
             if _cnt:
                 out["advice"] += " 当前队列长度约 %d。" % _cnt
         elif out["kind"] in ("exhausted", "daily"):

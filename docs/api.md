@@ -19,7 +19,7 @@
 | GET | `/v1/models` | Key | 模型清单；`?merge_realms=1` 同时返回两个区域的模型 |
 | GET | `/models/refresh`（或 `/v1/models/refresh`） | Key | 立即向上游重新获取模型清单，并更新磁盘缓存。区域的选择规则与推理请求相同 |
 
-- 指定区域：`X-Realm: cn|intl` 请求头，或 `?realm=` 查询参数
+- 指定区域：使用 `X-Realm: cn|intl` 请求头，或 `?realm=cn|intl` 查询参数；普通推理 JSON 中的 `realm` 不参与路由。Key 的区域绑定优先于请求头/查询参数，需核对实际响应区域。`/diag/queue` 的 JSON `realm` 是该诊断接口显式支持的例外，不应推广到推理接口。
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
 
 ## 额度构成与端点自动探测
@@ -49,27 +49,34 @@ curl -s -X POST http://127.0.0.1:8790/credits/probe \\
 
 ## 排队诊断（`POST /diag/queue`，面板鉴权）
 
-上游对**模型**做并发排队（`10605` / `isQueued`）时，网关会按 `retryAfterSeconds` 等待重试，预算耗尽后返回 429 + `Retry-After`。这类错误与 Key/账号凭证无关，但客户端常常归类成「鉴权失败」（#137 之后文案已去敏并附英文原因）。
+issue #158 报告两个区域、所有账号持续 `10605` / `p4` / `serviceAvailable:true`，原因未确认。排队信号不证明模型容量不足，也不证明账号、凭证、套餐或网络无问题。`p4` / `p3` 是未文档化的标签，不映射为风险等级；`serviceAvailable:true` 不代表本次请求已获准推理。
 
-想确认某个模型此刻是不是在排队：
+诊断会实际发出**一次上游探测**（不是只读健康检查）。它使用 `aggregate_stream()` 消费真实 SSE，包括 HTTP 200 流内的错误信封；不会只读一段响应就判成功，空流或仅握手的流不算成功，必须有有效的上游成功终止帧；也不在一次调用中循环等待、轮换账号或进行 HTTP/传输重试探测。不要高频轮询此接口。
 
 ```bash
-curl -s -X POST http://127.0.0.1:8790/diag/queue \\
-  -H 'Content-Type: application/json' -H "X-Panel-Token: $TOKEN" \\
-  -d '{"model":"Qwen3.8-Flash","realm":"cn"}'
+curl -sS -X POST 'http://HOST/diag/queue' \
+  -H 'Content-Type: application/json' -H 'X-Panel-Token: TOKEN' \
+  -d '{"uid":"TARGET","model":"TARGET","realm":"cn"}'
 ```
 
-返回：
+请求参数：`model` 为待核对模型（省略为 `auto`），`uid` 可指定待核对账号；`realm` 在此诊断处理器中显式支持 JSON 传入。一次探测只代表实际使用账号/端点/模型的本次结果，不能代表全部账号、另一区域或持续状态。
 
-| 字段 | 含义 |
+| 字段 | 含义与边界 |
 |---|---|
-| `kind` | `ok` / `queued` / `exhausted` / `daily` / `error` |
-| `code` | 上游 HTTP 状态（排队是 403 信封 + 10605 业务码） |
-| `retry_after` / `queue_count` | 上游给的等待秒数与队列长度（有就回显） |
-| `identity_source` | `native`（官方风控桥）或 `derived`（派生身份）——判断「是否被当成陌生设备」 |
-| `advice` | 一句话结论 + 可执行建议 |
+| `kind` | `ok` / `queued` / `exhausted` / `daily` / `error` 等诊断分类；`ok` 不是“账号永远不受限制” |
+| `code` | 诊断记录的状态码；不要仅凭 HTTP 200 判断流内没有排队，也不要把它与上游业务码 10605 混同 |
+| `queue_type` | 接受 `p0` 至 `p9` 的队列标签，其余/缺失为 `unknown`；未公开定义风险/优先级语义 |
+| `service_available` | 上游可用性布尔标志；可以与 `kind=queued` 同时存在 |
+| `retry_after` / `queue_count` | 解析的建议等待秒数 / 队列计数；仅接受 0–86400 的整数，未提供或格式无效时为空，不补造 |
+| `reason` | `unknown`：本地解析不能确认根因 |
+| `identity_source` | `native` / `derived` / `unknown`，本地身份来源，不证明上游如何判定风险 |
+| `advice` | 有限等待、受控对照与支持确认的建议，不是根因认定 |
+| `detail` | 排队结果为空字符串；不公开原始队列文本 |
+| `elapsed_ms` | 本次探测耗时 |
 
-`kind=queued` 时建议换模型/换区域，或设 `QD_QUEUE_WAIT_MODE=fast`（立即返回 429，不等待）。
+遇到排队，遵守 `retryAfterSeconds` / HTTP `Retry-After`，并设有限次数和总预算；到限停止，不无限重试。普通推理默认 `QD_QUEUE_WAIT_MODE=visible`；`fast` 快速返回带 `Retry-After` 的 503，不是 429，也不修复排队。流已建立时可能通过流内事件报告排队/超时。
+
+持续现象需要**同账号、同时间窗口、同区域、同明确模型**对照官方客户端与网关，保持输入/出口等变量一致、顺序执行并记录起止时间。共同排队或仅网关排队都不足以单独确认容量或策略原因；将脱敏结构化结果交官方支持确认标签含义、账号/套餐资格和服务状态。不要通过换身份/账号/出口绕过，也没有住宅 IP 必定恢复的保证。完整操作见 [持续排队排查手册](<risk-control-playbook.md>)。
 
 ## 输出上限（max_tokens）
 
@@ -90,12 +97,39 @@ curl -s -X POST http://127.0.0.1:8790/diag/queue \\
 | GET | `/realm` | 公开 | 当前全局出口，以及自动选区是否开启 |
 | GET | `/credits/summary` | Key | 各账号余额汇总，只返回本地记录的数值，**不请求上游**，适合其他系统轮询 |
 
-`/health` 中用于排查的两个字段（都不含凭证）：
+`/health` 中用于排查的字段（不含凭证）：
 
 | 字段 | 内容 |
 |---|---|
 | `risk` | 网关启动以来收到的风控类信号次数：`queue`（排队）、`rate`（429 限流）、`rejected`（403 拒绝）、`version_gate`（430 版本过低），以及最近一次信号的详情 |
+| `queue_observation` | `queue_observation_snapshot()` 返回的安全聚合，排队原因保持 `unknown`；精确字段见下文 |
 | `env` | 运行环境自检：`container`（是否在容器中）、`proxy`（是否配置了出口代理）、`accounts_writable`（`accounts/` 是否可写）、`identity_cached`（机器身份是否已缓存）、`clock_skew_s`（与上游的时钟偏差，秒）、`traffic_guard`（流量守卫模式） |
+
+### `queue_observation` 的公开字段与限制
+
+| 字段 | 类型 / 说明 |
+|---|---|
+| `reason` | 字符串，固定为 `unknown`；不由排队标签推断根因 |
+| `persistent` | 布尔值，是否至少有一个作用域满足本地持续判据 |
+| `active_scopes` / `persistent_scopes` | 最近一次观察距现在不超过 900 秒的活跃作用域数 / 其中满足持续判据的作用域数 |
+| `observations` | 当前活跃作用域内排队样本总数，不是请求总数或历史累计 |
+| `queue_types` | `p0` 至 `p9` / `unknown` 的活跃作用域计数映射；不表示风险等级或全局队列人数 |
+| `max_observed_span_seconds` | 当前活跃作用域中的最大观察跨度（秒），不是已证明连续不可用的时长 |
+| `process_only` | `true`：仅当前进程内存 |
+| `max_gap_seconds` | `900`：持续序列允许的最大相邻观察间隔 |
+| `scope_limit` | `256`：最多保留的内部作用域条目数 |
+| `retention_seconds` | `86400`：内部条目的 24 小时 TTL |
+| `hint` | 对观察结果及边界的说明 |
+
+快照仅统计最后一次排队观察距现在不超过 900 秒的活跃作用域；超过此间隔即不再计入活跃/持续聚合，下一次观察重新开始序列，即使内部条目尚未达到 24 小时 TTL。
+
+内部作用域为实际使用的账号 UID + 实际选中的推理网关 URL（含备用主机） + 实际模型键（modelKey）的 SHA256 摘要；公开响应不暴露摘要键、账号、端点、模型、原始队列文本、请求标识、提示词或凭证。
+
+同一作用域至少 **3 次**排队观察，首末跨度 **≥900 秒**，相邻观察最大间隔 **≤900 秒**，才满足持续判据；不同作用域不能合并计数来达到阈值。成功仅在收到上游成功终止帧后重置匹配作用域，HTTP 200 握手不重置，其他账号/端点/模型成功也不清全局。
+
+状态 TTL 为 **24 小时**，最多 **256** 个条目，容量淘汰、过期和进程重启都会丢失观察。它不是跨重启/完整历史数据库，也不能证明两次采样之间始终排队；无样本、采样不足或 `persistent=false` 不能证明恢复。`GET /health` 不发送上游探测，多实例状态不会合并。
+
+现有 `QD_TRAFFIC_GUARD=on` 只是把全部账号纳入**按账号**闸门：默认并发 1、最小间隔 400ms，等待租约默认 30 秒后 fail-open 放行；因此不是严格全局限流器，不保证消除排队或修复上游风险策略。本文不改变任何默认值。
 
 `/credits/summary` 返回的结构：
 

@@ -29,8 +29,8 @@ check("识别排队/额度/正常三类", '"queued"' in _body and '"exhausted"' 
       and '"ok"' in _body)
 check("回显机器身份来源（native/derived）",
       'out["identity_source"]' in _body)
-check("排队时给出「与凭证无关」+ fast 模式建议",
-      "与 Key/账号凭证无关" in _body and "QD_QUEUE_WAIT_MODE=fast" in _body)
+check("#158 排队原因未知且 fast 不解除限制",
+      "原因未确认" in _body and "QD_QUEUE_WAIT_MODE=fast" in _body and "不会解除限制" in _body)
 check("额度类给「充值或换号」", "充值或换号" in _body)
 check("上游异常不 500（结构化返回）", "except Exception as exc:" in _body)
 
