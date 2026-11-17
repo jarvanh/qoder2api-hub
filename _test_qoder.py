@@ -290,9 +290,13 @@ check("model_entry reasoning efforts + default",
       (me.get("reasoning_efforts"), me.get("reasoning_default_effort")))
 check("model_entry can_disable", me.get("reasoning_can_disable") is True)
 check("model_entry is_free/is_new", me.get("is_free") is True and me.get("is_new") is True)
-check("model_entry does NOT fabricate max_output_tokens (official data has none)",
-      "max_output_tokens" not in me and "max_completion_tokens" not in me,
-      sorted(k for k in me if "output" in k))
+# 2026-11-17 主人批准：官方文档值可先声明（未实测时兜底），否则下游编排
+# （OmniRoute）的 pool 校验会把本腿当成承接不了大 max_tokens。
+check("model_entry declares max_output_tokens from official defaults",
+      me.get("max_output_tokens") == P.default_max_output("qmodel_38max")
+      and me.get("max_output_tokens") == 65536
+      and me.get("max_completion_tokens") == me.get("max_output_tokens"),
+      (me.get("max_output_tokens"), P.default_max_output("qmodel_38max")))
 me_off = P.model_entry("smodel", entry_i)
 check("model_entry disabled shows enabled=false (badge, not filtered)",
       me_off["enabled"] is False)

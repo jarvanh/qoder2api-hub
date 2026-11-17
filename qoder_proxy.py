@@ -8877,8 +8877,13 @@ QD_MODEL_MAX_OUTPUT_DEFAULTS = {
 }
 
 
-def default_max_output(model):
-    """官方文档兜底值（大小写不敏感）；未知模型返回 None。"""
+def default_max_output(model, realm=None):
+    """官方文档兜底值；未知模型返回 None。
+
+    入参可能是**内部 key**（auto / qfmodel / gfmodel …）也可能是展示名
+    （Auto / Qwen3.8-Flash …）：先按 key 直查，再经 catalog 的
+    display_name 反查展示名，最后按大小写不敏感匹配。
+    """
     key = str(model or "").strip()
     if not key:
         return None
@@ -8886,9 +8891,19 @@ def default_max_output(model):
     if hit:
         return hit
     low = key.lower()
-    for name, value in QD_MODEL_MAX_OUTPUT_DEFAULTS.items():
-        if name.lower() == low:
-            return value
+    # 内部 key → 展示名（catalog 里 key/display_name 成对出现）
+    try:
+        meta = catalog_meta_for(key, realm or CURRENT_REALM) or {}
+    except Exception:
+        meta = {}
+    shown = str(meta.get("display_name") or meta.get("name") or "").strip()
+    for cand in (shown, key):
+        if not cand:
+            continue
+        cl = cand.lower()
+        for name, value in QD_MODEL_MAX_OUTPUT_DEFAULTS.items():
+            if name.lower() == cl:
+                return value
     return None
 
 
@@ -8908,7 +8923,7 @@ def max_output_limit(model, realm=None):
         v = (meta or {}).get(k)
         if isinstance(v, int) and v > 0:
             return v
-    return default_max_output(model)
+    return default_max_output(model, realm)
 
 
 def _context_token_count(label, meta):
