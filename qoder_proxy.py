@@ -81,7 +81,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.11"  # fork 维护版：并入上游 v1.9.6–v1.9.10；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
+VERSION = "1.9.12"  # fork 维护版：并入上游 v1.9.6–v1.9.10；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -8851,8 +8851,49 @@ def _resolve_upstream_key_safe(model, realm=None):
         return ""
 
 
+# 官方文档声明的最大输出（未实测时的兜底，2026-11-17 主人批准先声明）。
+# 优先级：学习表（上游报错实测）> catalog 自带字段 > 本表。
+# 用途：/v1/models 必须给出 max_output_tokens，否则下游编排（OmniRoute）的
+# pool 校验会把本腿当成无法承接大 max_tokens，从而把整池上限压到最弱的一腿。
+QD_MODEL_MAX_OUTPUT_DEFAULTS = {
+    "Auto": 131072,
+    "Fast": 65536,
+    "GLM-5.3": 131072,
+    "GLM-5.3-Flash": 131072,
+    "Kimi-K3": 1048576,
+    "Kimi-K3.1-Pro": 131072,
+    "Kimi-K2.8-Preview": 131072,
+    "DeepSeek-V4-Pro": 384000,
+    "DeepSeek-Flash": 131072,
+    "Qwen3.8-Max": 65536,
+    "Qwen3.8-Flash": 65536,
+    "Qwen3.7-Max": 65536,
+    "Qwen3.7-Plus": 65536,
+    "Qwen3.7-Flash": 65536,
+    "Qwen4-Max": 65536,
+    "Qwen4-Max-Preview": 65536,
+    "Step-5-Preview": 65536,
+    "MiniMax-M3.1-Flash": 512000,
+}
+
+
+def default_max_output(model):
+    """官方文档兜底值（大小写不敏感）；未知模型返回 None。"""
+    key = str(model or "").strip()
+    if not key:
+        return None
+    hit = QD_MODEL_MAX_OUTPUT_DEFAULTS.get(key)
+    if hit:
+        return hit
+    low = key.lower()
+    for name, value in QD_MODEL_MAX_OUTPUT_DEFAULTS.items():
+        if name.lower() == low:
+            return value
+    return None
+
+
 def max_output_limit(model, realm=None):
-    """已学到的输出上限（含 catalog 自带的 maxOutputTokens），没有则 None。"""
+    """已学到的输出上限（含 catalog 自带字段），最后退回官方文档值。"""
     realm = realm or CURRENT_REALM
     _load_max_out_limits()
     for cand in (model or "", _resolve_upstream_key_safe(model, realm)):
@@ -8867,7 +8908,7 @@ def max_output_limit(model, realm=None):
         v = (meta or {}).get(k)
         if isinstance(v, int) and v > 0:
             return v
-    return None
+    return default_max_output(model)
 
 
 def _context_token_count(label, meta):
