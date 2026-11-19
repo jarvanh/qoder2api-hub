@@ -160,7 +160,34 @@ curl -sS -X POST 'http://HOST/diag/queue' \
 | POST | `/realm` | 切换全局出口（有 Key 即可） |
 | GET | `/logs`、`/logs/export`；POST `/logs/clear` | 运行日志 |
 | GET | `/update/check` | 检查 GitHub 上是否有新版本 |
+| POST | `/admin/shutdown` | 关闭网关进程，见下节 |
 | GET | `/diag/vm` | 本机虚拟化检测 |
+
+### 关闭网关（`POST /admin/shutdown`）
+
+停止网关进程，等价于 stop 脚本。与 `/update/apply` 同一套安全模型：
+
+| 闸门 | 行为 |
+|---|---|
+| 面板会话 | 缺少或无效的 `X-Panel-Token` → `401` |
+| 本机来源 | 非 loopback 或携带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` → `403`；设 `QD_SHUTDOWN_ALLOW_REMOTE=1` 放开 |
+| 显式确认 | 请求体必须是 `{"confirm": true}`，**布尔 true**；`1` / `"true"` → `400` |
+| 一键禁用 | `QD_SHUTDOWN_DISABLE=1` → `403`，面板按钮同时隐藏 |
+| 无监听器 / 正在关闭 | 返回 `409`；后台线程启动失败返回 `503`，可重试 |
+
+```bash
+curl -X POST 'http://127.0.0.1:8790/admin/shutdown' \
+     -H 'X-Panel-Token: TOKEN' -H 'Content-Type: application/json' \
+     -d '{"confirm": true}'
+# {"ok":true,"stopping":true,"restart_hint":"..."}
+```
+
+由独立线程延迟关闭监听循环，给响应发送留出时间。`HTTPServer.shutdown()`
+不能在运行 `serve_forever` 的同一线程调用；`ThreadingHTTPServer` 的请求工作线程
+与监听线程不同，并不天然死锁。退出走与
+SIGTERM 相同的收尾路径：`server_close()` → atexit（pid 文件清理）。
+`GET /settings` 的 `shutdown` 块回显 `can_shutdown` / `blocked_reasons` /
+`restart_hint`，面板据此决定是否渲染按钮。关闭后需用启动脚本重新拉起。
 
 ### 账号
 

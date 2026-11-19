@@ -81,7 +81,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.12"  # fork 维护版：并入上游 v1.9.6–v1.9.10；1.9.11 = 503 终局补 Retry-After（OmniRoute 契约）
+VERSION = "1.9.13"  # fork 维护版：并入上游 v1.9.11（流收尾/模型身份审计/admin shutdown）+ fork 排队/重试/计量语义
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -722,13 +722,17 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "model": model,
+        "model": model,  # Legacy grouping/limit key; not an upstream identity claim.
+        "requested_model": (session_trace or {}).get("requested_model", model),
+        "resolved_model": (session_trace or {}).get("resolved_model"),
         "stream": bool(stream),
         "elapsed_ms": elapsed_ms,
         "ttft_ms": ttft_ms,
         "gen_ms": gen_ms,
     }
     row.update(fields)
+    if session_trace and "upstream_model_key" in session_trace:
+        row["upstream_model_key"] = session_trace["upstream_model_key"]
     if fp:
         row.update(fp)
     if session_trace:
@@ -2657,6 +2661,8 @@ def runtime_settings_view():
         "log_dir": LOG_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
         "version": VERSION,
+        # 面板「关闭网关」按钮的可执行性（不发请求、不改任何状态）
+        "shutdown": shutdown_plan_info(),
     }
 
 
@@ -3109,8 +3115,9 @@ def _register_live_names(entries):
         for mid, meta in entries or []:
             name = str((meta or {}).get("display_name")
                        or (meta or {}).get("name") or "").strip()
-            if name and mid:
-                pairs.append((name, mid))
+            if mid:
+                # A catalog key is advertised even when it has no display name.
+                pairs.append((name or mid, mid))
         if pairs:
             qoder_catalog.register_live_display_names(pairs)
     except Exception:
@@ -3152,11 +3159,63 @@ def resolve_model_key(model, realm=None):
     官方改了显示名的情况（快照未跟上）由第二次解析兜住。
     """
     key = qoder_catalog.resolve_upstream_key(model, realm=realm)
-    raw = str(model or "").strip()
-    if key and key == raw and not qoder_catalog.is_known_upstream_key(key, realm):
+    if key and not qoder_catalog.is_known_upstream_key(key, realm):
         _ensure_live_names(realm)
         key = qoder_catalog.resolve_upstream_key(model, realm=realm)
     return key
+
+
+_UNKNOWN_MODEL_WARN_AT = None
+_UNKNOWN_MODEL_WARN_LOCK = threading.Lock()
+
+
+def unknown_model_policy():
+    """Read the policy without changing custom/BYOK names by default."""
+    policy = os.environ.get("QD_UNKNOWN_MODEL", "pass").strip().lower()
+    if policy not in ("pass", "auto", "error"):
+        raise ValueError("QD_UNKNOWN_MODEL must be pass, auto, or error")
+    return policy
+
+
+def resolve_request_model(model, realm=None):
+    """Resolve against aliases AND the offline/live catalog before applying policy.
+
+    No network discovery or account selection occurs here. Unknown means absent
+    from current catalog knowledge, not proof that a BYOK name does not exist.
+    """
+    key = resolve_model_key(model, realm=realm)
+    policy = unknown_model_policy()
+    if qoder_catalog.is_known_upstream_key(key, realm) or key == "auto":
+        return key
+    if policy == "error":
+        raise ValueError("unknown model %r; select an advertised model or set "
+                         "QD_UNKNOWN_MODEL=pass for custom/BYOK names"
+                         % str(model or "")[:96])
+    # One process-wide warning per minute: bounded state and log volume even if
+    # every request supplies a different name. repr bounds/escapes client data.
+    global _UNKNOWN_MODEL_WARN_AT
+    now = time.monotonic()
+    with _UNKNOWN_MODEL_WARN_LOCK:
+        warn = (_UNKNOWN_MODEL_WARN_AT is None
+                or now - _UNKNOWN_MODEL_WARN_AT >= 60)
+        if warn:
+            _UNKNOWN_MODEL_WARN_AT = now
+    if warn:
+        log("unknown model %r: QD_UNKNOWN_MODEL=%s; upstream may select auto; "
+            "resolved_model remains unknown until reported by upstream"
+            % (str(model or "")[:96], policy), level="WARN", tag="model")
+    return "auto" if policy == "auto" else key
+
+
+def _capture_model_identity(chunk, holder=None, usage_ctx=None):
+    """Record only an explicit upstream chunk model, never the requested name."""
+    actual = chunk.get("model") if isinstance(chunk, dict) else None
+    if not isinstance(actual, str) or not actual.strip():
+        return
+    if holder is not None:
+        holder["resolved_model"] = actual
+    if usage_ctx is not None:
+        usage_ctx["resolved_model"] = actual
 
 
 # 离线合并结果的短 TTL memo（MAJOR：请求路径每请求一次磁盘 IO 的节流）。
@@ -3958,6 +4017,93 @@ def _is_loopback(host):
     host = str(host or "")
     return host in ("::1", "localhost") or host.startswith("127.") \
         or host.startswith("::ffff:127.")
+
+
+# ---------------------------------------------------------------------------
+# 面板关闭网关（POST /admin/shutdown）
+#
+# 与 /update/apply 同一套安全模型：面板会话 + 本机（QD_SHUTDOWN_ALLOW_REMOTE=1
+# 放开）+ QD_SHUTDOWN_DISABLE=1 一键禁用，并要求请求体显式 confirm，
+# 避免误点/脚本裸 POST 把网关关掉。
+#
+# HTTPServer.shutdown() 不能在运行 serve_forever 的同一线程调用（#156）。
+# ThreadingHTTPServer 的请求工作线程并不是该线程，本身不会因此死锁。
+# 为避免阻塞响应，仍由单独的 daemon 线程延迟调用
+# shutdown()，让 serve_http_server 的 finally 正常走 server_close() 与
+# atexit（pid 文件清理），与 SIGTERM 的收尾路径一致。
+# ---------------------------------------------------------------------------
+SHUTDOWN_DISABLED = str(os.environ.get("QD_SHUTDOWN_DISABLE") or "").strip().lower() \
+    in ("1", "on", "true", "yes", "enable", "enabled")
+_ACTIVE_SERVER = None                  # main() 里绑定；plan 用它判断可执行性
+_SHUTDOWN_STARTED = False              # 一次进程只关一次（连点/并发去重）
+_SHUTDOWN_LOCK = threading.Lock()
+
+
+def _shutdown_allow_remote():
+    return str(os.environ.get("QD_SHUTDOWN_ALLOW_REMOTE") or "").strip().lower() \
+        in ("1", "on", "true", "yes", "enable", "enabled")
+
+
+def shutdown_plan_info():
+    """面板展示用的可执行性（不发请求、不关任何东西）。
+
+    阻断原因同时给 code 与中文 reasons：code 供前端映射成可翻译文案，
+    reasons 供 CLI / 直接读接口的调用方（不依赖面板 i18n）。
+    """
+    codes, reasons = [], []
+    if SHUTDOWN_DISABLED:
+        codes.append("disabled")
+        reasons.append("已禁用（QD_SHUTDOWN_DISABLE=1）")
+    if _SHUTDOWN_STARTED:
+        codes.append("stopping")
+        reasons.append("网关正在关闭")
+    if _ACTIVE_SERVER is None:
+        codes.append("no_listener")
+        reasons.append("当前进程未持有监听器（可能是测试或子进程）")
+    return {
+        "can_shutdown": not reasons,
+        "disabled": SHUTDOWN_DISABLED,
+        "allow_remote": _shutdown_allow_remote(),
+        "blocked_codes": codes,
+        "blocked_reasons": reasons,
+        "restart_hint": ("Windows: start-qoder-proxy.bat" if IS_WINDOWS
+                         else "Linux/macOS: ./start-qoder-proxy.sh"),
+    }
+
+
+def schedule_shutdown(delay=0.4):
+    """延迟关闭监听循环：先让响应的字节发出去，再优雅退出。
+
+    返回 False 表示当前没有可关闭的监听器（调用方应回 409）。
+    幂等：重复调用只会有一次关停（第二次起返回 False，避免连点起多个线程）。
+    """
+    global _SHUTDOWN_STARTED
+
+    def _run():
+        global _SHUTDOWN_STARTED
+        time.sleep(delay)
+        try:
+            server.shutdown()
+        except Exception as exc:
+            # The listener can still be serving: permit an explicit retry.
+            with _SHUTDOWN_LOCK:
+                _SHUTDOWN_STARTED = False
+            log("shutdown: server.shutdown() failed: %s" % exc, level="WARN",
+                tag="system")
+
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_STARTED:
+            return False
+        server = _ACTIVE_SERVER
+        if server is None:
+            return False
+        _SHUTDOWN_STARTED = True
+        try:
+            threading.Thread(target=_run, name="qd-shutdown", daemon=True).start()
+        except Exception:
+            _SHUTDOWN_STARTED = False
+            raise
+    return True
 
 
 def update_plan_info():
@@ -8483,6 +8629,9 @@ def friendly_upstream_error(code, detail):
                 "可稍后重试；若重复出现，请分批发送图片或检查原图格式。"
                 "上游详情：%s" % (code_i, _safe[:400] or "(无详情)"),
                 "upstream_image_conversion_timeout")
+    if "upstream stream read failed" in detail or "upstream stream idle timeout" in detail:
+        return ("上游流读取失败，本轮未完成；网关未自动重放已建立的请求。",
+                "upstream_stream_error")
     # issue #87：排队（fast 模式在这里统一给出中文原因，所有入口共用）
     if ("10605" in detail or "isQueued" in detail
             or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
@@ -8629,6 +8778,8 @@ def _note_quota_cooldown(account, status, detail, where, model=None):
 
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
+    if isinstance(exc, UpstreamStreamError):
+        return False  # 上游 v1.9.11：已建立的流读失败不付费重放
     if isinstance(exc, InvalidToolArguments):
         # issue #37：坏参数是模型生成内容的问题，**不是账号不可用**——
         # 记录成账号冷却会让一个健康账号被无辜停用（还会解绑会话）。
@@ -9089,6 +9240,8 @@ def should_retry_envelope(exc, emitted_bytes, attempt, model="", usage_ctx=None)
     # QD_QUEUE_FAST_MODELS 快速排队判定。两者缺一不可。
     """流内错误信封是否值得**重开上游**再试。
 
+    上游 v1.9.11：已建立流的读取失败（UpstreamStreamError）绝不触发付费重放。
+
     关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
     建流，provider 故障以 SSE 信封 statusCodeValue=418 投递——此时 urlopen
     层重试覆盖不到。只要 **尚未向客户端发出任何字节**、未超预算、且错误属
@@ -9493,7 +9646,8 @@ def _chat_chunks(obj, model):
     """把聚合好的 chat 对象摊成 SSE 分片（web 工具路径用：内容是整段回放）。"""
     cid = (obj or {}).get("id") or "chatcmpl-web"
     created = int((obj or {}).get("created") or time.time())
-    mdl = (obj or {}).get("model") or model or ""
+    mdl = ((obj.get("resolved_model") or "") if "resolved_model" in (obj or {})
+           else (obj or {}).get("model") or model or "")
     text = (((obj or {}).get("choices") or [{}])[0].get("message") or {}).get(
         "content") or ""
     base = {"id": cid, "object": "chat.completion.chunk",
@@ -9583,7 +9737,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             if usage_ctx is not None:
                 # 确定性原因 → 面板直接显示，不必自己推断
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
-    model_key = resolve_model_key(model, realm=realm)
+    try:
+        model_key = resolve_request_model(model, realm=realm)
+    except ValueError as exc:
+        raise UpstreamStatus(400, str(exc))
+    usage_ctx.update(requested_model=model, upstream_model_key=model_key,
+                     resolved_model=None)
 
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
@@ -9877,6 +10036,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 except Exception:
                     pass
             try:
+                resp._qd_model_audit = usage_ctx
                 resp._qd_queue_scope = _queue_scope(account, model_key, raw_url)
             except (AttributeError, TypeError):
                 pass
@@ -10063,6 +10223,22 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         % realm)
 
 
+class UpstreamStreamError(UpstreamStatus):
+    """Source read failure after HTTP establishment; never a client disconnect."""
+    def __init__(self, detail):
+        super().__init__(502, detail)
+
+
+def _upstream_stream_source(source):
+    """Keep source transport errors distinct from downstream socket write errors."""
+    try:
+        yield from source
+    except UpstreamStatus:
+        raise
+    except Exception as exc:
+        raise UpstreamStreamError("upstream stream read failed (%s)" % type(exc).__name__) from exc
+
+
 def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     """在等待上游数据的空档里发送 SSE 注释心跳（`: ping`），并原样转发数据。
 
@@ -10077,8 +10253,9 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     idle_limit : 单次等待上限（秒），默认 900；超过抛 TimeoutError
 
     读线程把上游数据放入队列，主线程只在“队列空闲”时补心跳，保证顺序与
-    错误传播（上游异常原样在主线程抛出）。
+    错误传播（上游状态异常保留；源读取异常统一标记，避免误判客户端断开）。
     """
+    source = _upstream_stream_source(source)
     if interval is None:
         try:
             interval = float(os.environ.get("QD_SSE_HEARTBEAT", "5") or 5)
@@ -10118,8 +10295,8 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
             send(b": ping\n\n")               # SSE 注释：客户端忽略
             waited += interval
             if waited >= idle_limit:
-                raise TimeoutError(
-                    "upstream produced no data for %.0fs" % waited)
+                raise UpstreamStreamError(
+                    "upstream stream idle timeout after %.0fs" % waited)
             continue
         if item is done:
             return
@@ -10253,6 +10430,7 @@ def iter_inner_sse(resp, holder=None):
         except Exception:
             continue
         if isinstance(inner, dict):
+            _capture_model_identity(inner, holder, getattr(resp, "_qd_model_audit", None))
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
             note_queue_observation(scope, inner.get("error"))
@@ -10280,6 +10458,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     allowed_names：本次请求声明的工具名集合；用于「泄漏文本回读」的守卫
     （见 parse_leaked_tool_calls / issue #8）。
     """
+    holder = holder if holder is not None else {}
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
@@ -10505,6 +10684,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             and finish not in ("length", "content_filter")):
         raise EmptyToolEcho(0, "reasoning_only" if reasoning else "empty_tool_turn")
     out = {
+        "resolved_model": (holder or {}).get("resolved_model"),
         "id": resp_id or "chatcmpl-qoder",
         "object": "chat.completion",
         "created": created or int(time.time()),
@@ -11048,6 +11228,13 @@ def _responses_usage(u):
     }
 
 
+def _response_model_identity(requested, resolved=None):
+    """Unknown actual identity is explicit; never label a requested alias actual."""
+    actual = resolved if isinstance(resolved, str) and resolved.strip() else None
+    return {"model": actual or "", "requested_model": requested,
+            "resolved_model": actual}
+
+
 def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                      allowed_names=None):
     """Fold a Chat Completions object into a Responses API response object.
@@ -11144,6 +11331,8 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
         "tools": [],
         "metadata": {},
     }
+    obj.update(_response_model_identity(
+        model, chat_obj.get("resolved_model", chat_obj.get("model"))))
     u = _responses_usage(chat_obj.get("usage"))
     if u:
         obj["usage"] = u
@@ -11189,6 +11378,7 @@ def stream_responses_events(inner_lines, model, holder):
             "tools": [],
             "metadata": {},
         }
+        obj.update(_response_model_identity(model, holder.get("resolved_model")))
         u = _responses_usage(usage)
         if u:
             obj["usage"] = u
@@ -11223,6 +11413,7 @@ def stream_responses_events(inner_lines, model, holder):
 
     yield ev("response.created", {"response": resp_obj("in_progress")})
     yield ev("response.in_progress", {"response": resp_obj("in_progress")})
+    announced_model = holder.get("resolved_model")
     for raw in inner_lines:
         data = strip_data_prefix(raw.decode("utf-8", "replace")
                                  if isinstance(raw, bytes) else raw)
@@ -11232,6 +11423,10 @@ def stream_responses_events(inner_lines, model, holder):
             chunk = json.loads(data)
         except Exception:
             continue
+        _capture_model_identity(chunk, holder)
+        if holder.get("resolved_model") != announced_model:
+            announced_model = holder.get("resolved_model")
+            yield ev("response.in_progress", {"response": resp_obj("in_progress")})
         if usage is None and chunk.get("usage"):
             usage = chunk["usage"]
             holder["usage"] = usage
@@ -11633,7 +11828,7 @@ def _responses_completed_quiet(holder, model=""):
             "id": holder.get("id") or "resp_lenient",
             "object": "response",
             "status": "completed",
-            "model": model or "",
+            **_response_model_identity(model, holder.get("resolved_model")),
             "output": ([{"type": "message", "role": "assistant",
                           "content": [{"type": "output_text", "text": text}]}]
                         if text else []),
@@ -12021,9 +12216,17 @@ class Handler(BaseHTTPRequestHandler):
         三处请求入口（chat / responses / anthropic messages）**共用本方法**——
         新增入口必须一并挂上，否则会出现「chat 被拦、别的协议绕过」的缺口。
         """
-        return (self._cross_realm_error(model, realm)
-                or self._banned_model_error(model)
-                or self._key_model_error(model))
+        blocked = (self._cross_realm_error(model, realm)
+                   or self._banned_model_error(model)
+                   or self._key_model_error(model))
+        if blocked:
+            return blocked
+        # Fail before opening a billed request, including web-tools/bridges.
+        try:
+            resolve_request_model(model, realm=realm)
+        except ValueError as exc:
+            return str(exc)
+        return None
 
     def _apply_context_header(self, target):
         """把 X-QD-Context 请求头写进将传给 build_qoder_body 的 payload（#106）。
@@ -13280,6 +13483,48 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_admin(self, path, payload):
         if not isinstance(payload, dict):
             return self._error(400, "expected a JSON object", "invalid_request_error")
+        if path == "/admin/shutdown":
+            # 关闭网关：面板会话（已在 do_POST 校验）+ 本机 + 显式 confirm。
+            # 与 /update/apply 同一套闸门；动作本身不可撤销，所以要求 confirm
+            # 为布尔 true，而不是任何真值（裸 POST 不能关掉网关）。
+            if SHUTDOWN_DISABLED:
+                return self._error(403, "shutdown is disabled "
+                                        "(QD_SHUTDOWN_DISABLE=1)",
+                                   "invalid_request_error")
+            # Local reverse proxies must not silently turn remote users into
+            # local operators. Ignore spoofed values; reject proxy provenance
+            # altogether unless remote shutdown was explicitly enabled.
+            proxy_headers = ("Forwarded", "X-Forwarded-For", "X-Real-IP",
+                             "CF-Connecting-IP")
+            if not _shutdown_allow_remote() and any(
+                    name in self.headers for name in proxy_headers):
+                return self._error(403, "shutdown rejects forwarded requests "
+                                        "(set QD_SHUTDOWN_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
+            if not _shutdown_allow_remote() and not _is_loopback(
+                    (self.client_address or ["?"])[0]):
+                return self._error(403, "shutdown is loopback-only "
+                                        "(set QD_SHUTDOWN_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
+            if payload.get("confirm") is not True:
+                return self._error(400, "confirm must be true "
+                                        "(body: {\"confirm\": true})",
+                                   "invalid_request_error")
+            try:
+                scheduled = schedule_shutdown()
+            except Exception as exc:
+                log("shutdown: could not start worker: %s" % exc, level="WARN", tag="system")
+                return self._error(503, "could not start shutdown worker; retry",
+                                   "server_error")
+            if not scheduled:
+                return self._error(409, "no active listener in this process "
+                                        "(already shutting down?)",
+                                   "invalid_request_error")
+            log("panel: shutdown requested by %s - stopping after this response"
+                % ((self.client_address or ["?"])[0]), level="WARN", tag="system")
+            return self._json(200, {"ok": True, "stopping": True,
+                                    "restart_hint":
+                                        shutdown_plan_info()["restart_hint"]})
         if path == "/admin/routing/save":
             try:
                 config = qoder_routing.save_config(ACCOUNTS_DIR,
@@ -14187,17 +14432,10 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse_write(frame)
                 except (BrokenPipeError, ConnectionResetError,
                         ConnectionAbortedError):
-                    wall = int((time.time() - t_start) * 1000)
-                    record_usage(model, holder.get("usage"), stream=True,
-                                 elapsed_ms=wall, ttft_ms=first_ms,
-                                 gen_ms=(wall - first_ms)
-                                 if first_ms is not None else None,
-                                 fp=fp, account=account.uid,
-                                 effort=usage_ctx.get("effort"),
-                                 effort_requested=usage_ctx.get("effort_requested"),
-                                 key_id=self._key_id_for_usage(),
-                                 realm_reason=usage_ctx.get("realm_reason", ""),
-                                 session_trace=usage_ctx)
+                    record_error(model, 499, "client disconnected while writing SSE",
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 stream=True, account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -14391,7 +14629,8 @@ class Handler(BaseHTTPRequestHandler):
             self._sse_begin()
             for frame in stream_responses_events(
                     _chat_chunks_iter(obj, model), model,
-                    {"usage": obj.get("usage")}):
+                    {"usage": obj.get("usage"),
+                     "resolved_model": obj.get("resolved_model")}):
                 self._sse_write(clean_responses_frame(frame))
             return
         if not want_stream:
@@ -14580,17 +14819,10 @@ class Handler(BaseHTTPRequestHandler):
                             break
                         except (BrokenPipeError, ConnectionResetError,
                                 ConnectionAbortedError):
-                            wall = int((time.time() - t_start) * 1000)
-                            record_usage(model, holder.get("usage"), stream=True,
-                                         elapsed_ms=wall, ttft_ms=first_ms,
-                                         gen_ms=(wall - first_ms)
-                                         if first_ms is not None else None,
-                                         fp=fp, account=account.uid,
-                                         effort=usage_ctx.get("effort"),
-                                         effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""),
-                                         session_trace=usage_ctx)
+                            record_error(model, 499, "client disconnected while writing SSE",
+                                         elapsed_ms=int((time.time() - t_start) * 1000),
+                                         stream=True, account=account.uid if account else None,
+                                         key_id=self._key_id_for_usage())
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -14774,11 +15006,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result)
 
     def do_POST(self):
-        # 在途计数：包住整个 POST 生命周期；health/models 是 GET，不受影响。
+        # 在途计数：包住整个 POST 生命周期；health/models 是 GET，不受影响。（fork）
         inflight_begin()
         try:
             return self._do_POST()
         finally:
+            # 上游 v1.9.11：每条 POST 退出路径都终止 chunked 流帧（幂等，
+            # 下游断开的 socket 不可修复），断连不再误记正常 chat done。
+            self._sse_end()
             inflight_end()
 
     def _do_POST(self):
@@ -15202,18 +15437,10 @@ class Handler(BaseHTTPRequestHandler):
                             break
                         except (BrokenPipeError, ConnectionResetError,
                                 ConnectionAbortedError):
-                            # 客户端断开；上游已产出的部分照常记账。
-                            wall = int((time.time() - t_start) * 1000)
-                            record_usage(model, holder.get("usage"), stream=True,
-                                         elapsed_ms=wall, ttft_ms=first_ms,
-                                         gen_ms=(wall - first_ms)
-                                         if first_ms is not None else None,
-                                         fp=fp, account=account.uid,
-                                         effort=usage_ctx.get("effort"),
-                                         effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""),
-                                         session_trace=usage_ctx)
+                            record_error(model, 499, "client disconnected while writing SSE",
+                                         elapsed_ms=int((time.time() - t_start) * 1000),
+                                         stream=True, account=account.uid if account else None,
+                                         key_id=self._key_id_for_usage())
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -15434,7 +15661,7 @@ def _keepalive_send(entry):
 
 def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
-        USAGE_SUMMARY, SCHEDULER
+        USAGE_SUMMARY, SCHEDULER, _ACTIVE_SERVER
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(
         description="Qoder (qoder.com.cn / qoder.com) -> OpenAI-compatible proxy")
@@ -15812,6 +16039,10 @@ def main():
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
+    # 面板「关闭网关」只允许作用于本进程真正在服务的监听器：把它登记下来，
+    # schedule_shutdown() 才有对象可关（子进程/测试里会是 None）。
+    global _ACTIVE_SERVER
+    _ACTIVE_SERVER = server
 
     # 启动预热（后台线程，不阻塞监听）：拉一次动态模型清单并注册显示名，
     # 让「客户端跳过 /v1/models 直接发新模型名」的第一条请求也能解析对

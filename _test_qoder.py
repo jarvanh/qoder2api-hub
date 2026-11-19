@@ -831,8 +831,9 @@ try:
         _got3.append(item)
 except Exception as exc:
     _raised3 = exc
-check("heartbeat: upstream error propagates unchanged",
-      isinstance(_raised3, _BoomErr) and _got3 == [b"data: first\n\n"],
+check("heartbeat: upstream error classified separately with original cause",
+      isinstance(_raised3, P.UpstreamStreamError) and isinstance(_raised3.__cause__, _BoomErr)
+      and _got3 == [b"data: first\n\n"],
       (type(_raised3).__name__, _got3))
 
 

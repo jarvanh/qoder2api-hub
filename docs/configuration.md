@@ -67,6 +67,27 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 两个字段都支持 fnmatch 通配符（如 `qwen*`），不区分大小写。被拒绝的请求在本地直接返回，不会发到上游。三个入口（Chat / Responses / Anthropic）共用同一套判断。
 
+### 未知模型与模型身份审计（Issue #163）
+
+环境变量 `QD_UNKNOWN_MODEL=pass|auto|error` 控制目录中尚未识别的模型名：
+
+| 值 | 行为 |
+|---|---|
+| `pass`（默认） | 保持旧版透传，兼容 BYOK / 自定义模型名；上游仍可能自行回退到 auto |
+| `auto` | 将未知名称明确转换为上游 `auto` |
+| `error` | 本地返回 HTTP 400，在付费请求发出前拒绝未知名称 |
+
+判断使用冻结别名、官方 key、动态目录 key / 显示名 / 展示 ID，以及本地与磁盘目录缓存，不只检查冻结别名表。请求路径不会为判断模型额外联网；目录尚未刷新时，严格模式可能拒绝实际存在的新模型或自定义 BYOK 名称。缺省模型仍解析为 `auto`。非法配置值返回 400，不会静默改用其他策略。`pass` / `auto` 的未知模型 WARN 日志全进程每分钟最多一条，模型名最多记录 96 字符。
+
+成功用量流水分别记录：
+
+- `requested_model`：客户端请求名。
+- `upstream_model_key`：实际提交给上游的模型 key（有请求审计上下文时）。
+- `resolved_model`：上游 chunk 明确回报的模型；未回报为 `null`，不会用请求名或提交 key 推测。
+- 旧 `model` 字段仍是请求侧分组 / 限额键，保持历史统计兼容，不表示已验证的实际模型。
+
+Responses API 的响应对象与生命周期事件包含 `requested_model` / `resolved_model`，其 `model` 使用上游回报值。最初 `response.created` / `response.in_progress` 还没有上游数据时，`model` 为空字符串、`resolved_model` 为 `null`；发现实际模型后补发更新后的 `response.in_progress`，最终 `response.completed` 使用最新回报值。若回放开始前已捕获实际模型，created 也带该值。非流式响应同样保留真实模型。上游回报 `auto` 仅表示上游报告了 auto，不证明其背后物理模型或计费归属。
+
 ## 限额护栏
 
 看板「设置 → 事实性限额护栏」。账号触碰阈值后会暂停接单，请求自动切到其他账号，不用等上游返回 402 / 429。

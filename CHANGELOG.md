@@ -25,6 +25,37 @@
 - 主版本号只在确有破坏性变更时才动。
 - 本次正式版本 **1.9.11**：持续排队诊断（并入上游 v1.9.10）+ 503 终局补 Retry-After。
 
+## v1.9.13 — 并入上游 v1.9.11（流收尾、模型身份与面板关停）
+
+fork 视角：保留 fork 的排队/快速拒绝、坏工具回声重试、池级配额 402、图片转换重试预算与
+在途计数；上游的流失败收尾与 fork 的 inflight 计数合并为同一 finally（见 do_POST）。
+
+- 修复 #162：读取上游连接重置/中断/超时不再误判为客户端断开；明确流内错误并在所有 POST 退出路径终止 chunked 流。已建立流的读取失败不自动重放收费请求，客户端断开不再记为正常 chat done。新增三协议真实 HTTP 流回归98项。
+- 修复 #163：成功用量增加 `requested_model` / `resolved_model` / `upstream_model_key`，上游未回报则实际身份为 null；Responses 同步上游实际 model，初始未获数据时空 model，发现后更新 in_progress。面板用量显示请求名 → 上游回报名，保留旧 model 分组兼容。新增模型身份138项与面板6项回归。
+- 新增 `QD_UNKNOWN_MODEL=pass|auto|error`：默认 pass 保持 BYOK/自定义名称兼容并限频 WARN；auto 显式提交 auto；error 在收费请求前本地400。识别动态目录 key/显示名，严格模式受本地目录新鲜度限制。
+- 发布前完整回归：156 个套件、4710 项检查、0 失败，工作区清洁检查通过；Linux 另验三协议流98项、模型身份138项、关停安全21项。
+- PR #159 网页工具后端本轮不纳入：流式普通function丢失、length终态与账号缓存隔离边界需继续修正，审查证据已写回PR。
+
+**✨ 合并修正后的 PR #161（感谢 @loong-git）：面板关闭网关（`POST /admin/shutdown`）**
+
+面板此前只能「一键更新（含自动重启）」，没有任何停止入口；要停只能去跑
+`stop-qoder-proxy.bat` / `.sh`。现在「设置 → 运行信息」下方新增**关闭网关**卡片。
+
+- 安全模型与一键更新一致：**面板会话 + 仅本机来源 + 请求体显式 `{"confirm": true}`**
+  （必须是布尔 true，`1` / `"true"` 一律 400，裸 POST 关不掉网关）；
+  `QD_SHUTDOWN_DISABLE=1` 一键禁用，`QD_SHUTDOWN_ALLOW_REMOTE=1` 才放开远程（不建议）。
+- `HTTPServer.shutdown()` 不能在运行 `serve_forever` 的**同一线程**调用（#156）；
+  请求工作线程并不天然死锁。为避免阻塞响应，由独立线程延迟关闭，
+  收尾走与 SIGTERM 相同的路径（`server_close()` → atexit → pid 文件清理）。
+- 关停是幂等的：连点或并发只会关一次；当前进程没有监听器时返回409。维护者修正代理来源头绕过、线程启动失败状态回滚、stopping计划与前端失败误报；新增安全21项、UI10项回归，原关停42项保留。200仅确认已安排，不承诺已退出或排空在途请求。
+- `GET /settings` 新增 `shutdown` 块（`can_shutdown` / `blocked_codes` /
+  `blocked_reasons` / `restart_hint`），面板据此**只在可执行时才渲染按钮**
+  （与 #132 的 `can_apply` 同一原则），仅在收到关停确认后停掉轮询；失败保留刷新。
+- 文档：`docs/api.md` 补端点与闸门表，`docs/deployment.md` 补两个环境变量与
+  「容器里更推荐 `docker compose restart`」的说明；`i18n/en.json` 补文案（version 19→20）。
+- 测试：新增 `tests/_test_admin_shutdown.py`（42 条：三层闸门、confirm 类型、
+  禁用/远程开关、plan 可执行性与 code、真实关停后端口释放、幂等、源码接线与文档同步）。
+
 
 ## v1.9.10 — 持续排队诊断（#158）
 

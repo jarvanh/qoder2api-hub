@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 19
+    "version": 20
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -841,7 +841,19 @@
     "lenient 是折中：那一轮没有工具调用，但对话不会断。上游修好后建议切回 strict。": "Lenient mode is a compromise: that turn has no tool calls, but the conversation continues. Return to strict mode after upstream is fixed.",
     "高": "High",
     "低": "Low",
-    "不指定 Key（管理员预览）": "No key (administrator preview)"
+    "不指定 Key（管理员预览）": "No key (administrator preview)",
+    "关闭网关": "Stop gateway",
+    "停止当前网关进程（等价于 stop 脚本）。": "Stops the gateway process (equivalent to the stop script).",
+    "只接受本机且已登录面板的请求；QD_SHUTDOWN_DISABLE=1 可一键禁用。": "Accepts local panel sessions only; set QD_SHUTDOWN_DISABLE=1 to disable it.",
+    "停止后需用启动脚本重新拉起，正在转发的请求可能被中断。": "Start it again with the launcher script; in-flight requests may be interrupted.",
+    "确认关闭网关？停止后这个页面将无法连接，正在转发的请求可能被中断。这个操作无法在页面里撤销。": "Stop the gateway? This page will lose its connection, in-flight requests may be interrupted, and the action cannot be undone from the panel.",
+    "正在关闭...": "Stopping...",
+    "网关正在关闭。请用启动脚本重新启动：": "Gateway is stopping. Restart it with the launcher script: ",
+    "网关正在关闭": "Gateway is stopping",
+    "未确认关停请求": "Shutdown request was not acknowledged",
+    "关闭失败: ": "Shutdown failed: ",
+    "已禁用（QD_SHUTDOWN_DISABLE=1）": "disabled (QD_SHUTDOWN_DISABLE=1)",
+    "当前进程未持有监听器（可能是测试或子进程）": "this process holds no listener (test or child process)"
   },
   "patterns": {
     "正在申请{0}设备授权…": "Requesting device authorization for {0}…",

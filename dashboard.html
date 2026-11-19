@@ -4235,6 +4235,20 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         <button class="sec" onclick="panelLogout()">退出面板登录</button>
       </div>
     </section>
+
+    <section id="sectionShutdown">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">关闭网关 <em id="setShutdownState"></em></h2>
+          <ul style="font-size:12px;color:var(--dim);margin:6px 0 0;padding-left:18px;line-height:1.8">
+            <li>停止当前网关进程（等价于 stop 脚本）。</li>
+            <li>只接受本机且已登录面板的请求；QD_SHUTDOWN_DISABLE=1 可一键禁用。</li>
+            <li>停止后需用启动脚本重新拉起，正在转发的请求可能被中断。</li>
+          </ul>
+        </div>
+        <button class="danger" id="btnShutdown" onclick="shutdownGateway(this)">关闭网关</button>
+      </div>
+    </section>
   </div>
 
   <div id="pageLogs" class="main-page">
@@ -4704,7 +4718,8 @@ async function adminGroupAction(action,btn){
 }
 function adminGroupResult(rows,status){const ok=rows.filter(x=>x.ok).length;status.textContent='已完成 '+ok+'/'+rows.length+' 成功'+(ok<rows.length?' · '+rows.filter(x=>!x.ok).map(x=>x.hint||x.error||'失败').join('；'):'');}
 async function adminWatchJob(id,status){
-  try{const r=await getJSON('/admin/jobs?id='+encodeURIComponent(id));const j=r.job||{};
+  if(!PANEL_READY) return;
+  try{const r=await getJSON('/admin/jobs?id='+encodeURIComponent(id));if(!PANEL_READY)return;const j=r.job||{};
     status.textContent='后台任务 '+(j.done||0)+' / '+(j.total||0);
     if(j.status==='completed'||j.status==='failed'){adminGroupResult(j.results||[],status);await loadAccounts();return;}
     if(!PANEL_READY)return;
@@ -6429,7 +6444,7 @@ async function triggerSchedulerNow(btn){
   try{
     const r = await postJSON("/scheduler/trigger", {});
     toast(r.msg || "已触发巡检保活", "ok");
-    setTimeout(loadSchedulerStatus, 2000);
+    setTimeout(() => { if(PANEL_READY) loadSchedulerStatus(); }, 2000);
   }catch(e){
     toast("触发失败: " + e.message, "bad");
   }finally{
@@ -7658,6 +7673,13 @@ function keyCell(r){
   if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
   return d.label + '<div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>';
 }
+function usageModelCell(r){
+  const requested = r.requested_model || r.model || '—';
+  const known = typeof r.resolved_model === 'string' && r.resolved_model.trim();
+  if(!Object.prototype.hasOwnProperty.call(r, 'resolved_model')) return esc(requested);
+  return esc(requested) + (known && r.resolved_model === requested ? '' : ' → ' + (known ? esc(r.resolved_model) : '<span class="hint">?</span>'));
+}
+
 function effortCell(r){
   const mono = s => '<span class="mono" style="font-size:11px">' + esc(s) + '</span>';
   const hasReq = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort_requested');
@@ -7839,7 +7861,7 @@ async function refreshInner(){
     '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th><th style="text-align:right;width:150px" title="按 token 折算的三段贡献：非缓存输入 + 缓存输入 + 输出；斜体「名义」表示上游标记为不计费">积分拆分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
-        + '<td class="mono">' + esc(r.model)
+        + '<td class="mono">' + usageModelCell(r)
         + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
@@ -8157,10 +8179,74 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
+    renderShutdownState(data.shutdown || null);
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
   }
+}
+
+// —— 面板关闭网关 ——
+// 后端 GET /settings 的 shutdown 块给出 can_shutdown / blocked_reasons：
+// 必然失败的按钮不渲染（与「一键更新」的 can_apply 门控同一原则，issue #132）。
+let SHUTDOWN_STATE = null;
+function renderShutdownState(info){
+  SHUTDOWN_STATE = info || null;
+  const state = document.getElementById('setShutdownState');
+  const btn = document.getElementById('btnShutdown');
+  if(!info){
+    if(state) state.textContent = '';
+    if(btn){ btn.disabled = true; btn.style.display = 'none'; }
+    return;
+  }
+  // blocked_codes 是本前端自己的文案（可被 i18n 包逐字命中）；
+  // blocked_reasons 是后端权威中文，code 认不出时才回退到它。
+  const REASONS = {
+    disabled: '已禁用（QD_SHUTDOWN_DISABLE=1）',
+    no_listener: '当前进程未持有监听器（可能是测试或子进程）',
+    stopping: '网关正在关闭',
+  };
+  const codes = (info.blocked_codes || []);
+  const why = codes.length
+    ? codes.map(c => REASONS[c] || c)
+    : (info.blocked_reasons || []).filter(Boolean);
+  const can = info.can_shutdown === true;
+  if(state){
+    state.textContent = can ? '(可用)' : '(不可用：' + (why.length ? why.join('；') : '未说明原因') + ')';
+    state.style.color = can ? 'var(--dim)' : 'var(--warn)';
+  }
+  if(btn){
+    btn.style.display = can ? '' : 'none';
+    btn.disabled = !can;
+  }
+}
+
+async function shutdownGateway(btn){
+  const hint = (SHUTDOWN_STATE && SHUTDOWN_STATE.restart_hint) || '启动脚本';
+  // 确认文案必须是**一行静态字符串**：i18n 包按整句逐字查表，拼 + 会让它永远命不中。
+  if(!confirm('确认关闭网关？停止后这个页面将无法连接，正在转发的请求可能被中断。这个操作无法在页面里撤销。')) return;
+  if(btn){ btn.disabled = true; btn.textContent = '正在关闭...'; }
+  try{
+    const r = await postJSON('/admin/shutdown', {confirm: true});
+    if(!r || r.ok !== true || r.stopping !== true) throw new Error('未确认关停请求');
+    stopGatewayPolling();
+    toast('网关正在关闭。请用启动脚本重新启动：' + (r.restart_hint || hint), 'ok');
+  }catch(e){
+    // A transport failure cannot prove the request reached the server.
+    const msg = String((e && e.message) || e);
+    toast('关闭失败: ' + msg, 'bad');
+  } finally{
+    if(btn){ btn.textContent = '关闭网关'; btn.disabled = false; }
+  }
+}
+
+function stopGatewayPolling(){
+  PANEL_READY = false;
+  (PANEL_TIMERS || []).forEach(t => clearInterval(t));
+  PANEL_TIMERS = [];
+  stopLogPolling();
+  // Gate the independent overview interval and already queued callbacks too.
+  if(typeof RT_TIMER !== 'undefined') clearTimeout(RT_TIMER);
 }
 
 
@@ -9107,7 +9193,7 @@ const LOG_MAX_ROWS = 2000;   // 与 logEntries 的保留上限一致
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
   logPollTimer = setInterval(() => {
-    if(logAutoRefresh && currentMainTab === 'logs'){
+    if(PANEL_READY && logAutoRefresh && currentMainTab === 'logs'){
       fetchNewLogs(false);
     }
   }, 2000);

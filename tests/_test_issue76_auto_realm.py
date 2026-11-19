@@ -54,7 +54,7 @@ SRC = open(os.path.join(os.path.dirname(HERE), "qoder_proxy.py"),
 # ---------------- 1) 源码守卫：按函数归属 ----------------
 BUG = "req_realm = self._request_realm() or CURRENT_REALM"
 PLAIN = "req_realm = self._request_realm()"
-ENTRIES = ("do_POST", "_handle_responses", "_handle_anthropic")
+ENTRIES = ("_do_POST", "_handle_responses", "_handle_anthropic")
 
 
 def lines_of_func(name):
