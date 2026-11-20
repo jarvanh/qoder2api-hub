@@ -1889,15 +1889,20 @@ class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener_for_request():
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _opener_for_request(*, follow_redirects=True):
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
     「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
-                                       _VpcRedirectHandler())
+    redirects = _VpcRedirectHandler() if follow_redirects else _NoRedirectHandler()
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), redirects)
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1920,7 +1925,7 @@ def upstream_clock_skew(timeout=4.0):
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
-              retries=3, backoff=1.0, log=None):
+              retries=3, backoff=1.0, log=None, *, follow_redirects=True):
     """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
     validate_public_http_url(url)
     attempts = max(1, int(retries or 1))
@@ -1933,7 +1938,8 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with _opener_for_request().open(req, timeout=timeout) as resp:
+            opener = _opener_for_request(follow_redirects=follow_redirects)
+            with opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             last = exc

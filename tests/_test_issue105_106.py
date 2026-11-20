@@ -102,8 +102,8 @@ print("[#106] 防伪造与路由")
 check("入口先 pop 客户端伪造键再读 header",
       'target.pop("_qd_context", None)' in _src
       and "X-QD-Context" in _src)
-check("三个入口都注入",
-      _src.count("self._apply_context_header(") == 3,
+check("四个入口都注入（含 hosted web）",
+      _src.count("self._apply_context_header(") == 4,
       _src.count("self._apply_context_header("))
 check("/settings 输出 model_context",
       '"model_context": _model_context_snapshot()' in _src)

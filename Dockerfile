@@ -45,12 +45,13 @@ RUN python -m pip install --no-cache-dir "Pillow>=12.1.1,<14"
 COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_scheduler.py qoder_settings.py qoder_sign.py qoder_tasks.py \
      qoder_anthropic.py qoder_agents.py qoder_updater.py \
-     qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_session_cache.py \
+     qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_official_web.py qoder_web_response.py qoder_external_web.py qoder_session_cache.py \
      qoder_keepalive.py qoder_images.py qoder_cache.py qoder_admin.py qoder_routing.py qoder_logpaths.py \
      dashboard.html baseprompt.json ./
 
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
 COPY qoder_catalog_intl.json qoder_catalog_cn.json ./
+COPY i18n/ ./i18n/
 
 # UMID 原生组件（构建期提取；运行时 qoder_accounts.runtime_info_exe() 在
 # POSIX 下按 <repo>/umid/runtime-info 查找）。builder 提取失败时这里是空目录。

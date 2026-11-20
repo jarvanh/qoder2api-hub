@@ -3657,7 +3657,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
   <div id="schedulerBar" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin-bottom:16px;font-size:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
     <div style="display:flex;align-items:center;gap:8px">
       <span class="dot" id="schedDot"></span>
-      <span>后台定时调度器: <b id="schedStatusText">待查询</b></span>
+      <span>自动签到 / Token 保活: <b id="schedStatusText">待查询</b></span>
       <span style="color:var(--dim);font-size:11px" id="schedTimes"></span>
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -3665,6 +3665,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       <button class="sec mini" id="btnTriggerSched" onclick="triggerSchedulerNow(this)">立即巡检保活</button>
       <button class="sec mini" id="btnToggleSched" onclick="toggleScheduler(this)">暂停调度</button>
     </div>
+    <div style="width:100%;color:var(--dim);font-size:11px">自动签到默认每日 09:00 / 21:00，按下方服务端时区执行；可在排程设置修改。网关需保持运行，暂停后不会自动签到；“立即巡检保活”也会补签符合条件的账号，结果见调度器日志。</div>
     <div id="schedEditor" style="display:none;width:100%;margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">
       <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
         <div id="schedDialWrap" style="flex:0 0 auto"></div>
@@ -4154,22 +4155,76 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 
 
     <section id="sectionWebTools">
+      <style>
+        #setWebToolsForm{border:0;padding:0;margin:0;min-width:0}
+        .web-tools-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
+        .web-tools-grid label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--dim)}
+        .web-tools-grid input:not([type=checkbox]),.web-tools-grid select,.web-tools-grid textarea{
+          box-sizing:border-box;width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit}
+      </style>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
-          <h2 style="margin:0">本地 web 工具 <em id="setWebToolsState"></em></h2>
+          <h2 style="margin:0">联网工具 <em id="setWebToolsState"></em></h2>
           <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
-            开启后，客户端声明的内置 <code>web_search</code> / <code>web_fetch</code> 会由<b>网关本地执行</b>：
-            把声明换成同名 function，模型要搜索时网关去搜（DuckDuckGo → Bing → Wikipedia 轮换）、要抓页面时网关去抓，
-            再把结果回灌给模型继续生成（最多 3 轮）。
-            <br><b style="color:var(--warn)">注意</b>：这是唯一会由模型驱动出网的能力；每轮代跑都会多消耗一次账号额度；
-            私网地址、localhost、重定向到内网一律拒绝。默认关闭。
+            代跑客户端声明的内置 <code>web_search</code> / <code>web_fetch</code>。可选原项目内置的本地 web 工具、Qoder 官方服务或外部搜索服务。
+            保存后对新请求立即生效，进行中的请求继续使用原配置；应用自己的普通 function 工具仍由应用执行。
+            <br>多轮推理及外部服务可能产生各自的用量；网页抓取只允许公网地址。默认关闭。
           </div>
         </div>
-        <label style="display:flex;align-items:center;gap:8px;font-size:13px;white-space:nowrap">
-          <input type="checkbox" id="setWebTools" onchange="saveWebTools(this)">
-          <span>启用</span>
-        </label>
       </div>
+      <fieldset id="setWebToolsForm">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:12px">
+          <input type="checkbox" id="setWebTools"><span>启用联网工具</span>
+        </label>
+        <div class="web-tools-grid">
+          <label>执行后端
+            <select id="setWebToolsBackend" onchange="updateWebToolsBackend()">
+              <option value="local">原项目内置（DuckDuckGo / Bing / Wikipedia）</option>
+              <option value="qoder">Qoder 官方搜索与抓取</option>
+              <option value="external">外部搜索服务（本地或云端）</option>
+            </select>
+          </label>
+        </div>
+        <div id="setWebToolsBackendHelp" style="font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7"></div>
+        <div id="setWebToolsEnv" style="font-size:12px;color:var(--warn);margin-top:6px"></div>
+        <div id="setWebExternal" style="display:none">
+          <div class="web-tools-grid">
+            <label>服务类型
+              <select id="setWebExternalProvider" onchange="changeWebExternalProvider(this.value)">
+                <option value="searxng">SearXNG</option><option value="tavily">Tavily</option>
+                <option value="brave">Brave Search</option><option value="serper">Serper</option>
+                <option value="custom">自定义 HTTP JSON</option>
+              </select>
+            </label>
+            <label>搜索接口完整地址
+              <input id="setWebExternalEndpoint" type="url" placeholder="http://searxng:8080/search" autocomplete="off">
+            </label>
+            <label>API 密钥
+              <input id="setWebExternalKey" type="password" autocomplete="new-password" placeholder="可选；按服务要求填写">
+            </label>
+          </div>
+          <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim);margin-top:8px">
+            <input id="setWebExternalClearKey" type="checkbox">清除当前服务已保存的密钥
+          </label>
+          <details style="margin-top:12px">
+            <summary style="cursor:pointer;font-size:12px;color:var(--dim)">请求与结果映射（预设已填好，自定义服务可修改）</summary>
+            <div class="web-tools-grid">
+              <label>请求方法<select id="setWebExternalMethod"><option>GET</option><option>POST</option></select></label>
+              <label>查询参数名<input id="setWebExternalQueryField" placeholder="q"></label>
+              <label>结果数量参数名（可留空）<input id="setWebExternalLimitField" placeholder="count / num / max_results"></label>
+              <label>结果列表路径<input id="setWebExternalResultsPath" placeholder="results / web.results / organic"></label>
+              <label>标题字段<input id="setWebExternalTitleField" placeholder="title"></label>
+              <label>链接字段<input id="setWebExternalUrlField" placeholder="url / link"></label>
+              <label>摘要字段<input id="setWebExternalSnippetField" placeholder="content / description / snippet"></label>
+              <label>认证请求头<input id="setWebExternalAuthHeader" placeholder="Authorization / X-API-KEY"></label>
+              <label>认证前缀（可留空）<input id="setWebExternalAuthPrefix" placeholder="Bearer"></label>
+              <label>其他固定参数（JSON 对象）<textarea id="setWebExternalParams" rows="3" spellcheck="false">{}</textarea></label>
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin-top:8px">GET 使用查询参数，POST 使用 JSON 请求体。嵌套结果字段用点分隔；结果列表在根数组时路径留空。服务地址必须能由网关访问，容器内 localhost 指向容器自身。</div>
+          </details>
+        </div>
+        <button style="margin-top:14px" onclick="saveWebTools(this)">保存并应用</button>
+      </fieldset>
     </section>
 
 
@@ -8127,8 +8182,7 @@ async function loadSettings(showToast){
     const data = await getJSON('/settings');
     // issue #106：模型上下文档缓存给模型库表用（保存后也走这份）
     window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
-    const wtBox = document.getElementById('setWebTools');
-    if(wtBox) wtBox.checked = data.web_tools === true;
+    renderWebToolsSettings(data);
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
     const teBox = document.getElementById("setToolEcho");
     const teState = document.getElementById("setToolEchoState");
@@ -8136,8 +8190,6 @@ async function loadSettings(showToast){
     if(teState) teState.textContent = data.tool_echo_mode_env
       ? ("（由环境变量固定为 " + data.tool_echo_mode_env + "）")
       : ("（" + (data.tool_echo_mode || "strict") + "）");
-    const wtState = document.getElementById('setWebToolsState');
-    if(wtState) wtState.textContent = data.web_tools ? '(已开启)' : '(已关闭)';
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -8259,19 +8311,89 @@ async function saveToolEchoMode(mode){
     if(st) st.textContent = "(" + (r.effective || mode) + ")";
   }catch(e){ toast("保存失败: " + e.message, "bad"); }
 }
-async function saveWebTools(el){
-  const on = !!(el && el.checked);
-  el.disabled = true;
+const WEB_EXTERNAL_FIELDS = {
+  endpoint:'Endpoint', method:'Method', query_field:'QueryField', limit_field:'LimitField',
+  results_path:'ResultsPath', title_field:'TitleField', url_field:'UrlField',
+  snippet_field:'SnippetField', auth_header:'AuthHeader', auth_prefix:'AuthPrefix'
+};
+let WEB_EXTERNAL_PROFILES = {};
+let WEB_EXTERNAL_SELECTED = 'searxng';
+function readWebExternalProfile(){
+  const profile = {provider:WEB_EXTERNAL_SELECTED};
+  for(const [key,suffix] of Object.entries(WEB_EXTERNAL_FIELDS)){
+    profile[key] = document.getElementById('setWebExternal'+suffix).value;
+  }
+  profile.params = JSON.parse(document.getElementById('setWebExternalParams').value || '{}');
+  const key = document.getElementById('setWebExternalKey').value;
+  if(document.getElementById('setWebExternalClearKey').checked) profile.api_key = '';
+  else if(key) profile.api_key = key;
+  return profile;
+}
+function showWebExternalProfile(provider){
+  WEB_EXTERNAL_SELECTED = provider;
+  const profile = WEB_EXTERNAL_PROFILES[provider] || {};
+  document.getElementById('setWebExternalProvider').value = provider;
+  for(const [key,suffix] of Object.entries(WEB_EXTERNAL_FIELDS)){
+    document.getElementById('setWebExternal'+suffix).value = profile[key] || '';
+  }
+  document.getElementById('setWebExternalParams').value = JSON.stringify(profile.params || {}, null, 2);
+  const key = document.getElementById('setWebExternalKey');
+  key.value = profile.api_key || '';
+  key.placeholder = profile.api_key_set ? '已保存；留空保留原密钥' : '按服务要求填写；SearXNG 通常可留空';
+  document.getElementById('setWebExternalClearKey').checked = Object.prototype.hasOwnProperty.call(profile,'api_key') && !profile.api_key;
+}
+function changeWebExternalProvider(provider){
   try{
-    const r = await postJSON("/settings/web-tools", {enabled: on});
-    toast("本地 web 工具已" + (r.web_tools ? "开启" : "关闭"), "ok");
-    const st = document.getElementById("setWebToolsState");
-    if(st) st.textContent = r.web_tools ? "(已开启)" : "(已关闭)";
+    const previous = WEB_EXTERNAL_PROFILES[WEB_EXTERNAL_SELECTED] || {};
+    WEB_EXTERNAL_PROFILES[WEB_EXTERNAL_SELECTED] = {...previous, ...readWebExternalProfile()};
   }catch(e){
-    toast("保存失败: " + ((e && e.message) || e), "bad");
-    el.checked = !on;
+    document.getElementById('setWebExternalProvider').value = WEB_EXTERNAL_SELECTED;
+    toast('其他固定参数不是有效 JSON，请先修正', 'bad');
+    return;
+  }
+  showWebExternalProfile(provider);
+}
+function updateWebToolsBackend(){
+  const backend = document.getElementById('setWebToolsBackend').value;
+  document.getElementById('setWebExternal').style.display = backend === 'external' ? '' : 'none';
+  document.getElementById('setWebToolsBackendHelp').textContent = {
+    local:'使用原项目内置引擎链搜索，网页由网关直接抓取。',
+    qoder:'搜索和网页抓取使用当前推理账号的 Qoder 官方服务，支持国内版和国际版公网账号，自动选择对应区域端点。',
+    external:'搜索交给所选外部服务，网页由网关直接抓取。各服务配置分别保存，切换不会互相覆盖密钥。'
+  }[backend] || '';
+}
+function renderWebToolsSettings(data){
+  if(!document.getElementById('setWebToolsBackend')) return;
+  WEB_EXTERNAL_PROFILES = data.web_tools_external_profiles || {};
+  const backend = data.web_tools_backend || 'local';
+  const select = document.getElementById('setWebToolsBackend');
+  select.value = backend;
+  select.disabled = !!data.web_tools_backend_env;
+  document.getElementById('setWebTools').checked = data.web_tools === true;
+  document.getElementById('setWebTools').disabled = !!data.web_tools_enabled_env;
+  document.getElementById('setWebToolsEnv').textContent = [
+    data.web_tools_backend_env ? '后端由环境变量固定为 '+data.web_tools_backend_env : '',
+    data.web_tools_enabled_env ? '总开关由环境变量固定为 '+data.web_tools_enabled_env : ''
+  ].filter(Boolean).join('；');
+  showWebExternalProfile((data.web_tools_external || {}).provider || 'searxng');
+  updateWebToolsBackend();
+  const names = {local:'原项目内置', qoder:'Qoder 官方', external:'外部服务'};
+  document.getElementById('setWebToolsState').textContent = data.web_tools ? '(已开启 · '+(names[backend] || backend)+')' : '(已关闭)';
+}
+async function saveWebTools(btn){
+  const form = document.getElementById('setWebToolsForm');
+  try{
+    const payload = {enabled:document.getElementById('setWebTools').checked,
+                     backend:document.getElementById('setWebToolsBackend').value};
+    if(payload.backend === 'external') payload.external = readWebExternalProfile();
+    form.disabled = true;
+    const r = await postJSON('/settings/web-tools', payload);
+    renderWebToolsSettings(r);
+    toast('联网工具设置已保存，新请求立即生效', 'ok');
+  }catch(e){
+    toast('保存失败: '+((e && e.message) || e), 'bad');
   }finally{
-    el.disabled = false;
+    form.disabled = false;
   }
 }
 async function savePanelPassword(btn){

@@ -503,6 +503,60 @@ def set_web_tools_enabled(accounts_dir, enabled):
         save(accounts_dir, data)
 
 
+def web_tools_config(accounts_dir):
+    """Persisted backend and separate provider profiles; internal, includes keys."""
+    import qoder_external_web as external
+    data = load(accounts_dir)
+    provider = data.get("web_tools_external_provider") or "searxng"
+    if provider not in external.PROVIDERS:
+        provider = "searxng"
+    saved = data.get("web_tools_external_profiles") or {}
+    profiles = {name: external.normalize(saved.get(name) or {}, name)
+                for name in external.PROVIDERS}
+    return {"backend": data.get("web_tools_backend") or "local",
+            "external": profiles[provider], "external_profiles": profiles}
+
+
+def set_web_tools_config(accounts_dir, updates):
+    """Validate the whole patch before atomically persisting any field."""
+    import qoder_external_web as external
+    if not isinstance(updates, dict):
+        raise ValueError("web tools settings must be an object")
+    if set(updates) - {"enabled", "backend", "external"}:
+        raise ValueError("unknown web tools setting")
+    with _lock:
+        data = load(accounts_dir)
+        if "enabled" in updates:
+            if type(updates["enabled"]) is not bool:
+                raise ValueError("enabled must be a boolean")
+            data["web_tools"] = updates["enabled"]
+        if "backend" in updates:
+            if updates["backend"] not in ("local", "qoder", "external"):
+                raise ValueError("backend must be local, qoder or external")
+            data["web_tools_backend"] = updates["backend"]
+        if "external" in updates:
+            patch = updates["external"]
+            if not isinstance(patch, dict):
+                raise ValueError("external search configuration must be an object")
+            provider = patch.get("provider") or data.get("web_tools_external_provider") or "searxng"
+            profiles = dict(data.get("web_tools_external_profiles") or {})
+            # Keys omitted by a masked form are retained only for this provider.
+            profile = dict(profiles.get(provider) or {})
+            unknown = set(patch) - set(external.defaults(provider))
+            if unknown:
+                raise ValueError("unknown external search setting")
+            profile.update(patch)
+            profiles[provider] = external.normalize(profile, provider)
+            data["web_tools_external_profiles"] = profiles
+            data["web_tools_external_provider"] = provider
+        if data.get("web_tools") is True and data.get("web_tools_backend") == "external":
+            provider = data.get("web_tools_external_provider") or "searxng"
+            external.normalize((data.get("web_tools_external_profiles") or {}).get(provider) or {},
+                               provider, ready=True)
+        save(accounts_dir, data)
+    return web_tools_config(accounts_dir)
+
+
 # ------------------------------------------------------------- model gates
 # P1-4：模型闸门配置层。全局封禁（banned_models）与每 Key 白名单（key 条目的
 # models 字段）共用同一套 pattern 清洗与匹配：fnmatch 通配、大小写不敏感；

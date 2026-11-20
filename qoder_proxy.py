@@ -76,12 +76,13 @@ import qoder_session_cache
 import qoder_sign
 import qoder_updater
 import qoder_webtools
+import qoder_web_response
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.13"  # fork 维护版：并入上游 v1.9.11（流收尾/模型身份审计/admin shutdown）+ fork 排队/重试/计量语义
+VERSION = "1.9.14"  # fork 维护版：并入上游 v1.9.12（自动签到面板 + 可选联网工具后端）+ fork 排队/重试/计量语义
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2647,6 +2648,7 @@ def runtime_settings_view():
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
+        **web_tools_settings_view(),
         # issue #135：工具协议残片收尾策略（面板可切换，立即生效）
         "tool_echo_mode": tool_echo_mode(),
         "tool_echo_mode_env": (os.environ.get("QD_TOOL_ECHO_MODE") or "").strip().lower(),
@@ -9611,6 +9613,19 @@ def web_tools_enabled():
         return False
 
 
+def web_tools_settings_view():
+    """Panel-only configuration view: API keys are never returned."""
+    import qoder_external_web
+    config = qoder_settings.web_tools_config(ACCOUNTS_DIR)
+    backend_env = (os.environ.get("QD_WEB_TOOLS_BACKEND") or "").strip().lower()
+    return {"web_tools_backend": backend_env or config["backend"],
+            "web_tools_backend_env": backend_env,
+            "web_tools_enabled_env": (os.environ.get("QD_WEB_TOOLS") or "").strip().lower(),
+            "web_tools_external": qoder_external_web.public_profile(config["external"]),
+            "web_tools_external_profiles": {name: qoder_external_web.public_profile(profile)
+                for name, profile in config["external_profiles"].items()}}
+
+
 def builtin_web_tool_names(tools):
     """客户端声明的内置 web 工具名集合（web_search / web_fetch）。"""
     names = set()
@@ -9644,29 +9659,33 @@ def rewrite_web_tools(tools, names):
 
 def _chat_chunks(obj, model):
     """把聚合好的 chat 对象摊成 SSE 分片（web 工具路径用：内容是整段回放）。"""
-    cid = (obj or {}).get("id") or "chatcmpl-web"
-    created = int((obj or {}).get("created") or time.time())
-    mdl = ((obj.get("resolved_model") or "") if "resolved_model" in (obj or {})
-           else (obj or {}).get("model") or model or "")
-    text = (((obj or {}).get("choices") or [{}])[0].get("message") or {}).get(
-        "content") or ""
-    base = {"id": cid, "object": "chat.completion.chunk",
-            "created": created, "model": mdl}
-    yield dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
-                               "finish_reason": None}])
-    if text:
-        yield dict(base, choices=[{"index": 0, "delta": {"content": text},
-                                   "finish_reason": None}])
-    tail = dict(base, choices=[{"index": 0, "delta": {},
-                                "finish_reason": "stop"}])
-    if (obj or {}).get("usage"):
-        tail["usage"] = (obj or {}).get("usage")
+    obj = obj or {}
+    choice = (obj.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    reported_model = obj.get("resolved_model") if "resolved_model" in obj else obj.get("model") or model
+    base = {"id": obj.get("id") or "chatcmpl-web", "object": "chat.completion.chunk",
+            "created": int(obj.get("created") or time.time()),
+            "model": reported_model or ""}
+
+    def chunk(delta, finish_reason=None):
+        return dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}])
+
+    yield chunk({"role": "assistant"})
+    for field in ("reasoning_content", "content"):
+        if message.get(field):
+            yield chunk({field: message[field]})
+    calls = message.get("tool_calls") or []
+    if calls:
+        yield chunk({"tool_calls": [dict(call, index=index) for index, call in enumerate(calls)]})
+    tail = chunk({}, choice.get("finish_reason") or "stop")
+    if obj.get("usage"):
+        tail["usage"] = obj["usage"]
     yield tail
 
 
 def _chat_chunks_iter(obj, model):
-    return [("data: " + json.dumps(c, ensure_ascii=False) + "\n\n").encode()
-            for c in _chat_chunks(obj, model)]
+    for chunk in _chat_chunks(obj, model):
+        yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
@@ -10431,6 +10450,12 @@ def iter_inner_sse(resp, holder=None):
             continue
         if isinstance(inner, dict):
             _capture_model_identity(inner, holder, getattr(resp, "_qd_model_audit", None))
+            # Hosted orchestration must reject explicit errors even when a stop
+            # frame precedes/follows them. Do not log or expose raw error bodies,
+            # execute their tool calls, or replay an already established request.
+            if (holder is not None and holder.get("_hosted_web_fail_on_inner_error")
+                    and inner.get("error")):
+                raise UpstreamStatus(502, "upstream returned an error")
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
             note_queue_observation(scope, inner.get("error"))
@@ -10452,14 +10477,15 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None):
+def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None, *,
+                     require_terminal=False):
     """把上游信封流折叠成一个非流式 chat.completion 对象。
 
     allowed_names：本次请求声明的工具名集合；用于「泄漏文本回读」的守卫
     （见 parse_leaked_tool_calls / issue #8）。
     """
     holder = holder if holder is not None else {}
-    content, reasoning, finish = [], [], "stop"
+    content, reasoning, finish = [], [], None
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
     started = time.time()
@@ -10545,6 +10571,12 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                         entry["function"]["arguments"] += fc["arguments"]
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+
+    if require_terminal and finish not in ("stop", "tool_calls", "function_call",
+                                           "length", "content_filter"):
+        raise UpstreamStatus(502, "upstream ended without a completed response")
+    if finish is None:
+        finish = "stop"
 
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
@@ -10901,6 +10933,10 @@ def _additional_tools_from_input(inp):
     return out
 
 
+def _responses_tool_declarations(payload):
+    return list(payload.get("tools") or []) + _additional_tools_from_input(payload.get("input"))
+
+
 def _stamp_tool_namespace(item, ns_map):
     """回程：把 namespace 补到 function_call/custom_tool_call 项上（issue #127）。"""
     if not isinstance(item, dict) or not ns_map:
@@ -10998,7 +11034,7 @@ def _unwrap_custom_input(args):
 _RESPONSES_IGNORED_ONCE = set()
 
 
-def _note_ignored_responses(payload):
+def _note_ignored_responses(payload, implemented=()):
     """issue #87：把当前**未实现**的 Responses 专有字段显式记下来。
 
     客户端（Codex 等）会带 store / previous_response_id / include / text 等字段，
@@ -11008,6 +11044,8 @@ def _note_ignored_responses(payload):
     try:
         for key in ("store", "previous_response_id", "include", "text",
                     "truncation", "metadata", "service_tier", "background"):
+            if key in implemented:
+                continue
             if payload.get(key) is None or key in _RESPONSES_IGNORED_ONCE:
                 continue
             _RESPONSES_IGNORED_ONCE.add(key)
@@ -11017,7 +11055,7 @@ def _note_ignored_responses(payload):
         pass
 
 
-def responses_to_chat(payload):
+def responses_to_chat(payload, hosted_web=False):
     """Translate a Responses API request body into a Chat Completions body."""
     messages = []
     instructions = payload.get("instructions")
@@ -11035,6 +11073,8 @@ def responses_to_chat(payload):
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
+            if itype in ("additional_tools", "mcp_tools"):
+                continue  # These declarations are collected separately from conversation items.
             if itype in (None, "message"):
                 body = _flatten_content(item.get("content"))
                 if body:
@@ -11188,10 +11228,12 @@ def responses_to_chat(payload):
         chat["reasoning_effort"] = effort
     # issue #127：工具清单可能分两处（顶层 tools + input 里的 additional_tools），
     # 且可能包在 type:"namespace" 容器里。先合并再展平，最后才做类型过滤。
-    _raw_tools = list(payload.get("tools") or [])
-    _raw_tools.extend(_additional_tools_from_input(payload.get("input")))
+    _raw_tools = _responses_tool_declarations(payload)
     if _raw_tools:
         _flat_tools, _ns_map = _flatten_ns_tools(_raw_tools)
+        if hosted_web:
+            _flat_tools = [t for t in _flat_tools if t.get("type") not in
+                           qoder_webtools.SEARCH_DECL_TYPES + qoder_webtools.FETCH_DECL_TYPES]
         chat["tools"] = _tools_for_chat(_flat_tools)
         if _ns_map:
             # 回程补 namespace 用（不下发给上游）
@@ -11205,7 +11247,7 @@ def responses_to_chat(payload):
         chat["parallel_tool_calls"] = True
     if isinstance(payload.get("stream_options"), dict):
         chat["stream_options"] = payload["stream_options"]
-    _note_ignored_responses(payload)
+    _note_ignored_responses(payload, implemented=("include", "metadata") if hosted_web else ())
     return chat
 
 
@@ -11235,6 +11277,12 @@ def _response_model_identity(requested, resolved=None):
             "resolved_model": actual}
 
 
+_RESPONSES_INCOMPLETE_REASONS = {
+    "length": "max_output_tokens",
+    "content_filter": "content_filter",
+}
+
+
 def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                      allowed_names=None):
     """Fold a Chat Completions object into a Responses API response object.
@@ -11248,6 +11296,8 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
     msg = choice.get("message") or {}
     text = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
+    incomplete_reason = _RESPONSES_INCOMPLETE_REASONS.get(choice.get("finish_reason"))
+    status = "incomplete" if incomplete_reason else "completed"
     output = []
     if reasoning:
         output.append({
@@ -11260,6 +11310,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
         fn = tc.get("function") or {}
         call_id = tc.get("id") or _new_id("call_")
         name = fn.get("name") or ""
+        arguments = fn.get("arguments") or ""
         if name and name in custom_names:
             output.append(_stamp_tool_namespace({
                 "id": _new_id("ctc_"),
@@ -11267,7 +11318,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
-                "input": _unwrap_custom_input(fn.get("arguments") or ""),
+                "input": _unwrap_custom_input(arguments),
             }, ns_map))
         else:
             output.append(_stamp_tool_namespace({
@@ -11276,7 +11327,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
-                "arguments": fn.get("arguments") or "{}",
+                "arguments": "{}" if isinstance(arguments, str) and not arguments.strip() else arguments,
             }, ns_map))
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
@@ -11312,17 +11363,16 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
         output.append({
             "id": _new_id("msg_"),
             "type": "message",
-            "status": "completed",
+            "status": status,
             "role": "assistant",
             "content": [{"type": "output_text", "text": text,
                          "annotations": []}] if text else [],
         })
-    finish = choice.get("finish_reason") or "stop"
     obj = {
         "id": _new_id("resp_"),
         "object": "response",
         "created_at": int(time.time()),
-        "status": "completed" if finish != "length" else "incomplete",
+        "status": status,
         "model": model,
         "output": output,
         "output_text": text,
@@ -11336,8 +11386,8 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
     u = _responses_usage(chat_obj.get("usage"))
     if u:
         obj["usage"] = u
-    if finish == "length":
-        obj["incomplete_details"] = {"reason": "max_output_tokens"}
+    if incomplete_reason:
+        obj["incomplete_details"] = {"reason": incomplete_reason}
     return obj
 
 
@@ -11465,7 +11515,8 @@ def stream_responses_events(inner_lines, model, holder):
                         "output_index": out_idx,
                         "id": c_id,
                         "name": fn_name,
-                        "arguments": fn_args,
+                        "arguments": "",
+                        "arguments_started": False,
                         "custom": is_custom,
                         "item_id": _new_id("ctc_" if is_custom else "fc_"),
                     }
@@ -11489,21 +11540,17 @@ def stream_responses_events(inner_lines, model, holder):
                         entry["name"] = fn_name
                         if fn_name in custom_names:
                             entry["custom"] = True
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                        if entry.get("custom"):
-                            yield ev("response.custom_tool_call_input.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
-                        else:
-                            yield ev("response.function_call_arguments.delta", {
-                                "output_index": entry["output_index"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
+                if fn_args:
+                    entry["arguments"] += fn_args
+                    if not entry["custom"] and (entry["arguments_started"] or fn_args.strip()):
+                        fragment = fn_args if entry["arguments_started"] else entry["arguments"]
+                        entry["arguments_started"] = True
+                        yield ev("response.function_call_arguments.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": fragment,
+                        })
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
@@ -11630,11 +11677,21 @@ def stream_responses_events(inner_lines, model, holder):
     for idx in sorted(tool_calls_map.keys()):
         entry = tool_calls_map[idx]
         if entry.get("custom"):
+            # The upstream function wraps freeform input in JSON. Decode the
+            # complete string once so deltas and the final item agree.
+            custom_input = _unwrap_custom_input(entry["arguments"])
+            if custom_input:
+                yield ev("response.custom_tool_call_input.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": custom_input,
+                })
             yield ev("response.custom_tool_call_input.done", {
                 "output_index": entry["output_index"],
                 "item_id": entry["item_id"],
                 "call_id": entry["id"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "input": custom_input,
             })
             fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
@@ -11642,13 +11699,23 @@ def stream_responses_events(inner_lines, model, holder):
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "input": custom_input,
             }, (holder or {}).get("tool_ns"))
         else:
+            arguments = entry["arguments"]
+            if not entry["arguments_started"]:
+                arguments = "{}"
+                yield ev("response.function_call_arguments.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": arguments,
+                })
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
+                "item_id": entry["item_id"],
                 "call_id": entry["id"],
-                "arguments": entry["arguments"],
+                "arguments": arguments,
             })
             fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
@@ -11656,7 +11723,7 @@ def stream_responses_events(inner_lines, model, holder):
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
-                "arguments": entry["arguments"],
+                "arguments": arguments,
             }, (holder or {}).get("tool_ns"))
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
@@ -11780,6 +11847,8 @@ def stream_responses_events(inner_lines, model, holder):
             })
             yield ev("response.output_item.done",
                      {"output_index": out_idx, "item": fc_item})
+    incomplete_reason = _RESPONSES_INCOMPLETE_REASONS.get(finish)
+    status = "incomplete" if incomplete_reason else "completed"
     # 3. 有文本或没有任何输出项时，补 message 项
     has_other_items = any(o for o in outputs if o)
     if msg_index is not None or full_text or not has_other_items:
@@ -11808,14 +11877,13 @@ def stream_responses_events(inner_lines, model, holder):
             "part": {"type": "output_text", "text": full_text,
                      "annotations": []},
         })
-        outputs[msg_index] = msg_item("completed")
+        outputs[msg_index] = msg_item(status)
         yield ev("response.output_item.done",
                  {"output_index": msg_index, "item": outputs[msg_index]})
-    status = "completed" if finish != "length" else "incomplete"
     final = resp_obj(status)
-    if finish == "length":
-        final["incomplete_details"] = {"reason": "max_output_tokens"}
-    yield ev("response.completed", {"response": final})
+    if incomplete_reason:
+        final["incomplete_details"] = {"reason": incomplete_reason}
+    yield ev("response." + status, {"response": final})
 
 
 def _responses_completed_quiet(holder, model=""):
@@ -14516,58 +14584,118 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result)
 
     def _handle_web_tools(self, path, payload, names):
-        """本地代跑 web_search / web_fetch：模型要搜就由网关去搜，再把结果回灌。
-
-        只在客户端声明了内置 web 工具（type=web_search / web_fetch）且开关打开时
-        走这里；普通 function 工具照常走原来的透传路径。
-        """
+        """Execute declared hosted web tools without client-side orchestration."""
         is_responses = path.endswith("/responses")
         want_stream = bool(payload.get("stream"))
+        names = set(names)
+        # Responses web_search includes opening sources, not just a query.
+        if is_responses and qoder_webtools.WEB_SEARCH_NAME in names:
+            names.add(qoder_webtools.WEB_FETCH_NAME)
         try:
-            chat_req = (responses_to_chat(payload) if is_responses
-                        else dict(payload))
-        except Exception as exc:
-            return self._error(400, "invalid request: %s" % exc,
-                               "invalid_request_error")
-        chat_req = dict(chat_req)
-        chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
+            if is_responses:
+                declared_tools, _ = _flatten_ns_tools(_responses_tool_declarations(payload))
+            else:
+                declared_tools = list(payload.get("tools") or [])
+            evidence = qoder_web_response.WebEvidence(declared_tools)
+            web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True)
+            call_limit = payload.get("max_tool_calls", 8)
+            if type(call_limit) is not int or call_limit < 0:
+                raise ValueError("max_tool_calls must be a non-negative integer")
+            call_limit = min(call_limit, 32)
+            if is_responses and (payload.get("previous_response_id") or payload.get("background")):
+                raise ValueError("stateful/background web responses are not supported; send full input history")
+            chat_req = (responses_to_chat(payload, hosted_web=True) if is_responses else dict(payload))
+            chat_req = dict(chat_req)
+            original_tools = chat_req.get("tools") or []
+            ordinary_names = {_tool_declared_name(t) for t in original_tools
+                              if isinstance(t, dict) and t.get("type") in (None, "function")}
+            ordinary_names.discard("")
+            if ordinary_names & names:
+                raise ValueError("client function names conflict with hosted web tools")
+            chat_req["tools"] = rewrite_web_tools(original_tools, names)
+            choice = chat_req.get("tool_choice")
+            choice_kind = choice.get("type") if isinstance(choice, dict) else None
+            forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
+                          else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
+                          else None)
+            if forced_web in names:
+                chat_req["tool_choice"] = {"type": "function", "function": {"name": forced_web}}
+            normalize_tool_choice(chat_req)
+            translate_max_completion_tokens(chat_req)
+        except (ValueError, TypeError) as exc:
+            return self._error(400, "invalid web request: %s" % exc, "invalid_request_error")
         chat_req["stream"] = False
+        if ordinary_names and "parallel_tool_calls" not in payload:
+            chat_req["parallel_tool_calls"] = False
+        self._apply_context_header(chat_req)
         model = str(chat_req.get("model") or "")
-        # issue #131-2：这条分支此前直接 open_upstream，跳过了模型封禁与 Key
-        # 白名单 —— 只要声明一个 web_search/web_fetch 就能用本不该授权的模型。
-        # 授权必须与协议/工具无关，统一在分流之后、推理之前判一次。
+        # issue #131-2: authorise before inference, independent of protocol/tools.
         _blocked = self._model_precheck(model, self._request_realm())
         if _blocked:
             return self._error(400, _blocked, "invalid_request_error")
+        web_output = (qoder_web_response.ResponsesWebOutput(
+            dict(payload, tools=declared_tools, parallel_tool_calls=chat_req["parallel_tool_calls"]),
+            model, evidence, self._sse_begin if want_stream else None,
+            self._sse_write if want_stream else None) if is_responses else None)
+        if web_output:
+            web_output.start()
+
+        def fail(status, message, kind="upstream_error"):
+            if web_output and web_output.started:
+                web_output.fail(message)
+                return None
+            return self._error(status, message, kind)
+
         session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
         usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}
         obj = None
         rounds = 0
-        _acc = {}          # 多轮消耗累加（issue #131-3）
-        for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
+        calls_used = 0
+        _acc = {}
+        _details = {"prompt_tokens_details": {}, "completion_tokens_details": {}}
+        all_names = names | ordinary_names
+        round_limit = max(1, WEB_TOOLS_MAX_ROUNDS)
+        # Reserve a synthesis turn after the last allowed tool round. Previously
+        # the last tool results were discarded and its pending calls leaked out.
+        for turn in range(round_limit + 1):
             req = dict(chat_req, messages=messages)
+            no_web = (turn >= round_limit or calls_used >= call_limit
+                      or chat_req.get("tool_choice") == "none")
+            if no_web:
+                req["tools"] = [t for t in req["tools"]
+                                if _tool_declared_name(t) not in names]
+                req["tool_choice"] = ("none" if chat_req.get("tool_choice") == "none"
+                                      or not req["tools"] else "auto")
+            elif turn:
+                # A required/forced search applies to the first turn, not forever.
+                req["tool_choice"] = "auto"
             try:
                 resp, account, _ = open_upstream(
                     req, target_realm=realm, usage_ctx=usage_ctx,
                     session_key=session_key)
             except RateLimited as exc:
+                if web_output and web_output.started:
+                    return fail(429, "upstream rate limit reached")
                 return self._rate_limited(exc)
             except urllib.error.HTTPError as exc:
                 detail = getattr(exc, "qoder_detail", "") or ""
                 msg, etype = friendly_upstream_error(exc.code, detail)
-                return self._error(exc.code, msg, etype)
-            except Exception as exc:
-                return self._error(502, str(exc)[:200], "upstream_error")
+                return fail(exc.code, msg, etype)
+            except Exception:
+                return fail(502, "upstream request failed")
+            self.realm_used = usage_ctx.get("realm") or realm or ""
             _round_t0 = time.time()
-            with resp:
-                obj = aggregate_stream(resp, model,
-                                       holder={"usage": None},
-                                       allowed_names=names)
-            # issue #131-3：这条分支此前完全不记账 —— 看板/按 Key 账号统计、
-            # 以及按本地流水折叠的每日限额都漏掉这部分消耗。每轮都记一条
-            # （账号/Key/模型与真实出站一致），并累加成总数回给客户端。
+            try:
+                with resp:
+                    obj = aggregate_stream(resp, model, holder={
+                        "usage": None, "_hosted_web_fail_on_inner_error": True},
+                        allowed_names=all_names, require_terminal=True)
+            except Exception:
+                # This block only consumes the upstream body. Socket errors
+                # here are source failures. Client write errors propagate.
+                return fail(502, "upstream stream failed")
             _u = obj.get("usage") or {}
             if _u:
                 try:
@@ -14582,72 +14710,104 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     log("web tools: record_usage failed: %s" % exc,
                         level="WARN", tag="webtools")
-                for _k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    try:
-                        _acc[_k] = _acc.get(_k, 0) + int(_u.get(_k) or 0)
-                    except (TypeError, ValueError):
-                        pass
-                for _k in ("credits", "credit"):
-                    if _u.get(_k) is not None:
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
+                            "credits", "credit", "original_credits"):
+                    if _u.get(key) is not None:
                         try:
-                            _acc[_k] = float(_acc.get(_k) or 0) + float(_u[_k])
+                            value = float(_u[key]) if key in ("credits", "credit", "original_credits") else int(_u[key])
+                            _acc[key] = _acc.get(key, 0) + value
                         except (TypeError, ValueError):
                             pass
-            msg = ((obj.get("choices") or [{}])[0].get("message") or {})
-            calls = [c for c in (msg.get("tool_calls") or [])
-                     if (c.get("function") or {}).get("name") in names]
+                for key, details in _details.items():
+                    for name, value in (_u.get(key) or {}).items():
+                        if type(value) is int:
+                            details[name] = details.get(name, 0) + value
+            choice = (obj.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            if choice.get("finish_reason") == "content_filter":
+                msg.pop("tool_calls", None)
+                break
+            all_calls = msg.get("tool_calls") or []
+            calls = [c for c in all_calls if (c.get("function") or {}).get("name") in names]
             if not calls:
                 break
+            if choice.get("finish_reason") == "length":
+                client_calls = [c for c in all_calls if (c.get("function") or {}).get("name") not in names]
+                if client_calls:
+                    msg["tool_calls"] = client_calls
+                else:
+                    msg.pop("tool_calls", None)
+                break
+            if no_web:
+                return fail(502, "upstream requested a disabled web tool")
+            if len(calls) != len(all_calls):
+                return fail(502, "upstream mixed hosted and client tools; retry without parallel tool calls")
             rounds += 1
-            log("web tools: round %d, %d call(s) -> local execution"
-                % (rounds, len(calls)), tag="webtools")
-            messages.append({"role": "assistant",
-                             "content": msg.get("content") or "",
-                             "tool_calls": msg.get("tool_calls") or []})
+            log("web tools: round %d, %d call(s) -> gateway execution" % (rounds, len(calls)), tag="webtools")
+            assistant = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": all_calls}
+            if msg.get("reasoning_content"):
+                assistant["reasoning_content"] = msg["reasoning_content"]
+            messages.append(assistant)
             for call in calls:
                 fn = call.get("function") or {}
+                index = web_output.tool_start(fn.get("name"), fn.get("arguments"),
+                    executing=calls_used < call_limit) if web_output else None
+                observed = []
                 try:
-                    result = qoder_webtools.run_tool(fn.get("name"),
-                                                     fn.get("arguments"))
-                except Exception as exc:
-                    result = json.dumps({"error": str(exc)[:120]},
-                                        ensure_ascii=False)
-                messages.append({"role": "tool",
-                                 "tool_call_id": call.get("id") or "",
-                                 "content": result})
-        self.realm_used = usage_ctx.get("realm") or (realm or "")
-        obj = obj or {"choices": [{"index": 0, "message": {"role": "assistant",
-                                   "content": ""}, "finish_reason": "stop"}]}
+                    if calls_used >= call_limit:
+                        result = json.dumps({"error": "web tool budget exhausted"})
+                    else:
+                        calls_used += 1
+                        result = qoder_webtools.run_tool(fn.get("name"), fn.get("arguments"),
+                            account=account, context=evidence, on_result=observed.append, config=web_config)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    raise
+                except (ValueError, TypeError) as exc:
+                    result = json.dumps({"error": str(exc)[:200]}, ensure_ascii=False)
+                except Exception:
+                    result = json.dumps({"error": "web tool execution failed"})
+                if web_output:
+                    web_output.tool_done(index, observed[-1] if observed else {"ok": False})
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result})
+        obj = copy.deepcopy(obj or {"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]})
         if _acc:
-            # 多轮合计回给客户端：客户端只看到一次请求，但上游扣的是每轮的钱。
             _usage = dict(obj.get("usage") or {})
-            _usage.update({k: v for k, v in _acc.items() if v})
+            _usage.update(_acc)
+            _usage.update({k: v for k, v in _details.items() if v})
             obj = dict(obj, usage=_usage)
+        for choice in obj.get("choices") or []:
+            message = choice.get("message") or {}
+            if isinstance(message.get("content"), str):
+                message["content"] = evidence.render(message["content"])
+                citations = evidence.annotations(message["content"])
+                if citations:
+                    message["annotations"] = [{"type": "url_citation", "url_citation": {
+                        k: v for k, v in citation.items() if k != "type"}} for citation in citations]
         if is_responses:
+            custom_names = custom_tool_names(declared_tools)
+            tool_ns = chat_req.get("_qd_tool_ns") or {}
             if not want_stream:
-                return self._json(200, chat_to_response(obj, model))
-            self._sse_begin()
-            for frame in stream_responses_events(
-                    _chat_chunks_iter(obj, model), model,
-                    {"usage": obj.get("usage"),
-                     "resolved_model": obj.get("resolved_model")}):
-                self._sse_write(clean_responses_frame(frame))
+                return self._json(200, web_output.enhance(chat_to_response(obj, model,
+                    custom_names=custom_names, ns_map=tool_ns, allowed_names=all_names)))
+            frames = stream_responses_events(_chat_chunks_iter(obj, model), model, {
+                "usage": obj.get("usage"), "resolved_model": obj.get("resolved_model"),
+                "custom_names": custom_names, "tool_ns": tool_ns, "allowed_names": all_names,
+            })
+            web_output.stream_final(clean_responses_frame(frame) for frame in frames)
             return
         if not want_stream:
             return self._json(200, obj)
         self._sse_begin()
-        for chunk in _chat_chunks(obj, model):
-            self._sse_write("data: " + json.dumps(chunk, ensure_ascii=False)
-                            + "\n\n")
-        self._sse_write("data: [DONE]\n\n")
+        for frame in _chat_chunks_iter(obj, model):
+            self._sse_write(frame)
+        self._sse_write(b"data: [DONE]\n\n")
 
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
+        # issue #127：在转换成 chat 请求前保留原始 custom 类型。
+        custom_names = custom_tool_names(_responses_tool_declarations(payload))
         chat_req = responses_to_chat(payload)
-        # issue #127：custom 判型必须用**合并 + 展平后**的清单（顶层 tools 与
-        # input.additional_tools 都可能含容器），否则回程判型与出站不一致。
-        custom_names = custom_tool_names(chat_req.get("tools") or [])
         tool_ns = chat_req.get("_qd_tool_ns") or {}
         self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
@@ -15175,14 +15335,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._error(400, "invalid json: %s" % exc,
                                    "invalid_request_error")
-            enabled = bool((body or {}).get("enabled"))
             try:
-                qoder_settings.set_web_tools_enabled(ACCOUNTS_DIR, enabled)
+                qoder_settings.set_web_tools_config(ACCOUNTS_DIR, body)
+            except (ValueError, TypeError) as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             except Exception as exc:
                 return self._error(500, "save failed: %s" % exc)
-            log("local web tools %s (panel)" % ("enabled" if enabled else "disabled"),
-                tag="webtools")
-            return self._json(200, {"ok": True, "web_tools": web_tools_enabled()})
+            log("web tools configuration saved (panel)", tag="webtools")
+            return self._json(200, {"ok": True, "web_tools": web_tools_enabled(),
+                                    **web_tools_settings_view()})
         if path == "/credits/probe":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
@@ -15281,6 +15442,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/chat/completions", "/chat/completions",
                     "/v1/responses", "/responses") and web_tools_enabled():
             _web_names = builtin_web_tool_names(payload.get("tools") or [])
+            if path in ("/v1/responses", "/responses"):
+                _additional, _ = _flatten_ns_tools(_additional_tools_from_input(payload.get("input")))
+                _web_names.update(builtin_web_tool_names(_additional))
             if _web_names:
                 return self._handle_web_tools(path, payload, _web_names)
         if path in ("/v1/responses", "/responses"):

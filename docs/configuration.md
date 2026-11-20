@@ -269,22 +269,96 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_TASKS_DEBUG=1` | 把任务中心每个子调用的耗时打印到 stderr |
 
 
-## 本地 web 工具（`QD_WEB_TOOLS`）
+## 联网工具与搜索后端（`QD_WEB_TOOLS`）
 
-客户端（Codex 等）在 Responses 请求里声明的内置工具 `web_search` / `web_fetch`，Qoder 上游不会执行；
-开启本功能后由**网关本地执行**：把声明改写成同名 function，模型调用时代网关去搜索/抓页面，再把结果回灌给模型继续生成（最多 3 轮）。
+客户端在请求里声明的内置工具 `web_search` / `web_fetch`，当前推理协议不能直接代跑；
+开启本功能后由**网关代跑工具**：把声明改写成同名 function，模型调用时由所选后端搜索/抓页面，再把结果回灌给模型继续生成。默认最多 3 轮工具调用，随后保留一轮最终回复；后端默认仍在本地执行。
 
 | 开关 | 说明 |
 |---|---|
-| 看板「设置 → 本地 web 工具」 | 持久化在 `accounts/settings.json` 的 `web_tools`，改完立即生效 |
+| 看板「设置 → 联网工具」 | 总开关、后端及外部服务配置保存在 `accounts/settings.json`；点击「保存并应用」后，新请求立即生效 |
 | `QD_WEB_TOOLS=on/off` | 环境变量优先于面板开关 |
 | `QD_WEB_TOOLS_ROUNDS` | 代跑轮次上限，默认 3 |
+| `QD_WEB_TOOLS_BACKEND=local/qoder/external` | 可选强制覆盖面板后端，面板会显示并锁定该选择。未设置时使用面板保存的后端，默认 `local`。要恢复面板控制，移除此环境变量后重启一次 |
 
-安全边界：只允许 http/https；拒绝带凭据的 URL、localhost、私网与链路本地地址；
-重定向逐跳复检；响应体 4MB / 正文 20000 字上限。
-配置了 `HTTPS_PROXY` / `QD_WEB_TOOLS_PROXY` 时由代理做 DNS 解析（仍然拦字面私网地址）。
+面板中的三种后端：
+
+| 选择 | 搜索 | 网页抓取 |
+|---|---|---|
+| 原项目内置（`local`） | DuckDuckGo → Bing → Wikipedia 引擎链 | 网关直接抓取 |
+| Qoder 官方（`qoder`） | 当前推理账号的官方搜索服务 | 当前推理账号的官方抓取服务 |
+| 外部搜索服务（`external`） | 面板配置的本地或云端 HTTP 服务 | 网关直接抓取 |
+
+配置在每次 API 请求开始时读取一次；面板切换不会把正在进行的多轮调用混到不同后端。普通应用 function 不被接管，也没有跨后端自动回退。
+
+本地后端安全边界：只允许 http/https；拒绝带凭据的 URL、localhost、私网与链路本地地址；
+重定向逐跳复检；响应体 4MB / 正文 20000 字上限。目标 DNS 无论是否使用代理都需通过公网地址检查；
+本地工具的代理需显式设置 `QD_WEB_TOOLS_PROXY`，不会自动继承 `HTTPS_PROXY`。
 
 代价：每代跑一轮都会多消耗一次账号额度；默认关闭。
+
+### 外部搜索服务
+
+在「设置 → 联网工具」选择「外部搜索服务」，选择服务类型，填写完整搜索接口地址和所需密钥，然后「保存并应用」。同一后端既可连接 Docker 内网服务，也可连接公网搜索 API。
+
+支持以下预设，接口地址也可修改以使用兼容网关：
+
+| 服务类型 | 默认地址 | 认证 |
+|---|---|---|
+| SearXNG | 自行填写，例如 `http://searxng:8080/search` | 通常无需密钥；需启用 JSON 输出 |
+| Tavily | `https://api.tavily.com/search` | Bearer API Key |
+| Brave Search | `https://api.search.brave.com/res/v1/web/search` | `X-Subscription-Token` |
+| Serper | `https://google.serper.dev/search` | `X-API-KEY` |
+| 自定义 HTTP JSON | 自行填写 | 可选认证请求头、前缀及专用密钥字段 |
+
+在「请求与结果映射」中，可调整 GET/POST、查询参数名、结果数量参数名、固定 JSON 参数，以及结果列表、标题、链接、摘要的字段路径。例如某服务返回 `{"data":{"items":[{"name":"标题","link":"https://...","summary":"摘要"}]}}`，可设列表路径为 `data.items`、标题字段为 `name`、链接字段为 `link`、摘要字段为 `summary`。结果列表在根数组时路径留空；路径支持点分隔和数组数字下标，不执行表达式。GET 用 URL 查询参数，POST 用 JSON 请求体。
+
+各服务配置和密钥独立保存，切换不会共用另一家服务的密钥。面板 API 只返回专用密钥是否已设置；输入留空保留该服务旧密钥，勾选「清除当前服务已保存的密钥」才删除。密钥使用专用字段，不放在固定参数或 URL 中。配置保存在 `web_tools_backend`、`web_tools_external_provider` 和 `web_tools_external_profiles`。
+
+外部服务地址只能由面板管理员配置，模型不能选择服务地址、请求头或密钥。这里允许管理员指定的本地/私网搜索服务；模型请求的网页及搜索结果链接仍须经过公网限制。外部 API 不跟随重定向，不自动重试，不把认证转发给其他地址。超时 15 秒、JSON 响应最多 2 MiB。容器内 `localhost` 指容器自身；跨容器接入需共享 Docker 网络并使用服务名。
+
+预设协议参考：[SearXNG](https://docs.searxng.org/dev/search_api.html)、[Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Brave Search](https://api-dashboard.search.brave.com/api-reference/web/search/get)、[Serper](https://serper.dev/)。服务的可用性、密钥和用量规则由对应服务决定。
+
+### 可选的 Qoder 官方搜索 / 网页抓取（国内版 / 国际版）
+
+```bash
+QD_WEB_TOOLS=on QD_WEB_TOOLS_BACKEND=qoder python qoder_proxy.py
+```
+
+也可直接通过面板选择「Qoder 官方搜索与抓取」并启用总开关。Docker Compose 的环境变量方式适合需要强制固定后端的部署。需要包含新增工具模块的源码或镜像；仅设置旧镜像的环境变量不会新增功能。
+
+- 复用**当前这轮模型推理实际选中的账号**及其 COSY 签名。不会另选账号、跨区借用凭据，也不需要额外搜索 API Key、Node 或官方 CLI 进程。
+- 支持国内版和国际版公网账号，按当前推理账号的区域自动选择端点：国内版使用账号的 `gateway`，国际版使用 `https://center.qoder.sh`。国际版的 `QD_INTL_GATEWAY` 只覆盖推理地址，不改变官方工具地址；两个区域不互相借用账号或自动回退。
+- 企业 VPC 工具尚未验证，显式报错。已有登录过期或官方服务拒绝请求时也返回工具错误，不会静默切换本地搜索。
+- 查询和抓取 URL 会发送给 Qoder 官方服务；连接沿用账号模块的 `HTTP_PROXY` / `HTTPS_PROXY` 策略。
+- 抓取前执行本地 URL / DNS 公网检查，正文最多返回 20000 字。服务端返回的最终重定向 URL 也会检查；**远端中间重定向无法由网关逐跳审计**，不能套用本地后端的逐跳连接保证。
+- 官方搜索返回的是 Qoder 工具服务结果，不等于模型服务商原生搜索，也不保证比本地引擎结果更好。额外搜索 / 抓取是否收费、按何规则计费，以官方账号规则为准；网关没有得到独立工具用量字段。
+- 实测一个用户报告无可用模型额度的国际版账号仍能搜索和抓取；这不能证明工具免费，也不绕过模型推理的额度要求。网关仍使用实际选中的推理账号执行工具，不另选“搜索专用”账号。
+- 本功能只代跑客户端声明的内置 `web_search` / `web_fetch`。WebUI、Hermes 等自行执行的普通 function 工具仍由客户端处理，不会因设置这个变量自动改用官方搜索。
+
+Responses 客户端仅需声明 `web_search`，即可搜索和打开网页：
+
+```json
+{
+  "model": "YOUR_MODEL",
+  "input": "需要联网处理的用户问题",
+  "tools": [{"type": "web_search"}],
+  "tool_choice": "auto",
+  "max_tool_calls": 6,
+  "include": ["web_search_call.action.sources"],
+  "stream": true
+}
+```
+
+网关不追加新闻核查或回答风格的系统提示词；工具说明只描述能力和返回字段。何时搜索、查询词、是否阅读全文、回答语言与格式由应用提示词及模型决定。`tool_choice:none` 会禁止网关工具；`auto` 不保证模型必定搜索。保留应用的 `instructions` 及显式并行设置。项目原有的缺省系统提示词规则仍然适用，应用可按现有方式提供自己的指令。
+
+Responses 返回 `web_search_call`（搜索或 `open_page`）、实际工具进度事件和已观测来源的 `url_citation`。`include` 可要求搜索来源列表。工具进度实时发送，最终正文仍先聚合再输出，并非逐 token 透传。引用只表示链接来自本次工具结果，不代表正文事实已经核实。
+
+`max_tool_calls` 默认 8、最高 32；与管理员配置的轮次上限同时生效。重复的相同工具调用可在单次 API 请求、同一账号内复用结果。`web_search.filters.allowed_domains` / `blocked_domains` 在网关后处理，不依赖上游是否执行过滤；也约束抓取的输入和返回最终 URL，不能阻止远端已经发生的中间跳转。
+
+此适配覆盖常用无状态文本搜索流程。云端会话续接、后台任务、仅缓存搜索及图像搜索未实现，相应请求显式拒绝；定位和搜索上下文大小未映射到官方接口。普通应用 function 调用仍交给应用执行；上游若在同一批混合返回托管与应用工具，目前会报错。存在应用工具且客户端未指定并行设置时，网关默认串行以减少这种情况。
+
+协议与验证范围见[官方工具协议记录](official-web-tools.md)。没有环境覆盖时，在面板选择「原项目内置」并保存即可切回原实现。
 
 ### 结构化工具历史（`QD_STRUCTURED_TOOL_HISTORY` / `_REALMS`）
 

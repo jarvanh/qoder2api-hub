@@ -32,6 +32,9 @@ services:
       # 账号覆盖、凭证域推断优先于此默认；国际版仍使用公网。
       # - QD_CN_VPC_ENDPOINT=TARGET
       - TZ=Asia/Shanghai
+      # Web backend is switchable in the panel: local / qoder / external.
+      # Set this only to pin the backend and override panel choices.
+      # - QD_WEB_TOOLS_BACKEND=qoder
     volumes:
       # 持久化挂载账号凭证与用量流水
       # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
