@@ -495,7 +495,7 @@ class Scheduler(object):
                 if line.startswith("✓") or line.startswith("!"):
                     self.log(line)
         elif checkin_due:
-            self.log("所有账号今日已签到")
+            self.log("没有符合本轮签到条件的账号")
 
         # 3. 刷新额度快照（看板积分卡片依赖）
         for acc in targets:
@@ -505,7 +505,7 @@ class Scheduler(object):
                 pass
             time.sleep(0.5)
 
-        self.log("巡检完成：Token 保活 %d 个，签到 %d 个，本次新增积分 +%d"
+        self.log("巡检完成：Token 保活 %d 个，已检查签到 %d 个账号，本次新增积分 +%d"
                  % (ka["refreshed"], checkin_count, earned))
         self._save_state()
 

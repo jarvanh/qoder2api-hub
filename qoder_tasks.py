@@ -772,8 +772,16 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         for item in camp.get("codes") or []:
             logs.append(f"🎟 [{name}] {item['campaign']} 兑换码：{item['code']}"
                         f"（官方活动页可扫码兑换）")
-    else:
+    elif not camp.get("errors"):
         logs.append(f"! [{name}] 活动平台查询失败：{camp.get('error')}")
+
+    if camp.get("errors"):
+        detail = "；".join(str(e) for e in camp["errors"])[:200]
+        logs.append(f"! [{name}] 活动领取未成功：{detail}")
+        if not (camp.get("claimed") or camp.get("already") or camp.get("blocked")):
+            # 这个账号已走到领取阶段；不要把服务端拒绝变成旧端点的再次领取。
+            return {"ok": False, "logs": logs, "earned_credit": 0,
+                    "message": camp.get("message") or detail, "error": detail}
 
     if (camp.get("claimed") or camp.get("already") or camp.get("ok")
             or camp.get("blocked")):

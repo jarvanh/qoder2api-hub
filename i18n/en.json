@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 23
+    "version": 24
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -834,6 +834,11 @@
     "收尾，客户端应看到错误并重试；": "so the client sees an error and can retry;",
     "改为正常完成并保留已产出的正文 —— 用于「客户端收到 failed 后静默结束对话」的场景（Codex 实测）。": "returns completion while keeping emitted text, for clients that otherwise stop silently on a failed event (observed with Codex).",
     "lenient 是折中：那一轮没有工具调用，但对话不会断。上游修好后建议切回 strict。": "Lenient mode is a compromise: that turn has no tool calls, but the conversation continues. Return to strict mode after upstream is fixed.",
+    "系统提示词": "System prompt",
+    "清空 Qoder 默认提示词": "Omit the default Qoder system prompt",
+    "没有自定义系统提示词时，勾选后请求将省略 Qoder 的默认提示词。": "Omit the default Qoder prompt on requests without a custom system prompt.",
+    "未确认系统提示词设置": "The gateway did not confirm the system prompt setting",
+    "系统提示词设置已保存": "System prompt setting saved",
     "高": "High",
     "低": "Low",
     "不指定 Key（管理员预览）": "No key (administrator preview)",

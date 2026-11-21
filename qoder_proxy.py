@@ -82,7 +82,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status, next_daily_reset)
 from pathlib import Path
 
-VERSION = "1.9.14"  # fork 维护版：并入上游 v1.9.12（自动签到面板 + 可选联网工具后端）+ fork 排队/重试/计量语义
+VERSION = "1.9.15"  # fork 维护版：并入上游 v1.9.13（签到状态修正 + 可选省略默认提示词）+ fork 排队/重试/计量语义
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -459,7 +459,6 @@ def serve_http_server(server):
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 # 官方 baseprompt 模板（与桌面端一致的请求体骨架）
 BASEPROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1414,7 +1413,7 @@ def save_persisted_realm(realm):
 
 
 API_KEY = None
-SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+SYSTEM_PROMPT = None
 
 
 def _refreshable_accounts(accounts):
@@ -2642,6 +2641,7 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
+        "omit_default_system_prompt": qoder_settings.omit_default_system_prompt(ACCOUNTS_DIR),
         # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
@@ -7499,19 +7499,16 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
         images = [_url for _m in flat
                   for _text, _urls in [_flatten_content_text(_m.get("content"))]
                   for _url in _urls]
-    # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
-    # 真实会话随后追加。
-    tmpl_system = [m for m in (body.get("messages") or [])
-                   if (m or {}).get("role") == "system"]
-    if system_text is None:
-        # 客户端没给 system：优先用 --system-prompt 覆盖值（非默认时），
-        # 否则保留模板自带的 Qoder 系统提示词。
-        if SYSTEM_PROMPT and SYSTEM_PROMPT != DEFAULT_SYSTEM_PROMPT:
-            system_text = SYSTEM_PROMPT
-        else:
-            body["messages"] = tmpl_system
+    if system_text is None and SYSTEM_PROMPT:
+        system_text = SYSTEM_PROMPT
     if system_text is not None:
         body["messages"] = [{"role": "system", "content": system_text}]
+    elif qoder_settings.omit_default_system_prompt(ACCOUNTS_DIR):
+        body["messages"] = []
+    else:
+        # 模板里的示例对话不进入真实请求。
+        body["messages"] = [m for m in (body.get("messages") or [])
+                            if (m or {}).get("role") == "system"]
     # 追加真实会话
     body["messages"].extend(flat)
 
@@ -13286,6 +13283,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error()
         if payload is None:
             return
+        if ("omit_default_system_prompt" in payload
+                and type(payload["omit_default_system_prompt"]) is not bool):
+            return self._error(400, "omit_default_system_prompt must be a boolean",
+                               "invalid_request_error")
         reply = {}
         if "api_keys" in payload:
             raw = payload.get("api_keys")
@@ -13406,6 +13407,12 @@ class Handler(BaseHTTPRequestHandler):
                 reply["limits_apply_error"] = str(exc)
                 log("quota limits apply failed after save: %s" % exc,
                     level="WARN")
+        if "omit_default_system_prompt" in payload:
+            try:
+                qoder_settings.set_omit_default_system_prompt(
+                    ACCOUNTS_DIR, payload["omit_default_system_prompt"])
+            except OSError as exc:
+                return self._error(500, "save failed: %s" % exc)
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
@@ -15842,9 +15849,9 @@ def main():
                     default=os.environ.get("API_KEY")
                     or os.environ.get("QD_PROXY_KEY") or None,
                     help="require this bearer token on /v1/* (optional)")
-    ap.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT,
+    ap.add_argument("--system-prompt",
                     help="system message used when the request has none "
-                         "(default: keep the official Qoder template prompt)")
+                         "(if omitted, follow the panel's template prompt setting)")
     ap.add_argument("--usage-dir", default=None,
                     help="where to store usage.jsonl / usage-summary.json "
                          "(default: ./usage)")

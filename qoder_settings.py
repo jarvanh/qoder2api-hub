@@ -487,6 +487,25 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def omit_default_system_prompt(accounts_dir):
+    return load(accounts_dir).get("omit_default_system_prompt") is True
+
+
+def set_omit_default_system_prompt(accounts_dir, enabled):
+    with _lock:
+        try:
+            with open(settings_path(accounts_dir), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {}
+        except (ValueError, UnicodeError) as exc:
+            raise OSError("settings.json is invalid; refusing to overwrite it") from exc
+        if not isinstance(data, dict):
+            raise OSError("settings.json must contain an object; refusing to overwrite it")
+        data["omit_default_system_prompt"] = enabled
+        save(accounts_dir, data)
+
+
 def web_tools_enabled(accounts_dir):
     """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
 

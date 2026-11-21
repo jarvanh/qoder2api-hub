@@ -1,6 +1,7 @@
 # 配置参考
 
 - [命令行参数](#命令行参数)
+- [系统提示词](#系统提示词)
 - [面板密码](#面板密码)
 - [API Key 与出口绑定](#api-key-与出口绑定)
 - [模型闸门](#模型闸门)
@@ -26,8 +27,14 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `--accounts-dir` | `$ACCOUNTS_DIR` 或 `./accounts` | 账号与设置目录 |
 | `--usage-dir` | `$QD_PROXY_USAGE_DIR` 或 `./usage` | 用量流水目录 |
 | `--panel-password` | — | 启动时设置面板密码 |
-| `--system-prompt` | 官方模板 | 请求中没有 system 消息时使用的系统提示词 |
+| `--system-prompt` | — | 请求没有提供系统提示词时，使用此参数的内容 |
 | `--pid-file` | — | 把进程 PID 写入该文件，退出时删除（`stop-qoder-proxy.bat` 依赖它） |
+
+## 系统提示词
+
+非空的客户端系统提示词优先，其次是非空启动参数 `--system-prompt`；空字符串不覆盖下一级。两者都没有时，网关默认发送 Qoder 模板自带的提示词。显式传入 `--system-prompt "You are a helpful assistant."` 时，这段文字作为自定义值发送。
+
+在「设置 → 系统提示词」勾选「清空 Qoder 默认提示词」并保存。没有自定义提示词的新请求将省略 Qoder 的默认提示词。Kimi 调用工具时仍会收到网关的工具协议指令。
 
 ## 面板密码
 

@@ -4247,6 +4247,16 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         </label>
       </div>
     </section>
+    <section id="sectionSystemPrompt">
+      <h2>系统提示词</h2>
+      <fieldset id="setSystemPromptForm" disabled style="border:0;padding:0;margin:0;min-width:0">
+        <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px">
+          <input type="checkbox" id="setOmitDefaultSystemPrompt"><span>清空 Qoder 默认提示词</span>
+        </label>
+        <div class="hint" style="margin-top:6px">没有自定义系统提示词时，勾选后请求将省略 Qoder 的默认提示词。</div>
+        <button type="button" style="margin-top:12px" onclick="saveSystemPromptSettings()">保存并应用</button>
+      </fieldset>
+    </section>
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -8177,12 +8187,24 @@ async function saveModelContext(model, label){
   }catch(e){ toast('保存失败: ' + e.message, 'bad'); }
 }
 
+let SYSTEM_PROMPT_READ_ID = 0;
+let SYSTEM_PROMPT_SAVING = false;
+let SYSTEM_PROMPT_CONFIRMED = null;
+
 async function loadSettings(showToast){
+  const promptReadId = ++SYSTEM_PROMPT_READ_ID;
   try {
     const data = await getJSON('/settings');
     // issue #106：模型上下文档缓存给模型库表用（保存后也走这份）
     window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
     renderWebToolsSettings(data);
+    const promptForm = document.getElementById('setSystemPromptForm');
+    if(promptForm && !SYSTEM_PROMPT_SAVING && promptReadId === SYSTEM_PROMPT_READ_ID
+        && typeof data.omit_default_system_prompt === 'boolean'){
+      SYSTEM_PROMPT_CONFIRMED = data.omit_default_system_prompt;
+      document.getElementById('setOmitDefaultSystemPrompt').checked = SYSTEM_PROMPT_CONFIRMED;
+      promptForm.disabled = false;
+    }
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
     const teBox = document.getElementById("setToolEcho");
     const teState = document.getElementById("setToolEchoState");
@@ -8235,6 +8257,30 @@ async function loadSettings(showToast){
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
+  }
+}
+
+async function saveSystemPromptSettings(){
+  const form = document.getElementById('setSystemPromptForm');
+  const checkbox = document.getElementById('setOmitDefaultSystemPrompt');
+  if(!form || !checkbox || form.disabled || SYSTEM_PROMPT_SAVING) return;
+  SYSTEM_PROMPT_SAVING = true;
+  ++SYSTEM_PROMPT_READ_ID;
+  const omit = checkbox.checked;
+  form.disabled = true;
+  try{
+    const result = await postJSON('/settings/save', {omit_default_system_prompt: omit});
+    if(result.omit_default_system_prompt !== omit) throw new Error(t('未确认系统提示词设置'));
+    SYSTEM_PROMPT_CONFIRMED = result.omit_default_system_prompt;
+    checkbox.checked = SYSTEM_PROMPT_CONFIRMED;
+    toast('系统提示词设置已保存', 'ok');
+  }catch(e){
+    if(SYSTEM_PROMPT_CONFIRMED !== null) checkbox.checked = SYSTEM_PROMPT_CONFIRMED;
+    toast('保存失败: ' + e.message, 'bad');
+  }finally{
+    ++SYSTEM_PROMPT_READ_ID;
+    SYSTEM_PROMPT_SAVING = false;
+    form.disabled = false;
   }
 }
 
