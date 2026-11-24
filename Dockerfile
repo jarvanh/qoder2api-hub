@@ -44,7 +44,7 @@ RUN python -m pip install --no-cache-dir "Pillow>=12.1.1,<14"
 # Copy application files (AES/RSA/COSY signing remain pure-stdlib implementations)
 COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_scheduler.py qoder_settings.py qoder_sign.py qoder_tasks.py \
-     qoder_anthropic.py qoder_agents.py qoder_updater.py \
+     qoder_anthropic.py qoder_anthropic_web.py qoder_agents.py qoder_updater.py \
      qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_official_web.py qoder_web_response.py qoder_external_web.py qoder_session_cache.py \
      qoder_keepalive.py qoder_images.py qoder_cache.py qoder_admin.py qoder_routing.py qoder_logpaths.py \
      dashboard.html baseprompt.json ./

@@ -45,8 +45,7 @@ Cherry Studio、Chatbox、NextChat、Kelivo 等客户端，按上面的通用参
   `custom_tool_names()` 也会递归进容器，否则回程判型错、调用不执行；
 - Codex Desktop 0.162+ 会把整份工具清单放进 `input` 的 `additional_tools` 条目，网关现在会与顶层 `tools` 合并。
 
-仍然不支持：`web_search` / `web_fetch` 这类需要网关自己出网执行的工具（会丢弃并 WARN），以及 Codex remote compaction 
-（`compaction_trigger`）——后者目前记一条 WARNING 后按普通请求继续，长会话仍可能撞上下文窗口。
+开启网关 Web 工具后，Responses 可代跑 `web_search` / `web_fetch`。Codex remote compaction（`compaction_trigger`）仍记一条 WARNING 后按普通请求继续，长会话可能撞上下文窗口。
 
 最简单的方式是用下面的[智能体一键配置](#智能体一键配置)。手动配置的话，在 `~/.codex/config.toml` 里加一个 provider：
 
@@ -81,6 +80,12 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 | 历史中的 thinking block 会被丢弃 | 网关无法校验它的签名，所以不会转发给上游 |
 | 流式请求出错不会重试 | `message_start` 已经发出后不能重新开始，网关会发送 `event: error` 结束这次请求。非流式请求仍然正常重试 |
 | `count_tokens` 是本地估算 | 不会请求上游 |
+
+开启网关 Web 工具后，`/v1/messages` 支持服务端声明 `web_search_20250305` 和 `web_fetch_20250910`，后端沿用面板的搜索配置。Claude Code 自带的 `WebFetch` 仍由客户端执行。如果同批调用还有客户端工具，网关会等客户端带回工具结果后再执行搜索或抓取。待执行的调用保留在当前网关进程，客户端需要在 10 分钟内续传。
+
+同一轮对话里的多次推理共用 `max_tokens`。上游未提供可用的输出用量时，网关按可见文本与工具内容的 UTF-8 字节数预留后续预算（不是实际 token 计费）；上游报告超过本轮剩余额度时，网关返回错误，不再执行该轮的联网调用。挂起的搜索或抓取也算一轮联网工具调用，续传时会按当前路由重新检查原账号能否继续使用。
+
+搜索结果可随会话历史回传。重启网关后继续使用原历史，需保留网关设置和同一个 API Key、区域。
 
 `messages` 里的 system 消息默认会原位改成 user 消息，让顶层 system 每一轮都保持不变，从而保证前缀缓存的命中率（`QD_ANTHROPIC_MSG_SYSTEM`）。
 
