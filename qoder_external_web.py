@@ -1,4 +1,4 @@
-"""Admin-configured search APIs. Model input never selects endpoints or headers."""
+"""Admin-configured web APIs. Model input never selects endpoints or headers."""
 import copy
 import json
 import re
@@ -28,6 +28,9 @@ _PRESETS = {
                "auth_header": "X-API-KEY", "auth_prefix": ""},
     "custom": {},
 }
+FETCH_DEFAULTS = {"endpoint": "", "method": "POST", "url_field": "url", "params": {},
+                  "text_path": "text", "title_path": "title", "final_url_path": "final_url",
+                  "api_key": "", "auth_header": "Authorization", "auth_prefix": "Bearer"}
 
 
 def defaults(provider):
@@ -44,15 +47,51 @@ def normalize(profile, provider=None, ready=False):
     for key in _BASE:
         if key in profile:
             result[key] = copy.deepcopy(profile[key])
-    for key in _BASE:
+    _normalize_http_profile(result, "search", ("query_field", "limit_field"),
+                            ("results_path", "title_field", "url_field", "snippet_field"), ready)
+    if ready and provider in ("tavily", "brave", "serper") and not result["api_key"]:
+        raise ValueError("external search API key is required for %s" % provider)
+    return result
+
+
+def normalize_fetch(profile, ready=False):
+    if not isinstance(profile, dict):
+        raise ValueError("external fetch configuration must be an object")
+    result = {key: copy.deepcopy(profile.get(key, default)) for key, default in FETCH_DEFAULTS.items()}
+    _normalize_http_profile(result, "fetch", ("url_field",),
+                            ("text_path", "title_path", "final_url_path"), ready)
+    for key in ("text_path", "final_url_path"):
+        if not result[key]:
+            raise ValueError("external fetch %s is required" % key)
+    return result
+
+
+def endpoint_origin(endpoint):
+    """Compare validated endpoint origins before reusing a stored credential."""
+    if not endpoint:
+        return None
+    parsed = urllib.parse.urlsplit(endpoint)
+    host = parsed.hostname
+    from ipaddress import ip_address
+    try:
+        host = str(ip_address(host))
+    except ValueError:
+        # Keep trailing dots and different hostname spellings distinct.
+        host = host.lower()
+    port = parsed.port if parsed.port is not None else {"http": 80, "https": 443}[parsed.scheme]
+    return parsed.scheme, host, port
+
+
+def _normalize_http_profile(result, label, input_fields, output_fields, ready):
+    prefix = "external " + label
+    for key in result:
         if key != "params" and not isinstance(result[key], str):
-            raise ValueError("external search %s must be text" % key)
-    for key in ("endpoint", "method", "query_field", "limit_field", "results_path",
-                "title_field", "url_field", "snippet_field", "auth_header", "auth_prefix"):
+            raise ValueError("%s %s must be text" % (prefix, key))
+    for key in ("endpoint", "method", "auth_header", "auth_prefix") + input_fields + output_fields:
         result[key] = result[key].strip()
     result["method"] = result["method"].upper()
     if result["method"] not in ("GET", "POST"):
-        raise ValueError("external search method must be GET or POST")
+        raise ValueError(prefix + " method must be GET or POST")
     endpoint = result["endpoint"]
     if endpoint:
         try:
@@ -64,33 +103,30 @@ def normalize(profile, provider=None, ready=False):
         except ValueError:
             valid = False
         if not valid:
-            raise ValueError("external search endpoint must be an HTTP(S) URL without credentials or fragment")
+            raise ValueError(prefix + " endpoint must be an HTTP(S) URL without credentials or fragment")
     elif ready:
-        raise ValueError("external search endpoint is required")
-    for key in ("query_field", "limit_field"):
-        if (not result[key] and key == "query_field") or (result[key] and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", result[key])):
-            raise ValueError("invalid external search %s" % key)
-    for key in ("results_path", "title_field", "url_field", "snippet_field"):
+        raise ValueError(prefix + " endpoint is required")
+    for key in input_fields:
+        if (not result[key] and key != "limit_field") or (result[key] and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", result[key])):
+            raise ValueError("invalid %s %s" % (prefix, key))
+    for key in output_fields:
         if result[key] and not re.fullmatch(r"[A-Za-z0-9_.-]{1,150}", result[key]):
-            raise ValueError("invalid external search %s (use dot-separated field names)" % key)
+            raise ValueError("invalid %s %s (use dot-separated field names)" % (prefix, key))
     header = result["auth_header"]
     if (header and not re.fullmatch(r"[A-Za-z0-9-]{1,80}", header)) or header.lower() in (
             "host", "connection", "content-length", "transfer-encoding", "proxy-authorization"):
-        raise ValueError("invalid external search authentication header")
+        raise ValueError("invalid " + prefix + " authentication header")
     for key in ("api_key", "auth_prefix"):
         if len(result[key]) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in result[key]):
-            raise ValueError("invalid external search %s" % key)
+            raise ValueError("invalid %s %s" % (prefix, key))
     if not isinstance(result["params"], dict):
-        raise ValueError("external search parameters must be a JSON object")
+        raise ValueError(prefix + " parameters must be a JSON object")
     try:
         serialized = json.dumps(result["params"], allow_nan=False)
     except (ValueError, TypeError):
-        raise ValueError("invalid external search parameters") from None
+        raise ValueError("invalid " + prefix + " parameters") from None
     if len(serialized) > 16000:
-        raise ValueError("external search parameters are too large")
-    if ready and provider in ("tavily", "brave", "serper") and not result["api_key"]:
-        raise ValueError("external search API key is required for %s" % provider)
-    return result
+        raise ValueError(prefix + " parameters are too large")
 
 
 def public_profile(profile):
@@ -141,8 +177,15 @@ def _json_request(endpoint, method, params, headers):
     with opener.open(request, timeout=15) as response:
         raw = response.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:
-            raise ValueError("external search response is too large")
+            raise ValueError("external web response is too large")
         return json.loads(raw.decode("utf-8"))
+
+
+def _headers(profile):
+    headers = {"Accept": "application/json", "User-Agent": "qoder2api-web-tools"}
+    if profile["api_key"] and profile["auth_header"]:
+        headers[profile["auth_header"]] = " ".join(part for part in (profile["auth_prefix"], profile["api_key"]) if part)
+    return headers
 
 
 def search(profile, query, limit=5):
@@ -157,10 +200,7 @@ def search(profile, query, limit=5):
         params[profile["query_field"]] = query
         if profile["limit_field"]:
             params[profile["limit_field"]] = max(1, min(20, int(limit)))
-        headers = {"Accept": "application/json", "User-Agent": "qoder2api-web-tools"}
-        if profile["api_key"] and profile["auth_header"]:
-            headers[profile["auth_header"]] = ((profile["auth_prefix"] + " ") if profile["auth_prefix"] else "") + profile["api_key"]
-        data = _json_request(profile["endpoint"], profile["method"], params, headers)
+        data = _json_request(profile["endpoint"], profile["method"], params, _headers(profile))
         items = field(data, profile["results_path"])
         if not isinstance(items, list):
             raise ValueError("external search response has no result list at the configured path")
@@ -188,3 +228,36 @@ def search(profile, query, limit=5):
     except Exception:
         error = "external search request failed (network or response error)"
     return {"ok": False, "engine": "external/" + provider, "results": [], "error": error}
+
+
+def fetch(profile, url):
+    from qoder_webtools import MAX_FETCH_CHARS, check_url
+
+    result = {"ok": False, "engine": "external", "url": url}
+    try:
+        profile = normalize_fetch(profile, ready=True)
+        ok, reason = check_url(url)
+        if not ok:
+            return dict(result, error=reason)
+        params = dict(profile["params"])
+        params[profile["url_field"]] = url
+        data = _json_request(profile["endpoint"], profile["method"], params, _headers(profile))
+        text = field(data, profile["text_path"])
+        if not isinstance(text, str) or not text.strip():
+            return dict(result, error="external fetch response has no text at the configured path")
+        # The configured fetcher is trusted to enforce public-only egress at
+        # connection time on every hop. This checks its report, not its transport.
+        final_url = field(data, profile["final_url_path"])
+        if not public_link(final_url) or not check_url(final_url)[0]:
+            return dict(result, error="external fetch response has an invalid final URL")
+        title = clean_text(field(data, profile["title_path"]), 1000) if profile["title_path"] else ""
+        return dict(result, ok=True, final_url=final_url, title=title,
+                    text=text[:MAX_FETCH_CHARS], truncated=len(text) > MAX_FETCH_CHARS, error="")
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        return dict(result, error="external fetch request failed (HTTP %s)" % status)
+    except json.JSONDecodeError:
+        return dict(result, error="external fetch returned invalid JSON")
+    except Exception:
+        return dict(result, error="external fetch request failed (network or response error)")

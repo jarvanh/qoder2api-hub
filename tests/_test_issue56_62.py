@@ -38,9 +38,9 @@ check("#62 adaptive+max -> max",
            "output_config": {"effort": "max"}}) == "max")
 check("#62 无 thinking、只有 output_config -> 仍生效",
       eff({"output_config": {"effort": "max"}}) == "max")
-check("#62 thinking=disabled -> None（尊重显式关闭）",
+check("#62 thinking=disabled -> none（尊重显式关闭）",
       eff({"thinking": {"type": "disabled"},
-           "output_config": {"effort": "max"}}) is None)
+           "output_config": {"effort": "max"}}) == "none")
 check("#62 完全没档位 -> None（不猜测）", eff({}) is None)
 check("#62 budget 31999 -> high（旧语义不变）",
       eff({"thinking": {"type": "enabled", "budget_tokens": 31999}}) == "high")

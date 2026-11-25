@@ -51,6 +51,19 @@ const data={web_tools:true,web_tools_backend:'external',web_tools_external:{prov
   check('non-external backend hides service fields',elements.setWebExternal.style.display==='none');
   await api.save();
   check('non-external save omits unrelated service drafts',!Object.hasOwn(requests.at(-1).payload,'external'));
+  check('locked search and enable fields are omitted on save',
+    !Object.hasOwn(requests.at(-1).payload,'backend') && !Object.hasOwn(requests.at(-1).payload,'enabled'));
+  api.render({...data,web_tools_backend:'local',web_fetch_backend:'external',web_fetch_external:{
+    endpoint:'http://fetcher:8080/fetch', method:'POST', url_field:'url', text_path:'data.markdown', api_key_set:true
+  }});
+  check('custom fetch UI visible independently of search',elements.setWebFetchExternal.style.display==='' && elements.setWebExternal.style.display==='none');
+  check('fetch credential is masked separately',elements.setWebFetchExternalKey.value==='' && elements.setWebFetchExternalKey.placeholder.includes('留空保留'));
+  await api.save();
+  check('fetch save contains mapping and omits the existing key',requests.at(-1).payload.fetch_backend==='external' &&
+    requests.at(-1).payload.external_fetch.text_path==='data.markdown' && !Object.hasOwn(requests.at(-1).payload.external_fetch,'api_key'));
+  elements.setWebFetchBackend.value='external';elements.setWebFetchExternalClearKey.checked=true;
+  await api.save();
+  check('fetch clear submits an explicit empty key',requests.at(-1).payload.external_fetch.api_key==='');
   console.log('\nSUMMARY: TOTAL '+(pass+fail)+' checks, '+pass+' passed, '+fail+' failed');
   process.exitCode=fail?1:0;
 })().catch(e=>{console.error(e);process.exitCode=1;});

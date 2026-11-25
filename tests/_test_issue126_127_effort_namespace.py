@@ -38,8 +38,8 @@ print("[#126] 合法档位原样透传 / 关闭仍不下发")
 check("low 原样", AN.effort_from_anthropic(
     {"thinking": {"type": "enabled", "budget_tokens": 2048}},
     supported=SUP3, catalog_meta=META3) == "low")
-check("disabled 返回 None", AN.effort_from_anthropic(
-    {"thinking": {"type": "disabled"}}, supported=SUP3, catalog_meta=META3) is None)
+check("disabled 返回 none", AN.effort_from_anthropic(
+    {"thinking": {"type": "disabled"}}, supported=SUP3, catalog_meta=META3) == "none")
 check("空档位表不下发", AN.effort_from_anthropic(
     {"thinking": {"type": "enabled", "budget_tokens": 2048}},
     supported=[], catalog_meta={}) is None)

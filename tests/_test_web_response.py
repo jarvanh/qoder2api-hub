@@ -449,12 +449,12 @@ class HostedWebHTTPTests(unittest.TestCase):
         return body, infer.call_args.args[0]
 
     def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None, account=None,
-                       headers=None):
+                       headers=None, search_backend="qoder"):
         return self.post_hosted("/v1/messages", payload, rounds, expected_status=expected_status,
-                                fetched=fetched, account=account, headers=headers)
+                                fetched=fetched, account=account, headers=headers, search_backend=search_backend)
 
     def post_hosted(self, path, payload, rounds, *, expected_status=200, fetched=None, account=None,
-                    headers=None):
+                    headers=None, search_backend="qoder"):
         account = account or SimpleNamespace(uid="test-scope", access_token="fake-test-token", realm="cn",
             realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
         upstreams = []
@@ -462,7 +462,7 @@ class HostedWebHTTPTests(unittest.TestCase):
             wire = "".join("data: " + json.dumps({"body": json.dumps(item)}) + "\n\n" for item in items)
             wire += 'data: {"body":"[DONE]"}\n\n'
             upstreams.append((io.BytesIO(wire.encode()), account, None))
-        with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": "qoder"}), \
+        with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": search_backend}), \
                 mock.patch.object(P, "API_KEY", "web-http-key"), \
                 mock.patch.object(P, "open_upstream", side_effect=upstreams) as infer, \
                 mock.patch.object(P, "record_usage"), mock.patch.object(W, "check_url", return_value=(True, "")), \
@@ -871,6 +871,88 @@ class HostedWebHTTPTests(unittest.TestCase):
                         mock.patch.object(P, "detect_model_realm", return_value="intl"):
                     _, requests, count = self.post_anthropic(automatic, [], account=cn, expected_status=403)
                 self.assertEqual((requests, count), ([], 0))
+
+    def test_custom_fetch_is_used_in_all_protocols_independently_of_official_search(self):
+        import qoder_external_web
+
+        url = "https://example.com/reference"
+        fetch = dict(call("web_fetch", {"url": url}), index=0)
+        rounds = [self.anthropic_round({"tool_calls": [fetch]}, "tool_calls"),
+                  self.anthropic_round({"content": "Got it [S1]."})]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(P, "ACCOUNTS_DIR", directory):
+            P.qoder_settings.set_web_tools_config(directory, {"enabled": True, "fetch_backend": "external",
+                "external_fetch": {"endpoint": "http://fetcher:8080/fetch", "text_path": "data.markdown"}})
+            for path, stream in ((path, stream) for path in self.HOSTED_PATHS for stream in (False, True)):
+                with self.subTest(path=path, stream=stream), mock.patch.object(qoder_external_web, "_json_request",
+                        return_value={"data": {"markdown": "Fetched by the configured service"}, "final_url": url}) as remote:
+                    payload = self.hosted_payload(path, stream=stream)
+                    history = payload.get("messages") or payload["input"]
+                    history[0]["content"] = "Read " + url
+                    payload["tools"][0] = ({"type": "web_fetch_20250910", "name": "web_fetch"}
+                                            if path.endswith("/messages") else {"type": "web_fetch"})
+                    body, inference, official_calls = self.post_hosted(path, payload, rounds)
+                    self.assertEqual(official_calls, 0)
+                    self.assertIn("Fetched by the configured service", inference[-1]["messages"][-1]["content"])
+                    self.assertIn("Got it", body)
+                    self.assertEqual(remote.call_args.args[:3], ("http://fetcher:8080/fetch", "POST", {"url": url}))
+                    remote.assert_called_once()
+
+    def test_anthropic_unused_fetch_backend_does_not_block_search_or_named_client_tool(self):
+        payload = self.hosted_payload("/v1/messages")
+        fetch = {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 0}
+        payload["tools"].append(fetch)
+        search = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        final = self.anthropic_round({"content": "Done"})
+        ordinary = self.anthropic_round({"tool_calls": [
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=0)]}, "tool_calls")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(P, "ACCOUNTS_DIR", directory):
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "external"})
+            _, requests, count = self.post_anthropic(payload, [search, final])
+            self.assertEqual((len(requests), count), (2, 1))
+            self.assertNotIn("web_fetch", [tool["function"]["name"] for tool in requests[0]["tools"]])
+            fetch["max_uses"] = 1
+            forced = dict(payload, tool_choice={"type": "tool", "name": "lookup_order"})
+            _, requests, count = self.post_anthropic(forced, [ordinary])
+            self.assertEqual(([tool["function"]["name"] for tool in requests[0]["tools"]], count),
+                             (["lookup_order"], 0))
+            forced_search = dict(payload, tool_choice={"type": "tool", "name": "web_search"})
+            for request in (payload, forced_search):
+                body, requests, count = self.post_anthropic(request, [], expected_status=400)
+                self.assertIn("external fetch endpoint is required", body)
+                self.assertEqual((requests, count), ([], 0))
+
+    def test_anthropic_deferred_official_fetch_checks_credentials_with_local_search(self):
+        url = "https://example.com/reference"
+        payload = dict(self.hosted_payload("/v1/messages"), max_tokens=128,
+                       messages=[{"role": "user", "content": "Read " + url}])
+        payload["tools"][0] = {"type": "web_fetch_20250910", "name": "web_fetch"}
+        mixed = self.anthropic_round({"tool_calls": [
+            dict(call("web_fetch", {"url": url}), index=0),
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=1)]}, "tool_calls")
+        mixed += [{"choices": [], "usage": {"completion_tokens": 12}}]
+        final = self.anthropic_round({"content": "Done"})
+        account = SimpleNamespace(uid="fetch-credentials", access_token="fake-original", realm="cn",
+            realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
+        options = {"account": account, "search_backend": "local"}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(P, "ACCOUNTS_DIR", directory):
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "qoder"})
+            body, _, count = self.post_anthropic(payload, [mixed], **options)
+            self.assertEqual(count, 0)
+            resume = self.resume_messages(payload, json.loads(body))
+            fetched = {"results": [{"statusCode": 200, "markdown": "Official fetch"}]}
+            P.qoder_settings.set_web_tools_config(directory, {"external": {"provider": "brave", "api_key": "unused-key"}})
+            body, requests, count = self.post_anthropic(resume, [final], fetched=fetched, **options)
+            self.assertIn("Official fetch", body)
+            self.assertEqual((requests[0]["max_tokens"], count), (116, 1))
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "local"})
+            body, requests, count = self.post_anthropic(resume, [], expected_status=400, **options)
+            self.assertIn("unchanged web settings", body)
+            self.assertEqual((requests, count), ([], 0))
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "qoder"})
+            account.access_token = "fake-rotated"
+            body, requests, count = self.post_anthropic(resume, [], expected_status=409, **options)
+            self.assertIn("account credentials changed", body)
+            self.assertEqual((requests, count), ([], 0))
 
     def test_anthropic_mixed_batch_waits_for_client_results_and_replays_once(self):
         account = SimpleNamespace(uid="continuation-account", access_token="fake-test-token", realm="cn",

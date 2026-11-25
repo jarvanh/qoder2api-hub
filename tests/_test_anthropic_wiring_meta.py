@@ -139,8 +139,8 @@ try:
                         "messages": [{"role": "user", "content": "hi"}],
                         "thinking": {"type": "disabled"}})
         _req = _captured.get("req") or {}
-        check("thinking=disabled -> 不下发档位（既有语义不回退）",
-              not _req.get("reasoning_effort"), _req.get("reasoning_effort"))
+        check("thinking=disabled -> reasoning_effort=none 明确关闭",
+              _req.get("reasoning_effort") == "none", _req.get("reasoning_effort"))
 
         _captured.clear()
         _post_messages({"model": "qmodel_38max", "max_tokens": 16,

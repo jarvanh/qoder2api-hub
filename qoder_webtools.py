@@ -146,19 +146,26 @@ def _resolve_public_ip(host):
 
 def check_url(url):
     """返回 (ok, reason)。模型给的 URL 必须过这一关才会被请求。"""
+    if not isinstance(url, str) or "\\" in url or any(
+            c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+        return False, "invalid url"
     try:
-        parsed = urllib.parse.urlparse(str(url or "").strip())
-    except Exception:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
         return False, "invalid url"
     if parsed.scheme not in ("http", "https"):
         return False, "only http/https allowed"
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         return False, "credentials in url are not allowed"
     host = parsed.hostname or ""
     if not host:
         return False, "missing host"
-    if host in ("localhost", "localhost.localdomain"):
-        return False, "localhost is not allowed"
+    if port == 0 or "%" in host:
+        return False, "invalid url"
+    dns_host = host.rstrip(".")
+    if dns_host in ("localhost", "localhost.localdomain") or dns_host.endswith((".local", ".localhost")):
+        return False, "local hostnames are not allowed"
     try:
         literal_ip = str(ipaddress.ip_address(host))
     except Exception:
@@ -453,16 +460,42 @@ def tool_declarations():
     ]
 
 
-def backend_config(accounts_dir=None, ready=False):
+def tool_backend(config, name):
+    if name != WEB_FETCH_NAME:
+        return config["backend"]
+    fetch_backend = config.get("fetch_backend", "inherit")
+    if fetch_backend == "inherit":
+        return "qoder" if config["backend"] == "qoder" else "local"
+    return fetch_backend
+
+
+def operational_config(config, names):
+    """Settings that can affect execution of the indicated hosted tools."""
+    profiles = {WEB_SEARCH_NAME: "external", WEB_FETCH_NAME: "external_fetch"}
+    result = {}
+    for name in names:
+        backend = tool_backend(config, name)
+        profile = config[profiles[name]] if backend == "external" else None
+        result[name] = (backend, profile)
+    return result
+
+
+def backend_config(accounts_dir=None, ready=False, names=None):
     """Snapshot settings once per API request; environment retains precedence."""
     import qoder_settings
     config = qoder_settings.web_tools_config(accounts_dir or os.environ.get("ACCOUNTS_DIR") or "accounts")
-    config["backend"] = str(os.environ.get("QD_WEB_TOOLS_BACKEND") or config["backend"]).strip().lower()
+    _, _, backend_env = qoder_settings.web_tools_environment()
+    config["backend"] = backend_env or config["backend"]
     if config["backend"] not in ("local", "qoder", "external"):
         raise ValueError("QD_WEB_TOOLS_BACKEND must be local, qoder or external")
-    if ready and config["backend"] == "external":
+    if config["fetch_backend"] not in ("inherit", "local", "qoder", "external"):
+        raise ValueError("fetch_backend must be inherit, local, qoder or external")
+    if ready:
         import qoder_external_web
-        config["external"] = qoder_external_web.normalize(config["external"], ready=True)
+        if config["backend"] == "external" and (names is None or WEB_SEARCH_NAME in names):
+            config["external"] = qoder_external_web.normalize(config["external"], ready=True)
+        if tool_backend(config, WEB_FETCH_NAME) == "external" and (names is None or WEB_FETCH_NAME in names):
+            config["external_fetch"] = qoder_external_web.normalize_fetch(config["external_fetch"], ready=True)
     return config
 
 
@@ -490,7 +523,7 @@ def run_tool(name, arguments, account=None, context=None, on_result=None, config
             args = {}
     args = args if isinstance(args, dict) else {}
     config = config if config is not None else backend_config()
-    backend = config["backend"]
+    backend = tool_backend(config, name)
     official = None
     if backend == "qoder" and name in (WEB_SEARCH_NAME, WEB_FETCH_NAME):
         import qoder_official_web as official
@@ -553,9 +586,17 @@ def run_tool(name, arguments, account=None, context=None, on_result=None, config
             if not matches_domain(args.get("url") or "", *context.filters_for(name)):
                 observe({"ok": False, "error": "URL is outside the request's web domain filters"})
                 return json.dumps({"error": "URL is outside the request's web domain filters"})
-        res = observe(context.cache[cache_key] if context and cache_key in context.cache else
-                      (official.fetch(account, args.get("url") or "") if official
-                       else fetch(args.get("url") or "")))
+        url = args.get("url") or ""
+        if context and cache_key in context.cache:
+            res = context.cache[cache_key]
+        elif official:
+            res = official.fetch(account, url)
+        elif backend == "external":
+            import qoder_external_web
+            res = qoder_external_web.fetch(config["external_fetch"], url)
+        else:
+            res = fetch(url)
+        res = observe(res)
         if not res.get("ok"):
             return json.dumps({"error": res.get("error") or "fetch failed"},
                               ensure_ascii=False)

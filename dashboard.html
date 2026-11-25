@@ -4166,9 +4166,9 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         <div>
           <h2 style="margin:0">联网工具 <em id="setWebToolsState"></em></h2>
           <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
-            代跑客户端声明的内置 <code>web_search</code> / <code>web_fetch</code>。可选原项目内置的本地 web 工具、Qoder 官方服务或外部搜索服务。
+            代跑客户端声明的内置 <code>web_search</code> / <code>web_fetch</code>。搜索和网页抓取可以分别选择后端。
             保存后对新请求立即生效，进行中的请求继续使用原配置；应用自己的普通 function 工具仍由应用执行。
-            <br>多轮推理及外部服务可能产生各自的用量；网页抓取只允许公网地址。默认关闭。
+            <br>多轮推理及外部服务可能产生各自的用量。默认关闭。
           </div>
         </div>
       </div>
@@ -4177,16 +4177,16 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           <input type="checkbox" id="setWebTools"><span>启用联网工具</span>
         </label>
         <div class="web-tools-grid">
-          <label>执行后端
+          <label>搜索后端
             <select id="setWebToolsBackend" onchange="updateWebToolsBackend()">
               <option value="local">原项目内置（DuckDuckGo / Bing / Wikipedia）</option>
-              <option value="qoder">Qoder 官方搜索与抓取</option>
+              <option value="qoder">Qoder 官方搜索</option>
               <option value="external">外部搜索服务（本地或云端）</option>
             </select>
           </label>
         </div>
         <div id="setWebToolsBackendHelp" style="font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7"></div>
-        <div id="setWebToolsEnv" style="font-size:12px;color:var(--warn);margin-top:6px"></div>
+        <div id="setWebToolsEnv" style="font-size:12px;color:var(--warn);margin-top:6px;white-space:pre-line"></div>
         <div id="setWebExternal" style="display:none">
           <div class="web-tools-grid">
             <label>服务类型
@@ -4221,6 +4221,44 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
               <label>其他固定参数（JSON 对象）<textarea id="setWebExternalParams" rows="3" spellcheck="false">{}</textarea></label>
             </div>
             <div style="font-size:12px;color:var(--dim);margin-top:8px">GET 使用查询参数，POST 使用 JSON 请求体。嵌套结果字段用点分隔；结果列表在根数组时路径留空。服务地址必须能由网关访问，容器内 localhost 指向容器自身。</div>
+          </details>
+        </div>
+        <div class="web-tools-grid">
+          <label>网页抓取后端
+            <select id="setWebFetchBackend" onchange="updateWebToolsBackend()">
+              <option value="inherit">沿用搜索设置</option>
+              <option value="local">网关直接抓取</option>
+              <option value="qoder">Qoder 官方抓取</option>
+              <option value="external">自定义 HTTP JSON 抓取</option>
+            </select>
+          </label>
+        </div>
+        <div id="setWebFetchHelp" style="font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7"></div>
+        <div id="setWebFetchExternal" style="display:none">
+          <div class="web-tools-grid">
+            <label>抓取接口完整地址
+              <input id="setWebFetchExternalEndpoint" type="url" placeholder="http://fetcher:8080/fetch" autocomplete="off">
+            </label>
+            <label>抓取服务 API 密钥
+              <input id="setWebFetchExternalKey" type="password" autocomplete="new-password" placeholder="可选；按服务要求填写">
+            </label>
+          </div>
+          <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim);margin-top:8px">
+            <input id="setWebFetchExternalClearKey" type="checkbox">清除抓取服务已保存的密钥
+          </label>
+          <div style="font-size:12px;color:var(--dim);margin-top:8px">服务地址的协议、主机或端口变更时，留空会清除旧密钥。</div>
+          <details style="margin-top:12px">
+            <summary style="cursor:pointer;font-size:12px;color:var(--dim)">抓取请求与结果映射</summary>
+            <div class="web-tools-grid">
+              <label>请求方法<select id="setWebFetchExternalMethod"><option>POST</option><option>GET</option></select></label>
+              <label>网址参数名<input id="setWebFetchExternalUrlField" placeholder="url"></label>
+              <label>正文路径<input id="setWebFetchExternalTextPath" placeholder="text / data.markdown"></label>
+              <label>标题路径（可留空）<input id="setWebFetchExternalTitlePath" placeholder="title"></label>
+              <label>最终网址路径（必填）<input id="setWebFetchExternalFinalUrlPath" placeholder="final_url"></label>
+              <label>认证请求头<input id="setWebFetchExternalAuthHeader" placeholder="Authorization / X-API-KEY"></label>
+              <label>认证前缀（可留空）<input id="setWebFetchExternalAuthPrefix" placeholder="Bearer"></label>
+              <label>其他固定参数（JSON 对象）<textarea id="setWebFetchExternalParams" rows="3" spellcheck="false">{}</textarea></label>
+            </div>
           </details>
         </div>
         <button style="margin-top:14px" onclick="saveWebTools(this)">保存并应用</button>
@@ -8362,6 +8400,10 @@ const WEB_EXTERNAL_FIELDS = {
   results_path:'ResultsPath', title_field:'TitleField', url_field:'UrlField',
   snippet_field:'SnippetField', auth_header:'AuthHeader', auth_prefix:'AuthPrefix'
 };
+const WEB_FETCH_EXTERNAL_FIELDS = {
+  endpoint:'Endpoint', method:'Method', url_field:'UrlField', text_path:'TextPath',
+  title_path:'TitlePath', final_url_path:'FinalUrlPath', auth_header:'AuthHeader', auth_prefix:'AuthPrefix'
+};
 let WEB_EXTERNAL_PROFILES = {};
 let WEB_EXTERNAL_SELECTED = 'searxng';
 function readWebExternalProfile(){
@@ -8401,12 +8443,41 @@ function changeWebExternalProvider(provider){
 }
 function updateWebToolsBackend(){
   const backend = document.getElementById('setWebToolsBackend').value;
+  const fetchBackend = document.getElementById('setWebFetchBackend').value;
   document.getElementById('setWebExternal').style.display = backend === 'external' ? '' : 'none';
+  document.getElementById('setWebFetchExternal').style.display = fetchBackend === 'external' ? '' : 'none';
   document.getElementById('setWebToolsBackendHelp').textContent = {
-    local:'使用原项目内置引擎链搜索，网页由网关直接抓取。',
-    qoder:'搜索和网页抓取使用当前推理账号的 Qoder 官方服务，支持国内版和国际版公网账号，自动选择对应区域端点。',
-    external:'搜索交给所选外部服务，网页由网关直接抓取。各服务配置分别保存，切换不会互相覆盖密钥。'
+    local:'使用原项目内置引擎链搜索。',
+    qoder:'搜索使用当前推理账号的 Qoder 官方服务。',
+    external:'搜索交给所选外部服务。各服务分别保存配置和密钥。'
   }[backend] || '';
+  document.getElementById('setWebFetchHelp').textContent = {
+    inherit: backend === 'qoder' ? '当前沿用 Qoder 官方抓取。' : '当前沿用网关直接抓取。',
+    local:'由网关访问网页并提取正文。',
+    qoder:'用当前推理账号调用 Qoder 官方抓取。',
+    external:'仅连接受信任的抓取服务：服务必须在连接时和每次重定向时验证目标为公网地址，并返回实际最终网址。'
+  }[fetchBackend] || '';
+}
+function readWebFetchProfile(){
+  const profile = {};
+  for(const [key,suffix] of Object.entries(WEB_FETCH_EXTERNAL_FIELDS)){
+    profile[key] = document.getElementById('setWebFetchExternal'+suffix).value;
+  }
+  profile.params = JSON.parse(document.getElementById('setWebFetchExternalParams').value || '{}');
+  const key = document.getElementById('setWebFetchExternalKey').value;
+  if(document.getElementById('setWebFetchExternalClearKey').checked) profile.api_key = '';
+  else if(key) profile.api_key = key;
+  return profile;
+}
+function showWebFetchProfile(profile){
+  for(const [key,suffix] of Object.entries(WEB_FETCH_EXTERNAL_FIELDS)){
+    document.getElementById('setWebFetchExternal'+suffix).value = profile[key] || '';
+  }
+  document.getElementById('setWebFetchExternalParams').value = JSON.stringify(profile.params || {}, null, 2);
+  const key = document.getElementById('setWebFetchExternalKey');
+  key.value = '';
+  key.placeholder = profile.api_key_set ? '已保存；留空保留原密钥' : '可选；按服务要求填写';
+  document.getElementById('setWebFetchExternalClearKey').checked = false;
 }
 function renderWebToolsSettings(data){
   if(!document.getElementById('setWebToolsBackend')) return;
@@ -8415,12 +8486,14 @@ function renderWebToolsSettings(data){
   const select = document.getElementById('setWebToolsBackend');
   select.value = backend;
   select.disabled = !!data.web_tools_backend_env;
+  document.getElementById('setWebFetchBackend').value = data.web_fetch_backend || 'inherit';
+  showWebFetchProfile(data.web_fetch_external || {});
   document.getElementById('setWebTools').checked = data.web_tools === true;
   document.getElementById('setWebTools').disabled = !!data.web_tools_enabled_env;
   document.getElementById('setWebToolsEnv').textContent = [
-    data.web_tools_backend_env ? '后端由环境变量固定为 '+data.web_tools_backend_env : '',
+    data.web_tools_backend_env ? '搜索后端由环境变量固定为 '+data.web_tools_backend_env : '',
     data.web_tools_enabled_env ? '总开关由环境变量固定为 '+data.web_tools_enabled_env : ''
-  ].filter(Boolean).join('；');
+  ].filter(Boolean).join('\n');
   showWebExternalProfile((data.web_tools_external || {}).provider || 'searxng');
   updateWebToolsBackend();
   const names = {local:'原项目内置', qoder:'Qoder 官方', external:'外部服务'};
@@ -8429,9 +8502,13 @@ function renderWebToolsSettings(data){
 async function saveWebTools(btn){
   const form = document.getElementById('setWebToolsForm');
   try{
-    const payload = {enabled:document.getElementById('setWebTools').checked,
-                     backend:document.getElementById('setWebToolsBackend').value};
-    if(payload.backend === 'external') payload.external = readWebExternalProfile();
+    const enabled = document.getElementById('setWebTools');
+    const search = document.getElementById('setWebToolsBackend');
+    const payload = {fetch_backend:document.getElementById('setWebFetchBackend').value};
+    if(!enabled.disabled) payload.enabled = enabled.checked;
+    if(!search.disabled) payload.backend = search.value;
+    if(search.value === 'external') payload.external = readWebExternalProfile();
+    if(payload.fetch_backend === 'external') payload.external_fetch = readWebFetchProfile();
     form.disabled = true;
     const r = await postJSON('/settings/web-tools', payload);
     renderWebToolsSettings(r);

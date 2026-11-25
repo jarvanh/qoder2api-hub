@@ -94,6 +94,7 @@
 |---|---|---|
 | `_test_stream_guards.py` | 守卫（离线纯函数） | 上游信封 body **不保证是 JSON object**（实测有裸数组/标量）。三处守卫 `clean_chunk` / `iter_inner_sse` / `aggregate_stream` 遇非 dict 帧：① 不抛异常；② 不吞后续帧（异常帧夹在中间时正文仍完整）；③ 既有语义不回退（噪声清洗、usage 首个优先、正文折叠）；④ 集成一条：异常帧走完整 Anthropic 流式管线 |
 | `_test_anthropic_wiring_meta.py` | 接线（HTTP 层 + 端到端） | `/v1/messages` 的 `thinking.budget_tokens` 要经 `catalog_meta` 才能映射成 `reasoning_effort`。断言拦在 `open_upstream` **唯一出站口**（不是「`messages_to_chat` 被调用过」）：实际交给上游的 `chat_req` 必须带档位、且档位在该模型官方档位表内；另加端到端「档位真的写进上游 `parameters`」与两条静态钉住 |
+| `_test_anthropic_conformance.py` | 协议一致性（纯函数 + 模拟 HTTP handler） | 普通和托管 JSON/SSE 的思考档位、输出覆盖优先级、签名占位事件、互不重叠的块生命周期、迟到思考片段、最终用量和旧字段别名 |
 
 ### 能红自证（本轮两条）
 

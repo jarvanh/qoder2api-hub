@@ -13,7 +13,7 @@ from collections import OrderedDict
 import qoder_anthropic
 import qoder_settings
 from qoder_web_response import WebEvidence, domains, matches_domain, parse_arguments, public_link, url_key
-from qoder_webtools import format_search_result
+from qoder_webtools import format_search_result, tool_backend
 
 
 _TYPES = {"web_search_20250305": "web_search", "web_fetch_20250910": "web_fetch"}
@@ -300,16 +300,16 @@ class DeferredWeb:
         self.config = config
         self.rounds = rounds
         self.tokens_left = tokens_left
-        self.identity = self.account_identity(account)
         self.client_ids = {call["id"] for call in client_calls}
         self.blocks = [dict(type="server_tool_use", id=self.id + "_" + str(i),
                             name=call["function"]["name"], input=parse_arguments(call["function"].get("arguments")))
                        for i, call in enumerate(calls)]
+        self.identity = self.account_identity(account)
         self.lock = threading.Lock()
         self.results = []
 
     def account_identity(self, account):
-        if self.config["backend"] != "qoder":
+        if not any(tool_backend(self.config, block["name"]) == "qoder" for block in self.blocks):
             return None
         import qoder_official_web
 

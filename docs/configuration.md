@@ -233,7 +233,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `QD_ANTHROPIC_MSG_SYSTEM` | `inline` | `messages` 里的 system 消息如何处理：`inline` 原位改为 user 消息（保持缓存前缀稳定）；`merge` 合并到顶层 system（旧行为）；`drop` 丢弃 |
-| `QD_ANTHROPIC_THINKING` | `off` | 设为 `empty` 时输出带空 `signature` 的 thinking block（见下方安全判定标准）；支持在面板设置或按 API Key 单独覆盖 |
+| `QD_ANTHROPIC_THINKING` | 请求驱动 | `empty` 表示有思考内容时输出带空 `signature` 的兼容块，`off` 表示隐藏该块；两者均不改变上游思考档位。未设置时按有效请求意图决定；未指定或显式关闭则为 `off`。支持在面板设置或按 API Key 单独覆盖 |
 
 #### QD_ANTHROPIC_THINKING 安全启用判定标准
 
@@ -246,8 +246,9 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 - **粒度覆盖优先级**：
   1. **按 API Key 覆盖**：在 API Key 配置中设置 `"anthropic_thinking": "empty" | "off"`；
   2. **面板全局设置**：在设置页面或 API 中切换 `anthropic_thinking`；
-  3. **进程级环境变量**：`QD_ANTHROPIC_THINKING=empty`（作为默认兜底）；
-  4. 缺省默认为 `off`。
+  3. **进程级环境变量**：`QD_ANTHROPIC_THINKING=empty|off`（作为默认兜底）；
+  4. **请求驱动**：以上都没设置时，`thinking.type=enabled/adaptive`、有效档位或正整数思考预算请求输出 `empty`；`thinking.type=disabled` 和有效档位 `none` 不请求输出；
+  5. 其余请求默认为 `off`。
 
 ### 账号与设备身份
 
@@ -286,9 +287,9 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | 看板「设置 → 联网工具」 | 总开关、后端及外部服务配置保存在 `accounts/settings.json`；点击「保存并应用」后，新请求立即生效 |
 | `QD_WEB_TOOLS=on/off` | 环境变量优先于面板开关 |
 | `QD_WEB_TOOLS_ROUNDS` | 代跑轮次上限，默认 3 |
-| `QD_WEB_TOOLS_BACKEND=local/qoder/external` | 可选强制覆盖面板后端，面板会显示并锁定该选择。未设置时使用面板保存的后端，默认 `local`。要恢复面板控制，移除此环境变量后重启一次 |
+| `QD_WEB_TOOLS_BACKEND=local/qoder/external` | 覆盖搜索后端。网页抓取选择「沿用搜索设置」时也会受影响。未设置时以面板为准，默认 `local` |
 
-面板中的三种后端：
+网页抓取可以独立选择「网关直接抓取」「Qoder 官方抓取」或「自定义 HTTP JSON 抓取」。默认是「沿用搜索设置」，旧配置继续按下表执行。
 
 | 选择 | 搜索 | 网页抓取 |
 |---|---|---|
@@ -320,11 +321,19 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 在「请求与结果映射」中，可调整 GET/POST、查询参数名、结果数量参数名、固定 JSON 参数，以及结果列表、标题、链接、摘要的字段路径。例如某服务返回 `{"data":{"items":[{"name":"标题","link":"https://...","summary":"摘要"}]}}`，可设列表路径为 `data.items`、标题字段为 `name`、链接字段为 `link`、摘要字段为 `summary`。结果列表在根数组时路径留空；路径支持点分隔和数组数字下标，不执行表达式。GET 用 URL 查询参数，POST 用 JSON 请求体。
 
-各服务配置和密钥独立保存，切换不会共用另一家服务的密钥。面板 API 只返回专用密钥是否已设置；输入留空保留该服务旧密钥，勾选「清除当前服务已保存的密钥」才删除。密钥使用专用字段，不放在固定参数或 URL 中。配置保存在 `web_tools_backend`、`web_tools_external_provider` 和 `web_tools_external_profiles`。
+各服务配置和密钥独立保存，切换不会共用另一家服务的密钥。面板 API 只返回专用密钥是否已设置；同一来源（协议、主机和端口）下留空可保留旧密钥；来源变更时，留空会清除旧密钥。也可勾选「清除当前服务已保存的密钥」主动删除。密钥使用专用字段，不放在固定参数或 URL 中。配置保存在 `web_tools_backend`、`web_tools_external_provider` 和 `web_tools_external_profiles`。
 
 外部服务地址只能由面板管理员配置，模型不能选择服务地址、请求头或密钥。这里允许管理员指定的本地/私网搜索服务；模型请求的网页及搜索结果链接仍须经过公网限制。外部 API 不跟随重定向，不自动重试，不把认证转发给其他地址。超时 15 秒、JSON 响应最多 2 MiB。容器内 `localhost` 指容器自身；跨容器接入需共享 Docker 网络并使用服务名。
 
 预设协议参考：[SearXNG](https://docs.searxng.org/dev/search_api.html)、[Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Brave Search](https://api-dashboard.search.brave.com/api-reference/web/search/get)、[Serper](https://serper.dev/)。服务的可用性、密钥和用量规则由对应服务决定。
+
+### 自定义网页抓取
+
+在「网页抓取后端」选择「自定义 HTTP JSON 抓取」，填写**受信任的管理员配置服务**的完整接口地址，例如 `http://fetcher:8080/fetch`。默认以 JSON POST 发送 `{"url":"https://example.com/"}`，并读取 `text` 正文、可选的 `title` 和必填的 `final_url`。GET 使用查询参数。字段路径支持点分隔，例如 `data.markdown`。
+
+抓取密钥和搜索密钥分开保存。抓取服务地址的协议、主机或端口变更时，必须重新提供密钥，否则清除旧密钥。密钥使用专用字段，不放在固定参数或 URL 中。
+
+网关会检查提交的目标和服务报告的实际最终网址；缺少有效最终网址时不会接受正文。**这不控制远端连接**：抓取服务必须自行在连接时和每次重定向时只允许公网目标，并以出站网络策略阻止对私网、环回和链路本地地址的访问。不要接入无法保证这些约束的服务。网关不会跟随抓取 API 本身的重定向；JSON 响应最多 2 MiB，正文最多 20000 字。
 
 ### 可选的 Qoder 官方搜索 / 网页抓取（国内版 / 国际版）
 
@@ -332,7 +341,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 QD_WEB_TOOLS=on QD_WEB_TOOLS_BACKEND=qoder python qoder_proxy.py
 ```
 
-也可直接通过面板选择「Qoder 官方搜索与抓取」并启用总开关。Docker Compose 的环境变量方式适合需要强制固定后端的部署。需要包含新增工具模块的源码或镜像；仅设置旧镜像的环境变量不会新增功能。
+也可直接通过面板选择「Qoder 官方搜索」，把网页抓取设为「沿用搜索设置」并启用总开关。Docker Compose 的环境变量方式适合需要强制固定后端的部署。需要包含新增工具模块的源码或镜像；仅设置旧镜像的环境变量不会新增功能。
 
 - 复用**当前这轮模型推理实际选中的账号**及其 COSY 签名。不会另选账号、跨区借用凭据，也不需要额外搜索 API Key、Node 或官方 CLI 进程。
 - 支持国内版和国际版公网账号，按当前推理账号的区域自动选择端点：国内版使用账号的 `gateway`，国际版使用 `https://center.qoder.sh`。国际版的 `QD_INTL_GATEWAY` 只覆盖推理地址，不改变官方工具地址；两个区域不互相借用账号或自动回退。

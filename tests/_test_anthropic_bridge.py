@@ -201,10 +201,10 @@ check("clamp：目标档不在表内 -> 取最近的更低档（无更低则最�
       and AN.effort_from_anthropic({"thinking": {"type": "enabled",
                                     "budget_tokens": 99999}},
                                    supported=["low", "medium"]) == "medium")
-check("无档位表 / disabled -> None（不下发，保持「不猜测」语义）",
+check("无档位表不下发档位；disabled 用 none 明确关闭",
       AN.effort_from_anthropic({"thinking": {"type": "enabled", "budget_tokens": 512}})
       is None
-      and AN.effort_from_anthropic({"thinking": {"type": "disabled"}}) is None)
+      and AN.effort_from_anthropic({"thinking": {"type": "disabled"}}) == "none")
 check("catalog_meta fallback（thinking_config.enabled.efforts）",
       AN.effort_from_anthropic({"thinking": {"type": "enabled", "budget_tokens": 512}},
                                catalog_meta={"thinking_config": {"enabled": {
@@ -274,8 +274,11 @@ check("usage 落在 message_delta（output_tokens 来自末帧）",
 print()
 print("[7] thinking 降级（§5）与 count_tokens（§6 判据 4）")
 os.environ.pop("QD_ANTHROPIC_THINKING", None)
+_start_types = [json.loads(ln[6:]).get("content_block", {}).get("type")
+                for e in _out for ln in e.splitlines()
+                if ln.startswith("data:") and "content_block_start" in ln]
 check("默认 off：事件流里没有 thinking 块",
-      all("thinking" not in e for e in _out))
+      "thinking" not in _start_types, _start_types)
 _msg_default = AN.chat_to_messages({"choices": [{"message": {
     "role": "assistant", "content": "x", "reasoning_content": "r"}}]}, "m")
 check("默认 off：非流式出站不含 thinking block",

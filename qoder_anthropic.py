@@ -77,6 +77,36 @@ def thinking_mode(override=None):
     raw = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
     return raw if raw in ("empty",) else "off"
 
+
+def _thinking_intent(payload):
+    """Return (request wants output, requested effort before catalog clamping)."""
+    payload = payload if isinstance(payload, dict) else {}
+    th = payload.get("thinking")
+    th = th if isinstance(th, dict) else {}
+    oc = payload.get("output_config")
+    oc = oc if isinstance(oc, dict) else {}
+    kind = th.get("type")
+    kind = kind.strip().lower() if isinstance(kind, str) else ""
+    if kind == "disabled":
+        return False, "none"
+    # Claude Code uses adaptive + output_config.effort for third-party models.
+    for value in (th.get("effort"), th.get("level"), oc.get("effort")):
+        if isinstance(value, str):
+            effort = value.strip().lower()
+            if effort in EFFORT_RANK:
+                return effort != "none", effort
+    budget = th.get("budget_tokens")
+    if type(budget) is int and budget > 0:
+        for limit, effort in BUDGET_STEPS:
+            if limit is None or budget <= limit:
+                return True, effort
+    return kind in ("enabled", "adaptive"), None
+
+
+def wants_thinking(payload):
+    """Whether the request asks to expose unsigned compatibility blocks."""
+    return _thinking_intent(payload)[0]
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -242,60 +272,22 @@ def _tools_to_chat(tools):
 
 
 def effort_from_anthropic(payload, catalog_meta=None, supported=None):
-    """thinking.budget_tokens -> reasoning_effort（设计文档 §4.2）。
+    """Map validated Anthropic thinking intent to the model's supported effort.
 
-    单调 + clamp：
-      · thinking.type == "disabled" / budget 缺失 -> None（不下发）
-      · 断点粗映射（<=1024 minimal / <=4096 low / <=16384 medium / >16384 high）
-      · supported 给定时做 clamp（**接线时应显式传 qoder_proxy.supported_efforts(meta)**）；
-        未给时回退从 catalog_meta["thinking_config"] 读（避免与 proxy 重复决策）。
-      · 档位表为空 -> None（保持「不猜测」语义）
+    Explicit off is the upstream sentinel, not a level to be clamped. An
+    absent effort or a positive effort with no catalog levels is omitted.
     """
-    th = payload.get("thinking")
-    oc = payload.get("output_config")
-    _oc_effort = None
-    if isinstance(oc, dict) and oc.get("effort"):
-        _cand = str(oc["effort"]).strip().lower()
-        _oc_effort = _cand if _cand in EFFORT_RANK else None
-    if not isinstance(th, dict):
-        # 完全没有 thinking：只有 output_config.effort 也能决定档位
-        if not _oc_effort:
-            return None
-        th = {"type": "enabled", "budget_tokens": None,
-              "effort": _oc_effort}
-    if str(th.get("type") or "").lower() == "disabled":
-        return None
-    target = None
-    if th.get("effort"):
-        cand = str(th["effort"]).strip().lower()
-        target = cand if cand in EFFORT_RANK else None
-    if target is None:
-        # issue #62：Claude Code 对**第三方模型名**发的是
-        #   thinking={"type":"adaptive"} + output_config={"effort":"low|medium|high|max"}
-        # adaptive 是合法 dict 但没有 effort/budget_tokens，旧实现因此跳过
-        # output_config 分支 -> 四档全部映射成 None（静默固定跑默认档=max）。
-        target = _oc_effort
-    if target is None:
-        budget = th.get("budget_tokens")
-        if budget is None:
-            return None
-        try:
-            budget = float(budget)
-        except (TypeError, ValueError):
-            return None
-        for limit, name in BUDGET_STEPS:
-            if limit is None or budget <= limit:
-                target = name
-                break
-    if not target:
-        return None
+    _, target = _thinking_intent(payload)
+    if target is None or target == "none":
+        return target
     # 注意用 `is not None`：调用方**明确传空表**（= 该模型没有可用档位）时，
     # 不应该被 fallback 覆盖掉（falsy 判断会把 [] 当成"没传"）。
     allowed = supported if supported is not None else _efforts_from_meta(catalog_meta)
     if not allowed:
         return None                     # 无档位表 -> 不下发
     allowed = [str(x).strip().lower() for x in allowed
-               if str(x).strip().lower() in EFFORT_RANK]
+               if str(x).strip().lower() in EFFORT_RANK
+               and str(x).strip().lower() != "none"]
     if not allowed:
         return None
     if target in allowed:
@@ -518,13 +510,15 @@ def chat_usage_to_anthropic(usage):
         u.get("prompt_cache_hit_tokens")) or _int(
         details.get("cached_tokens")) or _int(pdet.get("cached_tokens"))
     cached = max(0, min(cached, prompt))
+    thinking_tokens = max(0, _int(details.get("reasoning_tokens")))
     return {
         "input_tokens": max(0, prompt - cached),
         "cache_read_input_tokens": cached,
         "cache_creation_input_tokens": 0,
         "output_tokens": max(0, _int(u.get("completion_tokens"))),
-        "output_tokens_details": {
-            "reasoning_tokens": max(0, _int(details.get("reasoning_tokens")))},
+        # Both names are proxy extensions, not native Anthropic usage fields.
+        "output_tokens_details": {"thinking_tokens": thinking_tokens,
+                                  "reasoning_tokens": thinking_tokens},
     }
 
 
@@ -544,12 +538,13 @@ def chat_to_messages(chat_obj, model=None, thinking_mode_override=None):
     if isinstance(text, list):
         text = "".join(p.get("text", "") for p in text
                        if isinstance(p, dict))
-    if isinstance(text, str) and text:
-        content.append({"type": "text", "text": text})
+    # Anthropic 要求 thinking block 在正文之前（客户端按顺序渲染/回传）。
     if thinking_mode(thinking_mode_override) == "empty" and msg.get("reasoning_content"):
         content.append({"type": "thinking",
                         "thinking": str(msg["reasoning_content"]),
                         "signature": ""})
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls") or []:
         if not isinstance(tc, dict):
             continue
@@ -596,18 +591,14 @@ def stream_anthropic_events(inner_lines, model="", holder=None, thinking_mode_ov
     """
     msg_id = _new_id("msg_")
     next_index = 0
-    text_index = None
-    thinking_index = None
-    tool_index = {}
-    # issue #116：上游偶发「新 index 的首帧不带 name」，而 content_block_start
-    # 一旦发出就不能再补 name（Anthropic 协议不允许改已发出的块）——下游会拿到
-    # 空 name 并把整轮判成 malformed。所以先缓冲：name 非空才发 start，期间到达的
-    # arguments 先攒着，start 之后按序补发。
-    pending_tools = {}      # ci -> {ai, id, name, args, args_object}
-    dropped_tools = []      # 流结束仍无 name 的块（丢弃并记日志）
-    open_blocks = []
+    thinking_index = text_index = live_tool_index = None
+    visible_started = emitted_text = emitted_thinking = False
+    dropped_tool = False
+    late_text = []
+    pending_tools = {}
     finish = "stop"
     mode = thinking_mode(thinking_mode_override)
+    holder = holder if isinstance(holder, dict) else {}
 
     def ev(etype, obj):
         body = dict(obj)
@@ -615,8 +606,46 @@ def stream_anthropic_events(inner_lines, model="", holder=None, thinking_mode_ov
         return ("event: " + etype + "\ndata: "
                 + json.dumps(body, ensure_ascii=False) + "\n\n").encode("utf-8")
 
-    start_usage = chat_usage_to_anthropic(
-        holder.get("usage") if isinstance(holder, dict) else None)
+    def start_block(block):
+        nonlocal next_index
+        index = next_index
+        next_index += 1
+        return index, ev("content_block_start", {"index": index, "content_block": block})
+
+    def close_thinking():
+        nonlocal thinking_index
+        if thinking_index is not None:
+            yield ev("content_block_delta", {"index": thinking_index,
+                     "delta": {"type": "signature_delta", "signature": ""}})
+            yield ev("content_block_stop", {"index": thinking_index})
+            thinking_index = None
+
+    def start_tool(slot):
+        return start_block({"type": "tool_use", "id": slot["id"] or _new_id("toolu_"),
+                            "name": slot["name"], "input": {}})
+
+    def tool_deltas(index, slot, final=False):
+        if not final and not slot["args_object"]:
+            return
+        parts, slot["args"] = slot["args"], []
+        if parts and final and not slot["args_object"]:
+            try:
+                args = _parse_tool_arguments("".join(parts))
+            except (TypeError, ValueError):
+                pass  # Do not invent arguments for invalid or truncated JSON.
+            else:
+                if not isinstance(args, dict):
+                    args = {"value": args}
+                parts = [json.dumps(args, ensure_ascii=False)]
+        for piece in parts:
+            yield ev("content_block_delta", {"index": index,
+                     "delta": {"type": "input_json_delta", "partial_json": piece}})
+
+    def text_delta(index, text):
+        return ev("content_block_delta", {"index": index,
+                  "delta": {"type": "text_delta", "text": text}})
+
+    start_usage = chat_usage_to_anthropic(holder.get("usage"))
     yield ev("message_start", {"message": {
         "id": msg_id, "type": "message", "role": "assistant",
         "model": model or "", "content": [], "stop_reason": None,
@@ -644,123 +673,104 @@ def stream_anthropic_events(inner_lines, model="", holder=None, thinking_mode_ov
             continue
         if not isinstance(chunk, dict):
             continue
-        if isinstance(chunk.get("usage"), dict) and isinstance(holder, dict):
-            holder["usage"] = chunk["usage"]
+        usage = chunk.get("usage")
+        if isinstance(usage, dict) and usage:
+            holder["usage"] = usage
         for choice in chunk.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
             delta = choice.get("delta")
             delta = delta if isinstance(delta, dict) else {}
             piece = delta.get("reasoning_content")
-            if piece and mode == "empty":
+            # Ordinary SSE cannot insert a block before already visible output.
+            if isinstance(piece, str) and piece and mode == "empty" and not visible_started:
+                emitted_thinking = True
                 if thinking_index is None:
-                    thinking_index = next_index
-                    next_index += 1
-                    open_blocks.append(thinking_index)
-                    yield ev("content_block_start", {
-                        "index": thinking_index,
-                        "content_block": {"type": "thinking", "thinking": "",
-                                          "signature": ""}})
-                yield ev("content_block_delta", {
-                    "index": thinking_index,
-                    "delta": {"type": "thinking_delta", "thinking": piece}})
+                    thinking_index, frame = start_block(
+                        {"type": "thinking", "thinking": "", "signature": ""})
+                    yield frame
+                yield ev("content_block_delta", {"index": thinking_index,
+                         "delta": {"type": "thinking_delta", "thinking": piece}})
             txt = delta.get("content")
             if isinstance(txt, str) and txt:
-                if text_index is None:
-                    text_index = next_index
-                    next_index += 1
-                    open_blocks.append(text_index)
-                    yield ev("content_block_start", {
-                        "index": text_index,
-                        "content_block": {"type": "text", "text": ""}})
-                yield ev("content_block_delta", {
-                    "index": text_index,
-                    "delta": {"type": "text_delta", "text": txt}})
+                emitted_text = True
+                if live_tool_index is not None:
+                    late_text.append(txt)
+                else:
+                    if text_index is None:
+                        visible_started = True
+                        yield from close_thinking()
+                        text_index, frame = start_block({"type": "text", "text": ""})
+                        yield frame
+                    yield text_delta(text_index, txt)
             for tc in delta.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
                 ci = tc.get("index")
                 if not isinstance(ci, int):
-                    ci = len(tool_index)
+                    ci = len(pending_tools)
                 fn = tc.get("function")
                 fn = fn if isinstance(fn, dict) else {}
-                args = fn.get("arguments") or ""
-                if ci not in pending_tools:
-                    ai = next_index
-                    next_index += 1
-                    tool_index[ci] = ai
-                    pending_tools[ci] = {"ai": ai,
-                                         "id": str(tc.get("id") or ""),
-                                         "name": str(fn.get("name") or ""),
-                                         "args": [], "args_object": None}
-                slot = pending_tools[ci]
+                args = fn.get("arguments")
+                slot = pending_tools.setdefault(ci, {"index": None, "id": "", "name": "",
+                                                     "args": [], "args_object": None})
                 if not slot["name"]:
                     slot["name"] = str(fn.get("name") or "")
                 if not slot["id"]:
                     slot["id"] = str(tc.get("id") or "")
-                if args:
+                if isinstance(args, str) and args:
                     slot["args"].append(args)
                     # 只看首个非空白字符：正常对象继续即时透传，其余形态在
                     # 输出任何参数前缓冲，避免客户端把字符串 input 写进历史。
                     if slot["args_object"] is None and args.lstrip():
                         slot["args_object"] = args.lstrip().startswith("{")
-                # name 已知 -> 需要时才开块，然后把队列里的分片按序发完；
-                # name 未知 -> 继续攒（绝不发空 name 的 start）。
-                if slot["name"]:
-                    if slot["ai"] not in open_blocks:
-                        open_blocks.append(slot["ai"])
-                        yield ev("content_block_start", {
-                            "index": slot["ai"],
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": slot["id"] or _new_id("toolu_"),
-                                "name": slot["name"],
-                                "input": {}}})
-                    if slot["args_object"]:
-                        _queued = slot["args"]
-                        slot["args"] = []
-                        for piece in _queued:
-                            yield ev("content_block_delta", {
-                                "index": slot["ai"],
-                                "delta": {"type": "input_json_delta",
-                                          "partial_json": piece}})
+                # Keep the first named tool live. Parallel tool fragments wait
+                # until it closes; Anthropic blocks must not overlap.
+                if slot["name"] and live_tool_index is None:
+                    visible_started = True
+                    yield from close_thinking()
+                    if text_index is not None:
+                        yield ev("content_block_stop", {"index": text_index})
+                        text_index = None
+                    live_tool_index, frame = start_tool(slot)
+                    slot["index"] = live_tool_index
+                    yield frame
+                if slot["index"] is not None:
+                    yield from tool_deltas(slot["index"], slot)
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
-    # issue #116：仍有块没等到 name —— 不发 start（发了就是空 name），整块丢弃并
-    # 降级 stop_reason，避免下游一直等一个永远不会到来的工具结果。
-    for _ci, _slot in list(pending_tools.items()):
-        if _slot["ai"] in open_blocks:
-            if _slot["args"]:
-                _queued = _slot["args"]
-                try:
-                    inp = _parse_tool_arguments("".join(_queued))
-                except (TypeError, ValueError):
-                    # 截断/非法 JSON 沿用现有处理，不编造工具参数。
-                    pass
-                else:
-                    if not isinstance(inp, dict):
-                        inp = {"value": inp}
-                    _queued = [json.dumps(inp, ensure_ascii=False)]
-                for piece in _queued:
-                    yield ev("content_block_delta", {
-                        "index": _slot["ai"],
-                        "delta": {"type": "input_json_delta",
-                                  "partial_json": piece}})
+    yield from close_thinking()
+    if text_index is not None:
+        yield ev("content_block_stop", {"index": text_index})
+    # Close the live tool before opening any queued blocks.
+    for slot in pending_tools.values():
+        if slot["index"] is not None:
+            yield from tool_deltas(slot["index"], slot, final=True)
+            yield ev("content_block_stop", {"index": slot["index"]})
+            break
+    for ci, slot in pending_tools.items():
+        if slot["index"] is not None:
             continue
-        dropped_tools.append(_slot)
-        log("anthropic stream: dropped tool_use block without name "
-            "(index=%s, id=%s, args_chars=%d) - issue #116"
-            % (_ci, _slot["id"] or "-",
-               sum(len(a) for a in _slot["args"])),
-            level="WARN", tag="anthropic")
-    if dropped_tools and finish == "tool_calls":
-        _kept_text = text_index is not None or thinking_index is not None
-        if not _kept_text:
-            finish = "stop"
-    for i in sorted(open_blocks):
-        yield ev("content_block_stop", {"index": i})
-    final = chat_usage_to_anthropic(
-        holder.get("usage") if isinstance(holder, dict) else None)
+        if not slot["name"]:
+            dropped_tool = True
+            log("anthropic stream: dropped tool_use block without name "
+                "(index=%s, id=%s, args_chars=%d) - issue #116"
+                % (ci, slot["id"] or "-", sum(len(a) for a in slot["args"])),
+                level="WARN", tag="anthropic")
+            continue
+        index, frame = start_tool(slot)
+        yield frame
+        yield from tool_deltas(index, slot, final=True)
+        yield ev("content_block_stop", {"index": index})
+    if late_text:
+        index, frame = start_block({"type": "text", "text": ""})
+        yield frame
+        for txt in late_text:
+            yield text_delta(index, txt)
+        yield ev("content_block_stop", {"index": index})
+    if dropped_tool and finish == "tool_calls" and not (emitted_text or emitted_thinking):
+        finish = "stop"  # Preserve the existing nameless-tool fallback.
+    final = chat_usage_to_anthropic(holder.get("usage"))
     # issue #42：新版 Anthropic 语义里 message_delta.usage 是**累计完整用量**，
     # Claude Code / AI SDK 系客户端按它读取最终计量。此前只回 output_tokens，
     # 输入侧（input/cache_read/cache_creation）全部缺失 -> 客户端输入 token 恒 0。

@@ -506,6 +506,31 @@ def set_omit_default_system_prompt(accounts_dir, enabled):
         save(accounts_dir, data)
 
 
+def web_tools_environment():
+    """Parsed enable override and raw normalized values for runtime and panel."""
+    enabled = (os.environ.get("QD_WEB_TOOLS") or "").strip().lower()
+    backend = (os.environ.get("QD_WEB_TOOLS_BACKEND") or "").strip().lower()
+    if enabled in ("1", "on", "true", "yes", "enable", "enabled"):
+        return True, enabled, backend
+    if enabled in ("0", "off", "false", "no", "disable", "disabled"):
+        return False, enabled, backend
+    return None, "", backend
+
+
+def _load_for_update(accounts_dir):
+    """A failed read is not a fresh install; never replace unreadable settings."""
+    try:
+        with open(settings_path(accounts_dir), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (ValueError, UnicodeError) as exc:
+        raise OSError("settings.json is invalid; refusing to overwrite it") from exc
+    if not isinstance(data, dict):
+        raise OSError("settings.json must contain an object; refusing to overwrite it")
+    return data
+
+
 def web_tools_enabled(accounts_dir):
     """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
 
@@ -516,16 +541,16 @@ def web_tools_enabled(accounts_dir):
 
 
 def set_web_tools_enabled(accounts_dir, enabled):
-    with _lock:
-        data = load(accounts_dir)
-        data["web_tools"] = bool(enabled)
-        save(accounts_dir, data)
+    set_web_tools_config(accounts_dir, {"enabled": bool(enabled)})
 
 
 def web_tools_config(accounts_dir):
     """Persisted backend and separate provider profiles; internal, includes keys."""
+    return _web_tools_config(load(accounts_dir))
+
+
+def _web_tools_config(data):
     import qoder_external_web as external
-    data = load(accounts_dir)
     provider = data.get("web_tools_external_provider") or "searxng"
     if provider not in external.PROVIDERS:
         provider = "searxng"
@@ -533,7 +558,9 @@ def web_tools_config(accounts_dir):
     profiles = {name: external.normalize(saved.get(name) or {}, name)
                 for name in external.PROVIDERS}
     return {"backend": data.get("web_tools_backend") or "local",
-            "external": profiles[provider], "external_profiles": profiles}
+            "external": profiles[provider], "external_profiles": profiles,
+            "fetch_backend": data.get("web_fetch_backend") or "inherit",
+            "external_fetch": external.normalize_fetch(data.get("web_fetch_external") or {})}
 
 
 def set_web_tools_config(accounts_dir, updates):
@@ -541,18 +568,21 @@ def set_web_tools_config(accounts_dir, updates):
     import qoder_external_web as external
     if not isinstance(updates, dict):
         raise ValueError("web tools settings must be an object")
-    if set(updates) - {"enabled", "backend", "external"}:
+    if set(updates) - {"enabled", "backend", "external", "fetch_backend", "external_fetch"}:
         raise ValueError("unknown web tools setting")
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
+        enabled_env, _, backend_env = web_tools_environment()
         if "enabled" in updates:
             if type(updates["enabled"]) is not bool:
                 raise ValueError("enabled must be a boolean")
-            data["web_tools"] = updates["enabled"]
+            if enabled_env is None:
+                data["web_tools"] = updates["enabled"]
         if "backend" in updates:
             if updates["backend"] not in ("local", "qoder", "external"):
                 raise ValueError("backend must be local, qoder or external")
-            data["web_tools_backend"] = updates["backend"]
+            if not backend_env:
+                data["web_tools_backend"] = updates["backend"]
         if "external" in updates:
             patch = updates["external"]
             if not isinstance(patch, dict):
@@ -564,16 +594,44 @@ def set_web_tools_config(accounts_dir, updates):
             unknown = set(patch) - set(external.defaults(provider))
             if unknown:
                 raise ValueError("unknown external search setting")
+            old_origin = external.endpoint_origin(external.normalize(profile, provider)["endpoint"])
             profile.update(patch)
-            profiles[provider] = external.normalize(profile, provider)
+            profile = external.normalize(profile, provider)
+            if "api_key" not in patch and old_origin != external.endpoint_origin(profile["endpoint"]):
+                profile["api_key"] = ""
+            profiles[provider] = profile
             data["web_tools_external_profiles"] = profiles
             data["web_tools_external_provider"] = provider
-        if data.get("web_tools") is True and data.get("web_tools_backend") == "external":
-            provider = data.get("web_tools_external_provider") or "searxng"
-            external.normalize((data.get("web_tools_external_profiles") or {}).get(provider) or {},
-                               provider, ready=True)
+        if "fetch_backend" in updates:
+            if updates["fetch_backend"] not in ("inherit", "local", "qoder", "external"):
+                raise ValueError("fetch_backend must be inherit, local, qoder or external")
+            data["web_fetch_backend"] = updates["fetch_backend"]
+        if "external_fetch" in updates:
+            patch = updates["external_fetch"]
+            if not isinstance(patch, dict) or set(patch) - set(external.FETCH_DEFAULTS):
+                raise ValueError("invalid external fetch settings")
+            fetch_profile = dict(data.get("web_fetch_external") or {})
+            old_endpoint = fetch_profile.get("endpoint") or ""
+            fetch_profile.update(patch)
+            fetch_profile = external.normalize_fetch(fetch_profile)
+            if "api_key" not in patch and "endpoint" in patch:
+                # Validate the previous endpoint independently of other old draft fields.
+                old_endpoint = external.normalize_fetch({"endpoint": old_endpoint})["endpoint"]
+                if external.endpoint_origin(old_endpoint) != external.endpoint_origin(fetch_profile["endpoint"]):
+                    fetch_profile["api_key"] = ""
+            data["web_fetch_external"] = fetch_profile
+        config = _web_tools_config(data)
+        enabled = data.get("web_tools") is True if enabled_env is None else enabled_env
+        backend = backend_env or config["backend"]
+        if enabled:
+            if backend not in ("local", "qoder", "external"):
+                raise ValueError("QD_WEB_TOOLS_BACKEND must be local, qoder or external")
+            if backend == "external":
+                external.normalize(config["external"], ready=True)
+            if config["fetch_backend"] == "external":
+                external.normalize_fetch(config["external_fetch"], ready=True)
         save(accounts_dir, data)
-    return web_tools_config(accounts_dir)
+    return config
 
 
 # ------------------------------------------------------------- model gates
