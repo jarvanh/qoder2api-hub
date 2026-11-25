@@ -7295,7 +7295,9 @@ async function testAccount(uid, btn){
       const _head = r.hint ? (r.hint + '  ') : '';
       const _tail = r.hint ? ('（' + (r.error || r.status || '异常') + '）')
                            : (r.error || r.status || '异常');
-      toast('测试失败: ' + _head + _tail, 'bad');
+      const _blocked = r.queued === true;
+      toast((_blocked ? '测试未完成: ' : '测试失败: ') + _head + _tail,
+            _blocked ? 'warn' : 'bad');
     }
     await loadAccounts();
   }catch(e){

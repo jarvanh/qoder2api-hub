@@ -190,13 +190,13 @@ check("cn-only: gm51model present, absent from intl",
       "gm51model" in cn_keys and "gm51model" not in intl_keys)
 intl_en = {m["key"] for m in C.STATIC_INTL_MODELS if m.get("enable")}
 cn_en = {m["key"] for m in C.STATIC_CN_MODELS if m.get("enable")}
-check("intl enabled flags include QoDuck launch state",
-      intl_en == {"qmodel_38max", "qfmodel", "lmodel"}, sorted(intl_en))
+check("intl enabled flags include launch and event models",
+      intl_en == {"qmodel_38max", "qfmodel", "lmodel", "HungerG"}, sorted(intl_en))
 check("cn all 15 enabled", len(cn_en) == 15, sorted(cn_en))
 # 全量列出（不按 enable 过滤）
 merged_i = P.merge_catalog([], realm="intl")
 merged_c = P.merge_catalog([], realm="cn")
-check("merge keeps FULL intl list (18, no enable filtering)", len(merged_i) == 18,
+check("merge keeps FULL intl list (19, no enable filtering)", len(merged_i) == 19,
       len(merged_i))
 check("merge keeps FULL cn list (15)", len(merged_c) == 15, len(merged_c))
 # 清单以官方动态/本机目录为准（桌面版此刻显示什么就显示什么）

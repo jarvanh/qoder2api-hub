@@ -883,6 +883,51 @@ _INTL_JSON = r'''
     }
   },
   {
+    "key": "HungerG",
+    "status": "idle",
+    "format": "openai",
+    "source": "system",
+    "enable": true,
+    "display_name": "HungerG",
+    "is_vl": true,
+    "is_reasoning": true,
+    "is_default": false,
+    "is_new": true,
+    "price_factor": 0.0,
+    "max_input_tokens": 180000,
+    "is_sensitive": true,
+    "tags": [
+      "free"
+    ],
+    "is_free": true,
+    "is_lite_plan": true,
+    "is_editable": true,
+    "context_config": {
+      "1M": {
+        "token_count": 1000000
+      },
+      "200K": {
+        "token_count": 200000,
+        "is_default": true
+      },
+      "400K": {
+        "token_count": 400000
+      }
+    },
+    "thinking_config": {
+      "disabled": {},
+      "enabled": {
+        "efforts": {
+          "low": {},
+          "medium": {},
+          "high": {},
+          "max": {}
+        },
+        "is_default": true
+      }
+    }
+  },
+  {
     "key": "lmodel",
     "status": "idle",
     "format": "openai",
@@ -1676,8 +1721,11 @@ STATIC_CN_MODELS = _load_snapshot("qoder_catalog_cn.json", _CN_JSON)
 STATIC_MODELS = STATIC_CN_MODELS   # 兼容旧名
 
 # 区域独占模型（官方双区清单差集）
-INTL_EXCLUSIVE = {'efficient', 'cmodel', 'smodel', 'ultimate', 'performance'}
+INTL_EXCLUSIVE = {'efficient', 'cmodel', 'smodel', 'ultimate', 'performance', 'hungerg'}
 CN_EXCLUSIVE = {'q37fmodel', 'gm51model'}
+# 限时活动模型即使未出现在动态清单也保持可见；到期后自动回到动态清单口径。
+# HungerG 官方活动：2026-11-23 24:00 至 2026-11-30 24:00（UTC+8）。
+CATALOG_SUPPLEMENTS = {"HungerG": 1796054400}
 INTL_EXCLUSIVE_PREFIXES = ("ultimate", "performance", "efficient", "smodel", "cmodel")
 CN_EXCLUSIVE_PREFIXES = ("q37fmodel", "gm51model")
 

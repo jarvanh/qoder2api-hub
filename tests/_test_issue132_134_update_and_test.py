@@ -44,7 +44,7 @@ _intl = P._default_test_model("intl")
 check("CN 默认探活模型是真免费模型", "Flash" in _cn or "flash" in _cn, _cn)
 check("INTL 默认探活模型同样免费", "Flash" in _intl or "flash" in _intl, _intl)
 _i2 = _src.index('if path == "/accounts/test":')
-_seg2 = _src[_i2:_i2 + 2000]
+_seg2 = _src[_i2:_i2 + 4500]
 check("测试入口用 _default_test_model 兜底", "_default_test_model(" in _seg2)
 check("显式 model 仍以调用方为准",
       'payload.get("model")' in _seg2.split("_default_test_model(")[0])
@@ -57,5 +57,9 @@ print("[#134] 面板 toast 优先显示 hint")
 check("hint 放前面", "const _head = r.hint ?" in _dash)
 check("原文放括号里（仍可追查）",
       "'（' + (r.error || r.status || '异常') + '）'" in _dash)
+check("排队结果带显式标记", '"queued": bool("10605" in _detail' in _seg2)
+check("排队显示为未完成而非测试失败",
+      "r.queued === true" in _dash and "_blocked ? 'warn' : 'bad'" in _dash
+      and "测试未完成: " in _dash)
 
 finish()
