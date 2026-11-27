@@ -17,7 +17,7 @@ def _path(usage_dir):
 
 
 def record(usage_dir, kind, ok, uid="", nickname="", realm="", detail="",
-           amount=0):
+           amount=0, outcome=None):
     """追加一条事件；任何异常都吞掉（流水不能影响主流程）。"""
     try:
         path = _path(usage_dir)
@@ -32,6 +32,8 @@ def record(usage_dir, kind, ok, uid="", nickname="", realm="", detail="",
                "nickname": nickname or "", "realm": realm or "",
                "detail": str(detail or "")[:200],
                "amount": amount or 0}
+        if outcome:
+            row["outcome"] = outcome
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:

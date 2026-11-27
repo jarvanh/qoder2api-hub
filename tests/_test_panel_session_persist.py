@@ -82,7 +82,7 @@ try:
     # ---- ⑦b settings.json 损坏时拒绝回写（否则会抹掉密码哈希与全部 API Key）----
     tmp_bad = tempfile.mkdtemp(prefix="qd-badsess-")
     try:
-        S.set_panel_password(tmp_bad, "keepme123")
+        S.set_panel_password(tmp_bad, "keepme123-fixture")
         bad_path = S.settings_path(tmp_bad)
         with open(bad_path, "w", encoding="utf-8") as fh:
             fh.write('{"panel_password_hash": "deadbeef", "api_keys": [{"id":"k0"}')
@@ -92,7 +92,7 @@ try:
         check("损坏的 settings.json 不被覆盖", "deadbeef" in content and "api_keys" in content,
               content[:60])
         check("损坏时密钥退到进程内（ephemeral）", pb._ephemeral is True)
-        check("损坏时面板仍可登录（临时密钥有效）", pb.valid(tokb))
+        check("底层临时签名仍可校验（HTTP 面板会另外检查口令）", pb.valid(tokb))
         # 恢复成合法文件后应能重新落盘
         S.save(tmp_bad, {"panel_password_hash": "x"})
         pc = S.PanelSessions(lambda: tmp_bad)

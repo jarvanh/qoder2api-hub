@@ -160,6 +160,7 @@ class Gateway(_Quiet, P.Handler):
 ACC = os.environ["ACCOUNTS_DIR"]
 P.ACCOUNTS_DIR = ACC
 P.POOL = A.AccountPool(ACC, log=lambda *_a, **_k: None)
+ST.set_panel_password(ACC, "fixture-panel-password")
 P.API_KEY = "launcher-key-131"
 P.PANEL = ST.PanelSessions(lambda: P.ACCOUNTS_DIR)
 P.POOL.add(A.Account(dict(uid="fake-acc-131", realm="cn",

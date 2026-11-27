@@ -18,8 +18,8 @@ services:
     # 别照抄示例（所有人用同一个名字反而成了共同指纹）。
     # hostname: my-nas
     ports:
-      # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
-      - "8790:8790"
+      # 默认只发布到宿主机回环；容器内部仍使用 bridge 网络。
+      - "127.0.0.1:8790:8790"
     environment:
       # HOST/PORT 真实生效：镜像 CMD 不再硬编码 --host/--port（argparse 读环境变量）
       - HOST=0.0.0.0

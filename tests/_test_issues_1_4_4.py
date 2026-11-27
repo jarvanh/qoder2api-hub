@@ -315,11 +315,11 @@ check("#40 签到 403 不再当硬错误（给可读原因）",
 print("[41] 改密码先校验原密码")
 _src41 = _read(ROOT_SRC)
 _i41 = _src41.find('if path == "/panel/password":')
-_blk41 = _src41[_i41:_i41 + 900] if _i41 > 0 else ""
+_blk41 = _src41[_i41:_i41 + 1450] if _i41 > 0 else ""
 check("#41 原密码错返回 403（不是 401——401 会让前端弹登录）",
       '当前密码不正确' in _blk41 and "_error(403" in _blk41, _blk41[:200])
 check("#41 校验发生在 set_panel_password 之前",
-      _blk41.find("verify_panel_password") < _blk41.find("set_panel_password")
+      0 <= _blk41.find("verified_panel_password_binding") < _blk41.find("set_panel_password")
       if _blk41 else False)
 _js41 = _read(os.path.join(ROOT, "dashboard.html"))
 check("#41 前端 403 不弹登录遮罩（既有契约，回归钉死）",

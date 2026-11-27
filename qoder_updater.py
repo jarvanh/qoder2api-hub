@@ -15,6 +15,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,29 +97,52 @@ def _download(url, dest, timeout=120):
     return dest
 
 
+_SPECIAL_WINDOWS_NAME = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$", re.I)
+_MAX_RELEASE_BYTES = 256 * 1024 * 1024
+
+
 def _safe_members(tar):
-    out = []
-    for m in tar.getmembers():
-        name = m.name.replace("\\", "/")
-        if name.startswith("/") or ".." in name.split("/"):
-            continue
-        out.append((m, name))
+    out, seen = [], set()
+    total = 0
+    for m in tar:
+        name = m.name.rstrip("/") if m.isdir() else m.name
+        parts = name.split("/")
+        if not (m.isdir() or m.type in (tarfile.REGTYPE, tarfile.AREGTYPE)):
+            raise RuntimeError("release archive contains unsupported member types")
+        if any(not p or p in (".", "..") or p.endswith((".", " "))
+               or _SPECIAL_WINDOWS_NAME.fullmatch(p.split(".", 1)[0])
+               or any(c in '\\:*?"<>|' or ord(c) < 32 for c in p) for p in parts):
+            raise RuntimeError("release archive contains an invalid path")
+        normalized = name.casefold()
+        if normalized in seen or (len(parts) == 1 and not m.isdir()):
+            raise RuntimeError("release archive contains conflicting paths")
+        seen.add(normalized)
+        total += m.size
+        if len(out) >= 20_000 or m.size < 0 or total > _MAX_RELEASE_BYTES:
+            raise RuntimeError("release archive exceeds size limits")
+        out.append((m, parts))
     return out
 
 
 def _extract(tarball, dest):
-    """解压到 dest，返回 release 根目录（tarball 顶层目录）。"""
+    """Copy only regular file bytes and create directories in a new staging area."""
     with tarfile.open(tarball, "r:*") as tar:
         members = _safe_members(tar)
-        if not members:
-            raise RuntimeError("empty or unsafe tarball")
-        roots = {n.split("/")[0] for _m, n in members}
+        roots = {parts[0] for _m, parts in members}
         if len(roots) != 1:
-            raise RuntimeError("unexpected tarball layout: %s" % sorted(roots))
-        root = roots.pop()
-        # 只解压**过滤后**的成员（extractall 默认会解压全部，等于绕过过滤）
-        tar.extractall(dest, members=[m for m, _n in members])
-    return os.path.join(dest, root)
+            raise RuntimeError("unexpected release archive layout")
+        os.mkdir(dest, mode=0o700)
+        for member, parts in members:
+            path = os.path.join(dest, *parts)
+            if member.isdir():
+                os.makedirs(path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with tar.extractfile(member) as source, open(path, "xb") as output:
+                shutil.copyfileobj(source, output, 64 * 1024)
+            if member.mode & 0o111:
+                os.chmod(path, os.stat(path).st_mode | 0o100)
+    return os.path.join(dest, roots.pop())
 
 
 def _read_version(path):

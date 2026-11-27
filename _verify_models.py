@@ -123,10 +123,16 @@ def _validate_fetch_url(url, allow_loopback):
     return url
 
 
-def fetch_models(base, realm):
+def fetch_models(base, realm, api_key=None):
     url = _validate_fetch_url(f"{base}/v1/models?realm={realm}",
                               allow_loopback=True)
-    with urllib.request.urlopen(url, timeout=30) as resp:
+    request = urllib.request.Request(url)
+    if api_key:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise ValueError("an authenticated model check requires HTTPS or loopback")
+        request.add_unredirected_header("Authorization", "Bearer " + api_key)
+    with urllib.request.urlopen(request, timeout=30) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload.get("data") or []
 
@@ -158,10 +164,10 @@ def main():
     for realm in ("cn", "intl"):
         # --- 网关输出 ---
         try:
-            entries = fetch_models(args.base, realm)
+            entries = fetch_models(args.base, realm, os.environ.get("QD_VERIFY_API_KEY"))
         except urllib.error.HTTPError as e:
             print(f"FATAL: gateway returned HTTP {e.code} for realm={realm} "
-                  f"(401 means panel/API key required — pass a key via ?key=)")
+                  f"(for an authenticated gateway, set QD_VERIFY_API_KEY)")
             return 2
         except Exception as e:
             print(f"FATAL: gateway unreachable at {args.base}: {e}")

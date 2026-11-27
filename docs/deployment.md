@@ -44,9 +44,8 @@ python qoder_proxy.py --port 8790
 两个脚本都在**前台**运行，关闭窗口即停止。
 
 - 监听所有网卡，Base URL 是 `http://<本机局域网 IP>:8790/v1`
-- 局域网模式必须使用 API Key。不指定时，首次启动会生成一个 `qd-` 开头的随机 Key，保存到 `accounts/settings.json` 并打印在终端，之后重启继续使用同一个
-- 其他设备可以通过 `http://<IP>:8790/?key=<API Key>` 直接打开看板
-- 如果面板还在用默认密码，启动时会打印警告，看板也会拒绝显示明文 Key。请先修改面板密码
+- 局域网模式必须使用 API Key。不指定时，首次启动会生成一个 `qd-` 开头的随机 Key，保存到 `accounts/settings.json`，之后重启继续使用同一个。Key 不写入启动日志
+- 其他设备访问看板也需要单独的面板密码。请先在服务器终端交互设置，不要把面板密码或 API Key 放进 URL；跨设备管理建议使用 HTTPS 或 SSH 转发。
 
 其他设备连不上时，放行防火墙：
 
@@ -73,7 +72,7 @@ docker compose logs -f
 
 ```bash
 docker run -d --name qoder-proxy --restart unless-stopped \
-  -p 8790:8790 \
+  -p 127.0.0.1:8790:8790 \
   -v "$(pwd)/accounts:/app/accounts" \
   -v "$(pwd)/usage:/app/usage" \
   ghcr.io/shuishuipingan/qoder2api-hub:latest
@@ -90,7 +89,9 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 **容器配置：**
 
-- 容器以 `--lan` 启动，会强制使用 API Key：要么通过 `API_KEY` 环境变量传入，要么在首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看
+- 默认只在宿主机 `127.0.0.1:8790` 发布端口；容器内仍监听 bridge 接口。需要局域网访问时，显式修改端口映射并限制防火墙或反向代理的访问来源。
+- 面板首设：`docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password`；使用 `docker run` 时，将 `docker compose exec` 改为 `docker exec -it`。
+- 容器以 `--lan` 启动，会强制使用 API Key：要么通过 `API_KEY` 环境变量传入，要么在首次启动时自动生成并写入挂载的 `accounts/settings.json`。推理 Key 不写入日志，可登录面板后管理
 - 环境变量：`HOST`（默认 `0.0.0.0`）、`PORT`（默认 `8790`）、`API_KEY`、`TZ`（默认 `Asia/Shanghai`）。改 `PORT` 时要同步修改 `ports:` 映射
 - 需要持久化的两个目录：`/app/accounts` 和 `/app/usage`。NAS 或长期部署建议挂载绝对路径
 - 镜像自带健康检查，探测的是 `/ping`

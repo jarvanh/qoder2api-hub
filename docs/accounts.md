@@ -17,7 +17,9 @@
 | **导入本机凭证** | 点「扫描本地凭证」，弹窗会按区域列出检测到的凭证，选中后点「导入」 |
 | **OAuth 设备授权** | 点「+ 添加账号 (OAuth)」，选择区域，在浏览器里打开官方授权链接完成登录。网关自动轮询结果并把账号加入池 |
 | **PAT** | 在 Qoder 网页版「设置 → Personal Access Token」创建一个 `pt-` 令牌，然后在看板点「导入 PAT」并粘贴 |
-| **JSON 导入 / 导出** | 可以导出全部或单个账号（凭证可选是否一并导出）；导入时支持预检（Dry-Run）和按 UID 覆盖 |
+| **JSON 导入 / 导出** | 浏览器只导出账号元数据，不能用作恢复凭证的备份。导入时支持预检（Dry-Run）和按 UID 覆盖 |
+
+需要迁移账号时，在服务器终端运行 `python qoder_proxy.py --backup-accounts <新文件>`；备份路径必须在账号目录之外且不能已存在。Docker 示例：`docker compose exec qoder-proxy python qoder_proxy.py --backup-accounts /tmp/qoder-backup.json`，随后用 `docker compose cp qoder-proxy:/tmp/qoder-backup.json ./qoder-backup.json` 复制到仅你可读的位置，确认保存后删除容器内副本。备份含明文凭证，不要上传或分享；恢复时从面板导入该文件。
 
 **扫描本地凭证**会读取以下位置，整个过程只读，导入前需要你逐条确认：
 
@@ -26,7 +28,15 @@
 | 桌面 App（仅 Windows） | `%APPDATA%\com.qodercn.app.stable\auth.v1.dat` | `%APPDATA%\com.qoder.app.stable\auth.v1.dat` |
 | Qoder CLI | `~/.qoder-cn/.auth/user*` | `~/.qoder/.auth/user*` |
 
-网关启动时如果发现本机凭证，只会在日志里提示数量，不会自动导入。
+网关启动时如果发现本机凭证，只会在日志里提示数量，不会自动导入。面板只接受网关扫描发现的有效凭证。
+
+自定义路径请在**网关主机终端**导入；建议先停止网关，导入后重新启动：
+
+```bash
+python qoder_proxy.py --import-local-credential "<本机凭证文件>" --credential-realm cn --credential-format cli
+```
+
+国际版用 `--credential-realm intl`；桌面加密凭证用 `--credential-format app`，需保留同目录的 `Local State`，且运行账户须有解密权限。加密 CLI 凭证需同目录的 `machine_id`。Docker 中路径是容器内路径，可用 Compose 的一次性容器并只读挂载凭证目录；如使用了自定义账号目录，传同一个 `--accounts-dir`。此命令不接受 URL 或 Windows 网络路径。
 
 ## 凭证与保活
 

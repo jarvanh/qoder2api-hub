@@ -3,7 +3,7 @@
     python tests/_test_auth_matrix.py
 
 用真实 ThreadingHTTPServer + 项目 Handler，所以测的是**真的路由与鉴权**；
-403 走 /settings/reveal 的「默认密码」策略守卫（唯一的 403 面板接口）。
+验证未初始化面板拒绝旧会话、配置后会话恢复、敏感选项仍有独立约束。
 """
 import http.server
 import json
@@ -47,6 +47,8 @@ class Pool(object):
 a = A.Account({"uid": "auth1", "realm": "cn", "accessToken": "dt-x"})
 a.nickname = "t"
 a.credits = {"remain": 10, "used": 1, "size": 100}
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+P.PANEL = P.qoder_settings.PanelSessions(lambda: P.ACCOUNTS_DIR)
 P.POOL = Pool([a])
 P.API_KEY = "right-key"
 P.API_KEY_FILE_SET = True
@@ -80,17 +82,20 @@ st, _ = get("/credits/summary", {"Authorization": "Bearer WRONG"})
 check("无效 key + 已设 key -> 401", st == 401, st)
 st, _ = get("/credits/summary")
 check("无凭据 + 已设 key -> 401", st == 401, st)
+unconfigured = P.PANEL.create()
+st, _ = get("/credits/summary", {"X-Panel-Token": unconfigured})
+check("未初始化面板的旧会话不能代替 API Key", st == 401, st)
+P.qoder_settings.set_panel_password(P.ACCOUNTS_DIR, "fixture-panel-password")
 tok = P.PANEL.create()
 st, _ = get("/credits/summary", {"X-Panel-Token": tok})
 check("面板会话 -> 200", st == 200, st)
-st, body = get("/settings/reveal?id=probe-key", {"X-Panel-Token": tok})
+st, body = get("/accounts/export?secrets=1", {"X-Panel-Token": tok})
 msg = ""
 try:
     msg = ((json.loads(body).get("error") or {}).get("message") or "")
 except Exception:
     pass
-check("默认密码下取明文 Key -> 非 200 且带可读 message（不是遮罩）：实测 %s" % st,
-      st in (403, 404) and len(msg) > 0, (st, body[:120]))
+check("有效面板会话也不能取 HTTP 凭证备份", st == 403 and bool(msg), st)
 st, _ = get("/settings/reveal")
 check("无面板会话取明文 Key -> 401（与 403 语义分离）", st == 401, st)
 srv.shutdown()

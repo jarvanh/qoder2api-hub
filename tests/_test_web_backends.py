@@ -334,6 +334,7 @@ class WebBackendTests(unittest.TestCase):
         thread.start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
+        S.set_panel_password(self.path, "fixture-panel-password")
         token = P.PANEL.create()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         def call(body, authenticated=True):

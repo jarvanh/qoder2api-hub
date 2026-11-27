@@ -3379,6 +3379,14 @@ class Account(object):
                     "failure_code": failure, "replayed": False,
                     "redemption_code": code,
                     "message": _CAMPAIGN_FAILURE_CN[failure], "raw": r}
+        benefit = r.get("benefit")
+        amount = benefit.get("amount") if isinstance(benefit, dict) else None
+        if amount is None:
+            amount = r.get("amount")
+        try:
+            amount = max(0, int(amount)) if amount is not None else None
+        except (TypeError, ValueError, OverflowError):
+            amount = 0  # malformed receipt is not evidence of a positive grant
         return {
             "ok": not failure and r.get("success") is not False
                   and status in ("CLAIMED", "GRANTED", "SUCCESS"),
@@ -3388,8 +3396,8 @@ class Account(object):
             "grant_id": str(r.get("grantId") or ""),
             "redemption_code": code,
             "confirming": bool(status == "CLAIMED" and not code),
-            "amount": int(((r.get("benefit") or {}) if isinstance(r.get("benefit"), dict)
-                           else {}).get("amount") or r.get("amount") or 0),
+            "amount": amount if amount is not None else 0,
+            "amount_reported": amount is not None,
             "message": ("已领取" if r.get("replayed") else "领取成功")
                        + (("，兑换码：%s" % code) if code else
                           ("，兑换码发放确认中" if status == "CLAIMED" else "")),
@@ -3502,7 +3510,11 @@ class Account(object):
                 continue      # 同人已领（冷却中）：不再重复 POST
             res = self.claim_campaign(cid)
             if res.get("ok"):
-                amount = res.get("amount") or c["benefit"]["amount"] or 0
+                amount = res.get("amount")
+                # 上游 v1.10.3：amount 缺失或未上报时回退活动档位金额；
+                # 老字段访问从 c["benefit"] 改为安全取值，防活动缺 benefit。
+                if amount is None or res.get("amount_reported") is False:
+                    amount = (c.get("benefit") or {}).get("amount") or 0
                 if res.get("replayed"):
                     # 2026-11-01：replay 不在此记奖励 —— 当日已记过会重复
                     # 累加，统一走函数尾部 already 回填（有当日守卫）。
@@ -3562,8 +3574,11 @@ class Account(object):
             elif not self._checkin_stamped_today():
                 self._stamp_checkin()
         if claimed:
-            msg = "活动领取成功 +%d Credits（%s）" % (
-                earned, "、".join(self.campaign_label(c) for c in claimed))
+            labels = "、".join(self.campaign_label(c) for c in claimed)
+            if earned == 0 and only_kinds == ("", "CREDITS"):
+                msg = "上游确认处理（%s），本次未新增积分" % labels
+            else:
+                msg = "活动领取成功 +%d Credits（%s）" % (earned, labels)
         elif blocked:
             msg = ("同人已领取：同一设备/身份下的其他账号本轮已领过（服务端按人去重，"
                    "failureCode=%s）" % blocked[0].get("failure_code"))
@@ -5275,13 +5290,13 @@ def _roaming_app_dir(cfg):
     return os.path.join(base, cfg["app_dir"])
 
 
-def _load_app_auth(realm):
-    """解出桌面 App auth.v1.dat 的明文 dict；失败抛异常。"""
+def _load_app_auth(realm, path=None):
+    """解出桌面 App auth.v1.dat；终端导入用所选文件同目录的 Local State。"""
     from qoder_sign import chromium_decrypt_v10
     cfg = get_realm_config(realm)
-    app_dir = _roaming_app_dir(cfg)
+    app_dir = os.path.dirname(path) if path else _roaming_app_dir(cfg)
     key = _read_chromium_os_crypt_key(app_dir)
-    with open(os.path.join(app_dir, "auth.v1.dat"), "rb") as fh:
+    with open(path or os.path.join(app_dir, "auth.v1.dat"), "rb") as fh:
         blob = fh.read()
     plain = chromium_decrypt_v10(blob, key)
     data = json.loads(plain.decode("utf-8"))
@@ -5429,43 +5444,71 @@ def scan_desktop_credentials():
 
 
 def import_desktop_credential(path=None, realm=None):
-    """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。"""
-    if not path:
+    """Only import valid candidates returned by the server-side scanner."""
+    if path is not None and (not isinstance(path, str) or not path or "\x00" in path):
+        raise ValueError("select a credential found by the server scanner")
+    candidates = [item for item in scan_desktop_credentials() if item.get("valid")]
+    if path is None:
         imported, errors = [], []
-        for item in scan_desktop_credentials():
-            if not item.get("valid"):
-                continue
+        for item in candidates:
             try:
-                imported.append(import_desktop_credential(
-                    path=item["path"], realm=item["realm"]))
+                imported.append(_import_scanned_desktop_credential(item))
             except Exception as exc:
                 errors.append("%s/%s: %s" % (item["realm"], item["file"], exc))
         if errors:
             raise RuntimeError("; ".join(errors[:3]))
         return imported
 
-    # 定位该 path 归属的 realm（按扫描结果匹配；否则按目录名猜）
-    target_realm = realm
-    matched = None
-    for item in scan_desktop_credentials():
-        if os.path.abspath(item["path"]) == os.path.abspath(path):
-            matched = item
-            target_realm = item["realm"]
-            break
-    if target_realm not in REALM_CONFIGS:
-        target_realm = "cn"
-    imported_vpc = matched.get("vpcEndpoint") if matched else _cli_path_vpc(
-        target_realm, os.path.dirname(path))
+    # Compare by path, but open the server-discovered path, never the input.
+    def path_key(value):
+        return os.path.normcase(os.path.abspath(value))
+
+    wanted = path_key(path)
+    for item in candidates:
+        if path_key(item["path"]) == wanted:
+            if realm is not None and realm != item["realm"]:
+                break
+            return _import_scanned_desktop_credential(item)
+    raise ValueError("select a credential found by the server scanner")
+
+
+def import_local_credential_file(path, realm, kind="cli"):
+    """Terminal-only custom file import, intentionally never called by HTTP."""
+    if realm not in REALM_CONFIGS or kind not in ("app", "cli"):
+        raise ValueError("choose a valid credential format and realm")
+    if not path or path.startswith(("//", "\\")) or "://" in path:
+        raise ValueError("choose a regular file on the gateway filesystem")
+    path = Path(path).expanduser().resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        if not re.fullmatch(r"[A-Za-z]:\\", path.anchor) or ctypes.windll.kernel32.GetDriveTypeW(path.anchor) == 4:
+            raise ValueError("network drives and UNC paths are not supported")
+    if not path.is_file():
+        raise ValueError("credential path must name a regular file")
+    # VPC identity comes from the configured scanner or explicit account
+    # settings, not from the name of an arbitrary local directory.
+    return _import_desktop_file(str(path), realm, kind, None, custom=True)
+
+
+def _import_scanned_desktop_credential(item):
+    return _import_desktop_file(item["path"], item["realm"], item["kind"], item.get("vpcEndpoint"))
+
+
+def _import_desktop_file(path, target_realm, kind, imported_vpc, *, custom=False):
     cfg = realm_config_for(target_realm, imported_vpc)
+    if custom:
+        companion_name = "Local State" if kind == "app" else "machine_id"
+        companion = Path(path).with_name(companion_name)
+        if companion.is_symlink() or (companion.exists() and not companion.is_file()):
+            raise ValueError("credential companion must be a regular file in the same directory")
 
     token = refresh = ""
     uid = nickname = ""
     user_type = DEFAULT_USER_TYPE
     org_id = org_name = ""
     exp = 0
-    base = os.path.basename(path)
-    if base == "auth.v1.dat":
-        data = _load_app_auth(target_realm)
+    if kind == "app":
+        data = _load_app_auth(target_realm, path=path) if custom else _load_app_auth(target_realm)
         token = str(data.get("token") or "")
         refresh = str(data.get("refreshToken") or "")
         user = data.get("user") or {}
@@ -5542,7 +5585,13 @@ def account_to_export(account):
     return data
 
 
-def build_export_document(accounts, realm=None, include_secrets=True, uids=None):
+# Metadata exports use an allowlist: arbitrary notes and upstream response
+# objects must not become part of a credential-free inventory.
+_EXPORT_METADATA_FIELDS = ("uid", "nickname", "group", "domain", "realm",
+                           "vpcEndpoint", "platform", "expiresAt", "addedAt", "source", "enabled")
+
+
+def build_export_document(accounts, realm=None, include_secrets=False, uids=None):
     wanted = None
     if uids is not None:
         wanted = {str(u) for u in uids}
@@ -5553,11 +5602,8 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
         if wanted is not None and account.uid not in wanted:
             continue
         row = account_to_export(account)
-        if not include_secrets:
-            row.pop("accessToken", None)
-            row.pop("refreshToken", None)
-            row.pop("personalToken", None)
-        rows.append(row)
+        rows.append(row if include_secrets else
+                    {key: row[key] for key in _EXPORT_METADATA_FIELDS if key in row})
     return {
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,

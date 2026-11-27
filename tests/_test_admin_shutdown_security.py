@@ -10,6 +10,8 @@ os.environ.pop("QD_SHUTDOWN_DISABLE", None)
 P, A = bootstrap()
 import qoder_settings as ST
 P.PANEL = ST.PanelSessions(lambda: os.environ["ACCOUNTS_DIR"])
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+ST.set_panel_password(P.ACCOUNTS_DIR, "fixture-panel-password")
 TOKEN = P.PANEL.create()
 P.log = lambda *a, **k: None
 declare_suite(__file__, ["qoder_proxy.py"])

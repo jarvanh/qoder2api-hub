@@ -4175,6 +4175,7 @@ import http.server as _hs38
 import threading as _th38
 import urllib.error as _ue38
 import urllib.request as _ur38
+import tempfile as _tf38
 
 _FC38 = []                                   # fetch_credits 桩计数（命门）
 _ORIG_FETCH38 = A.Account.fetch_credits
@@ -4187,7 +4188,11 @@ def _stub_fetch38(self, *a, **k):
 
 A.Account.fetch_credits = _stub_fetch38
 _ORIG_G38 = {_k: getattr(P, _k, None)
-             for _k in ("POOL", "API_KEY", "API_KEY_FILE_SET")}
+             for _k in ("POOL", "API_KEY", "API_KEY_FILE_SET", "ACCOUNTS_DIR", "PANEL")}
+_D38 = _tf38.TemporaryDirectory(prefix="qd-panel-38-")
+P.ACCOUNTS_DIR = _D38.name
+P.PANEL = P.qoder_settings.PanelSessions(lambda: P.ACCOUNTS_DIR)
+P.qoder_settings.set_panel_password(P.ACCOUNTS_DIR, "fixture-panel-password")
 
 
 class _Pool38(object):
@@ -4352,6 +4357,7 @@ finally:
     A.Account.fetch_credits = _ORIG_FETCH38
     for _k, _v in _ORIG_G38.items():
         setattr(P, _k, _v)
+    _D38.cleanup()
 
 print()
 print("[40] P0-1 事实性限额护栏：配置层 A1-A5 + 守卫方法 B1-B6（判据照抄文档 §5.1/§5.2）")

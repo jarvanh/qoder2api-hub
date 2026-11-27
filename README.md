@@ -45,12 +45,14 @@ cd qoder2api-hub
 启动后：
 
 - **API**：`http://127.0.0.1:8790/v1`
-- **看板**：`http://127.0.0.1:8790/`，默认密码 `admin`，首次登录后请到「设置」修改
+- **看板**：`http://127.0.0.1:8790/`；首次运行请先在服务器终端执行 `python qoder_proxy.py --set-panel-password`。Docker 用户运行 `docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password`。
 
 在看板「账号」页点 **+ 添加账号 (OAuth)**，到浏览器里完成授权，账号就加好了。
 
-> Docker 以局域网模式启动，会强制使用 API Key。首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看。
+> Docker Compose 默认只向宿主机回环地址发布端口；容器内强制使用 API Key。若未指定推理 Key，首次启动会生成并保存在服务器配置里；可在登录面板后管理 API Key。
 > 局域网共享、改端口、出口代理见[部署](docs/deployment.md)。
+
+发现安全问题请通过[私下报告渠道](SECURITY.md)联系维护者，不要提交到公开 Issue。
 
 ## 接入客户端
 

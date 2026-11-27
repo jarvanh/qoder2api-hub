@@ -1766,6 +1766,7 @@ MODEL_ALIASES = {
     "qmodel_preview": "qmodel_38max",          # 旧 key -> 新 key
     "qwen3.8-flash": "qfmodel",
     "qwen3.7-max": "qmodel_latest",
+    "qwen4-max": "qmodel_latest",
     "qwen3.7-plus": "qmodel",
     "qwen3.7-flash": "q37fmodel",
     "qwen3.6-flash": "q36fmodel",

@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="qd-account-vpc-") as root:
     pool.add(b)
     pool.add(public)
     for acc in (a, b, public):
-        doc = A.build_export_document([acc])
+        doc = A.build_export_document([acc], include_secrets=True)
         normalized = A.normalise_import_row(doc["accounts"][0])
         restored = A.Account(normalized)
         check(acc.uid + " export/import preserves override", restored.vpc_override == acc.vpc_override)
@@ -154,6 +154,8 @@ with tempfile.TemporaryDirectory(prefix="qd-account-vpc-") as root:
     P.API_KEY = ""
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), P.Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    P.ACCOUNTS_DIR = root
+    P.qoder_settings.set_panel_password(root, "fixture-panel-password")
     panel = P.PANEL.create()
     def post(path, payload):
         req = urllib.request.Request("http://127.0.0.1:%s%s" % (server.server_port, path),
@@ -193,6 +195,13 @@ with tempfile.TemporaryDirectory(prefix="qd-vpc-home-") as home, tempfile.Tempor
         check("scan visits configured instance only", len(candidates) == 1 and candidates[0]["vpcEndpoint"] == "fixture-a")
         imported = A.import_desktop_credential(candidates[0]["path"], realm="cn")
         check("CLI import preserves path instance", imported.vpc_endpoint == "fixture-a")
+        with mock.patch.object(A, "_import_scanned_desktop_credential") as loader:
+            check("unlisted paths cannot enter the desktop credential reader",
+                  rejected(lambda: A.import_desktop_credential(os.path.join(home, "unlisted")))
+                  and not loader.called)
+            check("caller cannot override server-discovered realm",
+                  rejected(lambda: A.import_desktop_credential(candidates[0]["path"], realm="intl"))
+                  and not loader.called)
 
 # Model discovery and inference must reach each selected account's gateway,
 # including the redirect-aware transport, not just return correct cfg strings.

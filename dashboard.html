@@ -3602,7 +3602,9 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
     <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px"></div>
     <button onclick="submitPanelLogin()" style="width:100%;padding:9px 12px;font-size:13px">进入面板</button>
     <div id="panelDefaultHint" style="display:none;font-size:11px;color:var(--warn);margin-top:12px">
-      当前仍在使用默认密码 <b>admin</b>，登录后请在「设置」中修改。
+      面板尚未设置密码。请在服务器终端执行下方命令，然后刷新本页。
+      <div><code>python qoder_proxy.py --set-panel-password</code></div>
+      <div><code>docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password</code></div>
     </div>
   </div>
 </div>
@@ -3813,7 +3815,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
     <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描本地凭证</button>
     <button class="sec" onclick="openPatImport()">导入 PAT</button>
     <button class="sec" onclick="openImport()">导入账号</button>
-    <button class="sec" onclick="exportAccounts(this)">导出账号</button>
+    <button class="sec" onclick="exportAccounts(this)" title="仅导出元数据，不含账号凭证">导出账号元数据</button>
     <span class="tb-sep" aria-hidden="true"></span>
     <div class="menu-wrap">
       <button class="sec" onclick="toggleBulkMenu(event)">批量操作 ▾</button>
@@ -4124,7 +4126,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 
     <section>
       <h2>面板访问密码 <em id="setPwdState"></em></h2>
-      <div style="font-size:12px;color:var(--dim);margin-bottom:12px">用于打开本看板。默认密码为 <b>admin</b>，建议立即修改。</div>
+      <div style="font-size:12px;color:var(--dim);margin-bottom:12px">密码独立于 API Key。修改后，其他会话需要重新登录。</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
         <div style="flex:1;min-width:180px">
           <div style="font-size:12px;color:var(--dim);margin-bottom:4px">当前密码</div>
@@ -4133,7 +4135,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         </div>
         <div style="flex:1;min-width:180px">
           <div style="font-size:12px;color:var(--dim);margin-bottom:4px">新密码</div>
-          <input id="setPwdNew" type="password" placeholder="至少 4 位"
+          <input id="setPwdNew" type="password" placeholder="至少 12 个字符" autocomplete="new-password"
                  style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
         </div>
         <button onclick="savePanelPassword(this)">修改密码</button>
@@ -4293,6 +4295,16 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         </label>
         <div class="hint" style="margin-top:6px">没有自定义系统提示词时，勾选后请求将省略 Qoder 的默认提示词。</div>
         <button type="button" style="margin-top:12px" onclick="saveSystemPromptSettings()">保存并应用</button>
+      </fieldset>
+    </section>
+    <section id="sectionIdentityGuard">
+      <h2>出站身份句守卫 <em id="setIdentityGuardState"></em></h2>
+      <fieldset id="setIdentityGuardForm" disabled style="border:0;padding:0;margin:0;min-width:0">
+        <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px">
+          <input type="checkbox" id="setIdentityGuard"><span>中和第三方 Agent 品牌身份句</span>
+        </label>
+        <div class="hint" style="margin-top:6px">上游（2026-11-23 起）对 system 中 <code>You are 品牌名,</code> / <code>powered by 品牌名.</code> 这类身份句（如 ZCode / Claude Code / Codex / DeepSeek Harness）返回 10605 硬拒绝（p1 队列、等待不放行），第三方 Agent 客户端因此报错。开启后用通用正则匹配任意大写品牌名，仅在命中片段内插入一个空格打断匹配，品牌名与语义保留，其余文本零改动。环境变量 <code>QD_IDENTITY_GUARD</code> 优先于本开关。</div>
+        <button type="button" style="margin-top:12px" onclick="saveIdentityGuardSettings()">保存并应用</button>
       </fieldset>
     </section>
     <section id="sectionLimits">
@@ -6448,7 +6460,10 @@ function renderActivity(rows, summary){
         return '<tr' + _stagger(i) + '><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
           + '<td>' + esc(kindName(r.kind)) + '</td>'
           + '<td>' + esc(r.nickname || r.uid || "") + '</td>'
-          + '<td>' + (r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>') + '</td>'
+          + '<td>' + (!r.ok ? '<span class="badge bad">失败</span>'
+            : (r.kind === 'checkin' && !(Number(r.amount) > 0)
+              ? '<span class="badge warn">' + (r.outcome === 'already_claimed' ? '已领取' : '未新增积分') + '</span>'
+              : '<span class="badge ok">成功</span>')) + '</td>'
           + '<td style="text-align:right">' + fmt(r.amount) + '</td>'
           + '<td class="insight-detail">' + esc(r.detail || "") + '</td></tr>';
       }).join("")
@@ -6614,7 +6629,7 @@ function checkinOutcome(x){
   const claimedList = (Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []))
     .filter(v => typeof v === 'string' && v);
   const earned = Number(x.earned_credit || 0);
-  if(claimedList.length || raw === true || earned > 0){
+  if(earned > 0 || (!Object.prototype.hasOwnProperty.call(x, 'state') && (claimedList.length || raw === true))){
     const text = detail || ('领取成功' + (earned > 0 ? ' +' + earned + ' 积分' : '') +
       (claimedList.length ? '（' + claimedList.join('、') + '）' : ''));
     return { state: 'claimed', name: name, text: name + ': ' + text };
@@ -6657,7 +6672,8 @@ async function doCheckin(btn){
     if(!res.length) toast("未发现可签到账号", "warn");
     else {
       const rows = res.map(checkinOutcome);
-      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
+      const total = r.credit_added ?? res.reduce((n, x) => n + Number(x.earned_credit || 0), 0);
+      toast('每日签到：本次新增 ' + total + ' 积分；' + checkinToastText(rows), checkinToastKind(rows));
     }
     await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
     await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
@@ -6687,37 +6703,22 @@ function card(k, v, sub, cls){
 }
 
 /* ---- api key handling ---- */
-const KEY_STORE = 'wb-proxy-api-key';
 const PANEL_STORE = 'wb-proxy-panel-token';
-let API_KEY = '';
 let PANEL_TOKEN = '';
-try { PANEL_TOKEN = sessionStorage.getItem(PANEL_STORE) || localStorage.getItem(PANEL_STORE) || ''; } catch(e) { PANEL_TOKEN = ''; }
+try {
+  PANEL_TOKEN = sessionStorage.getItem(PANEL_STORE) || localStorage.getItem(PANEL_STORE) || '';
+  localStorage.removeItem('wb-proxy-api-key');
+  const url = new URL(window.location.href);
+  if(url.searchParams.has('key') || url.searchParams.has('pwd')){
+    url.searchParams.delete('key');
+    url.searchParams.delete('pwd');
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+  }
+} catch(e) {}
 let PANEL_STATUS = {};
-(function initKey(){
-  try {
-    const fromUrl = new URLSearchParams(window.location.search).get('key');
-    if(fromUrl){
-      API_KEY = fromUrl.trim();
-      localStorage.setItem(KEY_STORE, API_KEY);
-      history.replaceState(null, '', window.location.pathname);
-    } else {
-      API_KEY = (localStorage.getItem(KEY_STORE) || '').trim();
-    }
-  } catch(e){ API_KEY = ''; }
-})();
-
-// A key with non-ASCII characters cannot go into an HTTP header at all: fetch
-// throws "String contains non ISO-8859-1 code point" before the request is
-// sent. Such a value is never a real gateway key, so drop it and let the panel
-// session carry the request.
-function usableKey(value){
-  return value && /^[\x20-\x7e]+$/.test(value) ? value : '';
-}
 
 function authHeaders(base){
   const h = Object.assign({}, base || {});
-  const key = usableKey(API_KEY);
-  if(key) h['Authorization'] = 'Bearer ' + key;
   if(PANEL_TOKEN) h['X-Panel-Token'] = PANEL_TOKEN;
   return h;
 }
@@ -7367,7 +7368,10 @@ async function downloadExport(query, fallbackLabel){
     try{ const e = await r.json(); msg = (e.error && e.error.message) || msg; }catch(_){}
     throw new Error(msg);
   }
-  if(!r.ok) throw new Error('HTTP ' + r.status);
+  if(!r.ok){
+    const e = await r.json().catch(() => ({}));
+    throw new Error((e.error && e.error.message) || 'HTTP ' + r.status);
+  }
   const text = await r.text();
   let doc;
   try{ doc = JSON.parse(text); }catch(e){ throw new Error('返回内容不是 JSON'); }
@@ -7385,20 +7389,19 @@ async function downloadExport(query, fallbackLabel){
 async function exportAccounts(btn){
   if(btn){ btn.disabled = true; btn.textContent = '导出中...'; }
   try{
-    const r = await downloadExport('', '');
+    const r = await downloadExport('?secrets=0', 'metadata-');
     toast('已导出 ' + r.count + ' 个账号 → ' + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '导出账号'; }
+    if(btn){ btn.disabled = false; btn.textContent = '导出账号元数据'; }
   }
 }
 
 async function exportOne(uid){
-  // Same document format as the bulk export, just narrowed to one account, so
-  // the file can be re-imported on another instance without editing.
+  // Browser downloads deliberately exclude credentials and cannot restore login.
   try{
-    const r = await downloadExport('?uid=' + encodeURIComponent(uid), uid.slice(0,8) + '-');
+    const r = await downloadExport('?secrets=0&uid=' + encodeURIComponent(uid), 'metadata-' + uid.slice(0,8) + '-');
     toast('已导出 1 个账号 → ' + r.name);
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
@@ -7791,7 +7794,13 @@ function effortCell(r){
   const hasEff = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort');
   const req = hasReq ? String(r.reasoning_effort_requested || '') : '';
   const eff = hasEff ? String(r.reasoning_effort || '') : '';
-  if(!hasReq && !hasEff) return '<span style="color:var(--dim)" title="这一行没有档位字段（旧行，或客户端未请求该参数）">—</span>';
+  if(!hasReq && !hasEff){
+    const labels = {budget_unsupported: '预算未映射', enabled_default: '已请求启用，沿用模型默认',
+                    unrecognized: '未识别的思考参数'};
+    if(Object.prototype.hasOwnProperty.call(labels, r.reasoning_intent))
+      return '<span class="badge warn">' + esc(labels[r.reasoning_intent]) + '</span>';
+    return '<span style="color:var(--dim)" title="这一行没有档位字段（旧行，或客户端未请求该参数）">—</span>';
+  }
   if(hasEff && eff === ''){
     return '<span class="badge bad" title="客户端请求 ' + esc(req || '?') + '，归一化后未下发给上游（模型无档位表或被丢弃）">' + mono(req || '?') + ' → 未下发</span>';
   }
@@ -8129,9 +8138,6 @@ async function submitPanelLogin(){
     const pDash = startDashboard();
     panelHideGate();
     toast('已进入面板', 'ok');
-    if(data.using_default_password){
-      toast('当前是默认密码 admin，建议到「设置」里修改', 'warn');
-    }
     await pDash;
   } catch(e) {
     if(btn){
@@ -8159,19 +8165,12 @@ async function bootPanel(){
     PANEL_STATUS = await r.json().catch(() => ({}));
   } catch(e) { PANEL_STATUS = {}; }
   const hint = document.getElementById('panelDefaultHint');
-  if(hint && PANEL_STATUS.panel_password_is_default) hint.style.display = 'block';
+  if(hint) hint.style.display = PANEL_STATUS.panel_password_is_default ? 'block' : 'none';
   if(PANEL_STATUS.authenticated){
     panelHideGate();
     await startDashboard();
   } else {
-    const pwdFromUrl = new URLSearchParams(window.location.search).get('pwd');
-    if(pwdFromUrl){
-      const input = document.getElementById('panelPwdInput');
-      if(input) input.value = pwdFromUrl;
-      await submitPanelLogin();
-    } else {
-      panelNeedsLogin();
-    }
+    panelNeedsLogin();
   }
 }
 
@@ -8245,6 +8244,19 @@ async function loadSettings(showToast){
       document.getElementById('setOmitDefaultSystemPrompt').checked = SYSTEM_PROMPT_CONFIRMED;
       promptForm.disabled = false;
     }
+    // 出站身份句守卫回显（上游 10605 品牌检测对策，默认关）
+    const igForm = document.getElementById('setIdentityGuardForm');
+    const igBox = document.getElementById('setIdentityGuard');
+    const igState = document.getElementById('setIdentityGuardState');
+    if(igForm && igBox && typeof data.identity_guard === 'boolean'){
+      igBox.checked = data.identity_guard;
+      // QD_IDENTITY_GUARD 固定时，面板开关保存了也不生效：只读展示，避免被当成保存失败
+      const igPinned = data.identity_guard_env === 'on' || data.identity_guard_env === 'off';
+      igForm.disabled = igPinned;
+      if(igState) igState.textContent = igPinned
+        ? (data.identity_guard ? '（由环境变量固定为开启）' : '（由环境变量固定为关闭）')
+        : (data.identity_guard ? '（已开启）' : '（已关闭）');
+    }
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
     const teBox = document.getElementById("setToolEcho");
     const teState = document.getElementById("setToolEchoState");
@@ -8254,7 +8266,7 @@ async function loadSettings(showToast){
       : ("（" + (data.tool_echo_mode || "strict") + "）");
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
-      pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
+      pwdState.textContent = data.panel_password_is_default ? '(尚未设置)' : '(已自定义)';
       pwdState.style.color = data.panel_password_is_default ? 'var(--warn)' : 'var(--accent2)';
     }
     const keyState = document.getElementById('setKeyState');
@@ -8320,6 +8332,27 @@ async function saveSystemPromptSettings(){
   }finally{
     ++SYSTEM_PROMPT_READ_ID;
     SYSTEM_PROMPT_SAVING = false;
+    form.disabled = false;
+  }
+}
+
+// 出站身份句守卫保存（独立于系统提示词设置，互不覆盖）
+async function saveIdentityGuardSettings(){
+  const form = document.getElementById('setIdentityGuardForm');
+  const checkbox = document.getElementById('setIdentityGuard');
+  if(!form || !checkbox || form.disabled) return;
+  const enabled = checkbox.checked;
+  form.disabled = true;
+  try{
+    const result = await postJSON('/settings/save', {identity_guard: enabled});
+    if(result.identity_guard !== enabled) throw new Error(t('未确认身份句守卫设置'));
+    checkbox.checked = result.identity_guard;
+    const state = document.getElementById('setIdentityGuardState');
+    if(state) state.textContent = result.identity_guard ? '（已开启）' : '（已关闭）';
+    toast('身份句守卫设置已保存', 'ok');
+  }catch(e){
+    toast('保存失败: ' + e.message, 'bad');
+  }finally{
     form.disabled = false;
   }
 }

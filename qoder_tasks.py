@@ -744,7 +744,10 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     if camp.get("claimed"):
         keys = "、".join(qoder_accounts.campaign_label(c) for c in camp["claimed"])
         earned = int(camp.get("earned") or 0)
-        logs.append(f"✓ [{name}] 活动领取成功 +{earned} Credits（{keys}）")
+        if only_daily and not earned:
+            logs.append(f"— [{name}] 上游确认处理（{keys}），本次未新增积分")
+        else:
+            logs.append(f"✓ [{name}] 活动领取成功 +{earned} Credits（{keys}）")
         for item in camp.get("codes") or []:
             logs.append(f"🎟 [{name}] {item['campaign']} 兑换码：{item['code']}"
                         f"（官方活动页可扫码兑换）")
@@ -818,6 +821,8 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         return {"ok": True, "logs": logs, "earned_credit": earned,
                 "credits": account.credits, "campaign": camp.get("message"),
                 "message": camp.get("message"),
+                "state": ("claimed" if earned > 0 else "already_claimed"
+                          if camp.get("already") or camp.get("blocked") else "no_credit"),
                 "claimed": [qoder_accounts.campaign_label(c)
                             for c in camp.get("claimed") or []],
                 # issue #130：上游按人去重时的原始码（本轮无需再领，已盖签到章）
@@ -833,7 +838,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         if res2.get("unavailable") or res2.get("disabled"):
             logs.append(f"— [{name}] {res2.get('msg')}，本次跳过")
             return {"ok": True, "logs": logs, "earned_credit": 0,
-                    "credits": account.credits,
+                    "credits": account.credits, "state": "no_credit", "message": res2.get("msg"),
                     "unavailable": bool(res2.get("unavailable")),
                     "disabled": bool(res2.get("disabled"))}
         if res2.get("already"):
@@ -853,7 +858,9 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         logs.append(f"  当前额度余额: {remain}")
     account.fetch_plan()
     return {"ok": True, "logs": logs, "earned_credit": earned,
-            "credits": account.credits}
+            "credits": account.credits, "message": res2.get("msg"),
+            "state": ("claimed" if earned > 0 else "already_claimed"
+                      if res2.get("already") else "no_credit")}
 
 
 # Pro 升级包一次性奖励面额：上游 eligibility/claim 目前不回传金额，故此处兜底；

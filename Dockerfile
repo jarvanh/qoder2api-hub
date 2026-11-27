@@ -47,6 +47,7 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_anthropic.py qoder_anthropic_web.py qoder_agents.py qoder_updater.py \
      qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_official_web.py qoder_web_response.py qoder_external_web.py qoder_session_cache.py \
      qoder_keepalive.py qoder_images.py qoder_cache.py qoder_admin.py qoder_routing.py qoder_logpaths.py \
+     qoder_identity_guard.py \
      dashboard.html baseprompt.json ./
 
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
@@ -81,9 +82,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # 读环境变量），所以 docker run -e PORT=9000 与 compose 的 environment 真的生效；
 # 需要附带其它命令行参数时用 compose 的 command: 覆盖本 CMD。
 #
-# --lan 是有意的（wb 修过的真实事故：端口发布到宿主网络而 Key 校验默认关闭，
-# 等于把上游额度向全网段裸奔）：--lan 监听全部网卡并**强制**生成随机 Key——
-# 首次写入 ./accounts/settings.json 并打印在启动日志（docker logs 里 grep -i
-# "api key" 可查）。显式传了 API_KEY 环境变量时仍以它为准（--api-key 默认读
-# 环境变量，argparse 的显式值优先级最高）。
+# --lan 令容器在 bridge 网络可达并要求 API Key；不要将容器端口发布到所有
+# 宿主机接口。随附 Compose 默认只发布到 127.0.0.1。面板须在服务端终端
+# 用 --set-panel-password 设置独立密码，镜像不内置可用面板口令。
 CMD ["python", "qoder_proxy.py", "--lan"]

@@ -77,6 +77,8 @@ if (api) {
   check("checkinOutcome：earned=0 且无 claimed -> idle（不报签到成功）",
     api.checkinOutcome({ uid: 'b', ok: true, earned_credit: 0, claimed: [] }).state === 'idle'
     && !/签到成功/.test(api.checkinOutcome({ uid: 'b', ok: true, earned_credit: 0, claimed: [] }).text));
+  check("checkinOutcome：上游确认处理但新增为零时不用绿色成功色",
+    api.checkinToastKind([api.checkinOutcome({ ok: true, state: 'no_credit', claimed: ['daily'], earned_credit: 0 })]) === 'warn');
   check("checkinOutcome：ok=false -> failed",
     api.checkinOutcome({ uid: 'c', ok: false, error: 'x' }).state === 'failed');
   check("checkinToastKind：有到账 -> ok（成功色只在真到账时）",

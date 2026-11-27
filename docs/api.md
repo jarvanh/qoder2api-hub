@@ -5,7 +5,7 @@
 | 标记 | 含义 |
 |---|---|
 | 公开 | 不需要任何凭证 |
-| Key | 需要 API Key（`Authorization: Bearer`、`x-api-key` 或 `?key=`）。没有配置任何 Key 时也可以访问。已登录的面板会话同样可以访问 |
+| Key | 需要 API Key（`Authorization: Bearer` 或 `x-api-key`）。仅回环监听且未配置 Key 时可直接访问。已登录的面板会话同样可以访问 |
 | 面板 | 需要面板会话：先调用 `POST /panel/login` 拿到 token，之后在请求头 `X-Panel-Token` 中带上 |
 
 ## 推理
@@ -21,6 +21,8 @@
 
 - 指定区域：使用 `X-Realm: cn|intl` 请求头，或 `?realm=cn|intl` 查询参数；普通推理 JSON 中的 `realm` 不参与路由。Key 的区域绑定优先于请求头/查询参数，需核对实际响应区域。`/diag/queue` 的 JSON `realm` 是该诊断接口显式支持的例外，不应推广到推理接口。
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
+- Chat Completions 请求已知目录模型时，如果上游仅回报通用标签 `auto`，响应 `model` 回显请求名。上游明确回报的其他模型名不会改写，未知/BYOK 和自动路由模型也不会改写；用量中的 `upstream_model_key` 和 `resolved_model` 始终独立记录。
+- Chat Completions 与 Responses 支持命名思考档位和显式关闭（例如 `enable_thinking: false`）。仅指定启用时沿用模型默认值；Token 预算不猜测成档位。最近请求的 `reasoning_intent` 区分未传、命名档位、关闭、默认启用、预算未映射和未识别参数；实际消耗的 `reasoning_tokens` 与请求意图是不同指标。
 
 ## 额度构成与端点自动探测
 
@@ -157,7 +159,7 @@ curl -sS -X POST 'http://HOST/diag/queue' \
 | POST | `/panel/login`、`/panel/logout`、`/panel/password` | 登录、登出、修改面板密码（公开） |
 | GET / POST | `/settings`、`/settings/save` | 读取 / 保存设置（API Key、限额、模型闸门等） |
 | GET | `/settings/reveal?id=` | 读取某个 Key 的明文（面板还在用默认密码时返回 403） |
-| POST | `/realm` | 切换全局出口（有 Key 即可） |
+| POST | `/realm` | 切换全局出口（仅面板会话可以修改） |
 | GET | `/logs`、`/logs/export`；POST `/logs/clear` | 运行日志 |
 | GET | `/update/check` | 检查 GitHub 上是否有新版本 |
 | POST | `/admin/shutdown` | 关闭网关进程，见下节 |
@@ -196,12 +198,15 @@ SIGTERM 相同的收尾路径：`server_close()` → atexit（pid 文件清理�
 | GET | `/accounts` | 账号列表 |
 | POST | `/accounts/login/start`、GET `/accounts/login/poll`、POST `/accounts/login/cancel` | OAuth 设备授权 |
 | POST | `/accounts/import/pat` | 导入 PAT |
-| POST | `/accounts/import/desktop` | 请求体为 `{}` 时只扫描本机凭证；带 `{"path": ...}` 时导入指定凭证；带 `{"all": true}` 时导入全部 |
-| GET | `/accounts/export`；POST `/accounts/import` | JSON 导出 / 导入 |
+| POST | `/accounts/import/desktop` | 请求体为 `{}` 时只扫描本机凭证；带 `{"path": ...}` 时只允许导入服务器扫描已发现的有效凭证；带 `{"all": true}` 时导入全部 |
+| GET | `/accounts/export` | 仅导出账号元数据；需要面板会话，不提供凭证下载 |
+| POST | `/accounts/import` | 导入账号 JSON；包含凭证的备份需在服务器终端用 `--backup-accounts` 生成 |
 | POST | `/accounts/refresh`、`/accounts/test` | 刷新 Token、测试账号 |
 | POST | `/accounts/set`、`/accounts/set-all`、`/accounts/delete` | 修改、批量修改、删除账号 |
 | GET / POST | `/accounts/credits` | 逐个账号**向上游**查询余额（会请求上游，不要用来轮询） |
-| POST | `/accounts/checkin` | 每日签到（单个或全部账号） |
+| POST | `/accounts/checkin` | 每日签到（单个或全部账号）；返回本轮新增总额 `credit_added` 和逐账号 `state`（`claimed` / `already_claimed` / `no_credit` / `failed`）。HTTP 200 只表示批次得到结果，不等于领取到账 |
+
+国内和国际账号都尝试主动领取官方活动列表标记为可领取的积分项；发放由上游活动与账号资格决定，桌面端显示的活动并不保证同一账号在网关收到相同的可领取项。没有可领取项不会猜测到账或给当前账号补签到章。
 
 ### 签到、调度与用量
 

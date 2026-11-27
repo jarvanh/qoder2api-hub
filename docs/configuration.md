@@ -16,6 +16,7 @@
 python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
                       [--accounts-dir DIR] [--usage-dir DIR]
                       [--panel-password PWD] [--system-prompt TEXT] [--pid-file FILE]
+python qoder_proxy.py [--accounts-dir DIR] (--set-panel-password | --backup-accounts FILE | --import-local-credential FILE)
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -26,7 +27,10 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `--api-key` | `$API_KEY` / `$QD_PROXY_KEY` | 启动级 API Key。看板里一旦配置了 Key，这个参数就不再生效 |
 | `--accounts-dir` | `$ACCOUNTS_DIR` 或 `./accounts` | 账号与设置目录 |
 | `--usage-dir` | `$QD_PROXY_USAGE_DIR` 或 `./usage` | 用量流水目录 |
-| `--panel-password` | — | 启动时设置面板密码 |
+| `--panel-password` | — | 启动时显式设置面板密码；优先使用交互方式，避免参数被记录 |
+| `--set-panel-password` | — | 在服务器终端交互设置或重置面板密码，完成后退出 |
+| `--backup-accounts FILE` | — | 离线写入可恢复账号备份，要求新文件且在账号目录之外 |
+| `--import-local-credential FILE` | — | 终端导入指定文件，配合 `--credential-realm cn/intl` 和 `--credential-format cli/app` |
 | `--system-prompt` | — | 请求没有提供系统提示词时，使用此参数的内容 |
 | `--pid-file` | — | 把进程 PID 写入该文件，退出时删除（`stop-qoder-proxy.bat` 依赖它） |
 
@@ -38,10 +42,14 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 ## 面板密码
 
-- 打开看板需要输入面板密码，默认是 `admin`。它和 API Key 互相独立
-- 密码以 PBKDF2-SHA256 摘要保存，不存明文
-- 登录会话有效期 7 天，网关重启后依然有效；修改密码会让所有已登录的浏览器下线
-- 面板还在用默认密码时，看板不会显示明文 API Key。请先修改密码
+- 面板没有可用的默认密码。新安装或旧安装未设置自定义密码时，所有网络接口上的面板登录均锁定；推理 API 独立，不受面板首设影响。
+- 首设或忘记密码时，在服务器终端运行 `python qoder_proxy.py --set-panel-password`；Docker 下运行 `docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password`。若使用自定义账号目录，请传入同一个 `--accounts-dir`。新密码至少 12 字符，不能使用旧版默认口令。
+- 密码以 PBKDF2-SHA256 摘要保存。已有自定义密码保留；升级后旧会话需重新登录。之后的会话有效期为 7 天，同一密码版本的会话可跨重启，改密码会立即使旧会话失效。
+
+## 设置文件（`accounts/settings.json`）
+
+- 保存任何设置时，网关先读取现有文件再做修改；文件不存在或内容为空时按全新安装处理，带 UTF-8 BOM 也能正常读取。
+- 文件解析失败或读取出错（例如被其他程序占用）时，保存会失败并在界面返回错误，原文件保持不变：网关不会用只含本次修改的配置覆盖整份文件。日志出现 `settings.json is invalid; refusing to overwrite it` 时，请先修复或移走该文件，再重新保存。
 
 ## API Key 与出口绑定
 
@@ -56,12 +64,8 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 **鉴权规则：**
 
-- 只要有任何一个启用中的 Key（或启动时指定了 `--api-key`），`/v1/*` 就必须带 Key
-- 否则不需要 Key，适用于本机单用户场景
-- Key 可以通过以下任一方式传入：
-  - `Authorization: Bearer <key>`
-  - `x-api-key: <key>`（Anthropic 客户端使用）
-  - 查询参数 `?key=<key>`
+- 非回环监听始终要求鉴权，即使旧配置关闭了鉴权；没有可用 Key 时请求会被拒绝。仅回环监听可在未配置 Key 时免鉴权。
+- 使用请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`（Anthropic 客户端使用）；不支持 URL 中的 Key。
 
 ## 模型闸门
 
@@ -227,6 +231,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_TOOL_RESULT_KEEP_TAIL` | `1` | `tail` 模式下保留完整的最后几条 |
 | `QD_TOOLCHOICE_NONE_DROPS_TOOLS` | `0` | 设为 `1` 时，`tool_choice="none"` 的请求会连同 `tools` 一起删掉（旧行为） |
 | `QD_KEEP_TOPLEVEL_IMAGES` | `0` | 设为 `1` 时，图片除了放在消息内容里，还会在请求体顶层再放两份（旧行为，仅供排查。会让多图请求的体积变成 3 倍） |
+| `QD_IDENTITY_GUARD` | `off` | 出站身份句守卫：中和第三方 Agent 品牌身份句，见下文「出站身份句守卫」 |
 
 ### Anthropic 入口
 
@@ -441,3 +446,20 @@ QD_TOOL_ECHO_MODE=lenient
 | `lenient` | **按正常完成收尾**并保留已产出的正文，本轮算完成、可直接继续；日志仍打 WARN、`最近请求` 里有一行 `lenient_tool_echo` 记录 |
 
 lenient 是**折中**：它把「整轮丢失」换成「这一轮没有工具调用、下一轮模型会重新发起」，代价是客户端不知道残片被丢弃了。上游修好输出形态后建议切回 strict。
+
+## 出站身份句守卫（`QD_IDENTITY_GUARD`）
+
+上游网关自 2026-11-23 起，对请求里特定的第三方 Agent 身份句做字面匹配，命中时返回 `10605/RESOURCE_LIMIT`（p1 队列、等待不放行）；这类请求实际上是硬拒绝，不是容量排队。已确认的形态是大小写敏感的 `You are 品牌名,` 与 `powered by 品牌名.`，实验记录见[风控与排队](risk-control-and-queueing.md)。
+
+开关默认关闭，两种方式开启：
+
+- 环境变量 `QD_IDENTITY_GUARD=1`。优先级最高；设置后面板里的开关变为只读。
+- 面板「设置 → 出站身份句守卫」，或 `accounts/settings.json` 里的 `"identity_guard": true`。
+
+开启后，网关在构造上游请求体时处理 `messages` 的全部文本（system、历史消息、多模态文本 part、`reasoning_content`）以及随请求出站的 `chat_context` 副本：命中片段只在标点前插入一个空格，例如 `You are ZCode,` → `You are ZCode ,`。品牌名与语序不变，其余文本逐字节不变，重复处理幂等。自家身份句 `You are Qoder,` 豁免，默认系统提示词与官方逐字节一致。
+
+需要注意：
+
+- 匹配的是字面形态，不区分来源：用户消息、工具结果里的同形文本（包括代码中的字符串字面量）同样会被插入空格。
+- 上游若改用语义识别或新增其他句式，需要重新评估规则；匹配不到的变体不会被处理。
+- 开关切换会改变出站文本，已有会话在上游的提示词缓存前缀会失效一次。

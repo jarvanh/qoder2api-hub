@@ -50,6 +50,10 @@ check('实际空串 → 红底「→ 未下发」（请求了但被丢弃）', /
 check('键缺失 → 「—」（与空串严格区分，不显示「未下发」）',
   /—/.test(api.effortCell({})) && !/未下发/.test(api.effortCell({})));
 check('只有实际值 → 「服务端默认」', /服务端默认/.test(api.effortCell({ reasoning_effort: 'low' })));
+check('预算未映射/明确启用/未知参数拥有独立审计展示',
+  /预算未映射/.test(api.effortCell({ reasoning_intent: 'budget_unsupported' }))
+  && /沿用模型默认/.test(api.effortCell({ reasoning_intent: 'enabled_default' }))
+  && /未识别的思考参数/.test(api.effortCell({ reasoning_intent: 'unrecognized' })));
 
 // —— Key 列四态 ——
 check('缺 key_id → 「历史行未记录 Key」', /历史行未记录 Key/.test(api.keyCell({})));

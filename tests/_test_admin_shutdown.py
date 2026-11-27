@@ -41,6 +41,7 @@ P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
 P.API_KEY = ""
 P.POOL = A.AccountPool(P.ACCOUNTS_DIR, log=lambda *a, **k: None)
 P.PANEL = ST.PanelSessions(lambda: P.ACCOUNTS_DIR)
+ST.set_panel_password(P.ACCOUNTS_DIR, "fixture-panel-password")
 TOKEN = P.PANEL.create()
 
 

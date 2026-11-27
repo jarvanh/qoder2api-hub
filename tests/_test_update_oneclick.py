@@ -68,11 +68,32 @@ with tarfile.open(_tar, "w:gz") as tf:
     with io.open(_ok, "w", encoding="utf-8") as fh:
         fh.write("x")
     tf.add(_ok, arcname="repo-1.0.0/ok.txt")
-_dest = os.path.join(_tmp, "x")
-_root = U._extract(_tar, _dest)
-check("解压过滤路径穿越（.. / 绝对路径）",
-      not os.path.exists(os.path.join(_tmp, "evil.txt"))
-      and os.path.isfile(os.path.join(_root, "ok.txt")))
+def _rejected_archive(archive, destination):
+    try:
+        U._extract(archive, destination)
+    except RuntimeError:
+        return not os.path.exists(destination)
+    return False
+
+check("无效路径在写入前拒绝整个归档", _rejected_archive(_tar, os.path.join(_tmp, "unsafe")))
+for name, kind in (("symlink", tarfile.SYMTYPE), ("hardlink", tarfile.LNKTYPE),
+                   ("fifo", tarfile.FIFOTYPE)):
+    artifact = os.path.join(_tmp, name + ".tar")
+    with tarfile.open(artifact, "w") as tf:
+        member = tarfile.TarInfo("repo-1.0.0/" + name)
+        member.type = kind
+        if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+            member.linkname = "ok.txt"
+        tf.addfile(member)
+    check("归档不接受非普通成员: " + name,
+          _rejected_archive(artifact, os.path.join(_tmp, name)))
+
+_good = os.path.join(_tmp, "good.tar.gz")
+with tarfile.open(_good, "w:gz") as tf:
+    tf.add(_ok, arcname="repo-1.0.0/ok.txt")
+_root = U._extract(_good, os.path.join(_tmp, "valid"))
+check("普通更新归档正常读取",
+      io.open(os.path.join(_root, "ok.txt"), encoding="utf-8").read() == "x")
 
 # ---------------------------------------------------------------- apply 语义
 _real_latest = U.latest_release
